@@ -28,7 +28,7 @@ La logique vit dans nos propres fichiers (`chrome/browser/ui/helium_plus/`,
 reçoivent que des appels d'une ou deux lignes.
 
 1. `tab-state.patch` : `helium_plus::TabState`, état par onglet créé par `TabFeatures::Init`
-   (titre personnalisé, URL et titre d'ancrage). Sauvé comme « tab extra data » de session
+   (titre personnalisé, URL et titre d'ancrage, état « fermé »). Sauvé comme « tab extra data » de session
    (clés `helium_plus.*`) : `SessionService::BuildCommandsForTab` + `AddTabExtraData` à chaque
    changement, `BrowserLiveTabContext::GetExtraDataForTab` pour la réouverture d'onglets ;
    restauré via `CreateRestoredTab` (`StashRestoredData`, repris par le constructeur de
@@ -42,12 +42,24 @@ reçoivent que des appels d'une ou deux lignes.
    (`TabState::IsDiverged`, nouvelle page ouverte hors redirections, navigations internes et
    rechargements), le bouton est un « − » (`TabCloseButton::SetShowsMinus`, via
    `TabData::anchor_diverged`) qui le ramène à son ancre ; sinon le × le met en veille et la page
-   d'accueil du profil s'affiche à sa place (onglet déjà dessus, sinon nouvel onglet) ; les liens ouverts depuis un onglet groupé arrivent après le groupe
-   (`TabStripModel::AddTab`) ; à la restauration de session, l'onglet rouvre sur son URL
+   d'accueil du profil s'affiche à sa place (onglet déjà dessus, sinon nouvel onglet) ; les liens
+   ouverts depuis un onglet groupé arrivent après le groupe (`TabStripModel::AddTab`) ; à la restauration de session, l'onglet rouvre sur son URL
    d'ancrage, son historique conservé (`ResetNavigationsToAnchor`). Les groupes enregistrés
    (`LocalTabGroupListener::MatchLocalTabToSavedTab`) renavigueraient ensuite vers la dernière URL
    qu'ils ont gardée : `IsAtAnchor` les en empêche. Un onglet en veille sur son ancre est déjà
-   « fermé » : sa × est masquée (`IsClosedAnchoredTab`, dans `tab_view_*_layout.cc`).
+   Fermé ≠ en veille : seule la × ferme (`TabState::SetClosed`, enregistré dans la session,
+   effacé quand l'onglet est activé) ; un onglet fermé n'a plus de × (`IsClosedAnchoredTab`, via
+   `TabData::anchor_closed`, dans `tab_view_*_layout.cc`). La veille automatique ne ferme pas.
+4. `auto-hibernation.patch` : `helium_plus::HibernationService` (démarré par `TabState`) met en
+   veille les onglets d'un groupe replié (5 min), d'un profil en arrière-plan (30 min) et, sous
+   pression mémoire, un onglet par minute ; délais de Memory Saver allongés
+   (`memory_saver_mode_policy.cc`).
+5. `right-aligned-tab-groups.patch` : barre verticale à droite, le trait et le retrait des groupes
+   passent à droite (`TabGroupViewLayout::CalculateVerticalLayout`).
+6. `collapsed-groups.patch` : en vertical, comme Arc, un groupe replié garde visibles ses onglets
+   ouverts (actif ou non fermés, en veille compris : `TabGroupView::IsOpenTab`) ; sélectionner un onglet ne déplie plus son
+   groupe (`RootTabCollectionNode`) et replier un groupe n'en fait plus sortir l'onglet actif
+   (`TabStripCollectionController::ToggleTabGroupCollapsedState`).
 
 Textes d'interface : `helium_plus/strings.cc` (français si le navigateur est en français, anglais
 sinon), pas de `.grd` pour éviter les gros patches et les recompilations complètes.
