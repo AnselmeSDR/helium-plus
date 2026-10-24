@@ -29,3 +29,4 @@ helium-plus/tab-context-menu.patch
 helium-plus/anchored-tabs.patch
 helium-plus/auto-hibernation.patch
 helium-plus/right-aligned-tab-groups.patch
+helium-plus/collapsed-groups.patch

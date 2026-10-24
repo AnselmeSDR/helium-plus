@@ -81,7 +81,7 @@
        ContentSerializedNavigationBuilder::ToNavigationEntries(
 --- /dev/null
 +++ b/chrome/browser/ui/helium_plus/tab_state.cc
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,283 @@
 +// Copyright 2026 The Helium+ Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -150,6 +150,9 @@
 +        state->OnAnchoringChanged();
 +      },
 +      base::Unretained(this)));
++  activated_subscription_ = tab.RegisterDidActivate(base::BindRepeating(
++      [](TabState* state, tabs::TabInterface*) { state->SetClosed(false); },
++      base::Unretained(this)));
 +}
 +
 +TabState::~TabState() = default;
@@ -176,7 +179,8 @@
 +    content::WebContents* contents,
 +    const std::map<std::string, std::string>& extra_data) {
 +  auto data = std::make_unique<RestoredData>();
-+  for (const char* key : {kCustomTitleKey, kAnchorUrlKey, kAnchorTitleKey}) {
++  for (const char* key :
++       {kCustomTitleKey, kAnchorUrlKey, kAnchorTitleKey, kClosedKey}) {
 +    auto it = extra_data.find(key);
 +    if (it != extra_data.end() && !it->second.empty()) {
 +      data->extra_data.insert(*it);
@@ -204,6 +208,9 @@
 +    if (!state->anchor_title_.empty()) {
 +      (*extra_data)[kAnchorTitleKey] = base::UTF16ToUTF8(state->anchor_title_);
 +    }
++  }
++  if (state->closed_) {
++    (*extra_data)[kClosedKey] = "1";
 +  }
 +}
 +
@@ -253,8 +260,20 @@
 +  SetAnchor(anchor_url_, entry->GetTitle());
 +}
 +
++void TabState::SetClosed(bool closed) {
++  if (closed_ == closed) {
++    return;
++  }
++  closed_ = closed;
++  Persist(kClosedKey, closed_ ? "1" : std::string());
++  if (content::WebContents* contents = tab().GetContents()) {
++    contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
++  }
++}
++
 +void TabState::OnAnchoringChanged() {
 +  if (!IsAnchored()) {
++    SetClosed(false);
 +    SetAnchor(GURL(), std::u16string());
 +    return;
 +  }
@@ -318,6 +337,9 @@
 +  if (auto it = extra_data.find(kAnchorTitleKey); it != extra_data.end()) {
 +    anchor_title_ = base::UTF8ToUTF16(it->second);
 +  }
++  if (auto it = extra_data.find(kClosedKey); it != extra_data.end()) {
++    closed_ = it->second == "1";
++  }
 +}
 +
 +void TabState::Persist(const char* key, const std::string& value) {
@@ -345,7 +367,7 @@
 +}  // namespace helium_plus
 --- /dev/null
 +++ b/chrome/browser/ui/helium_plus/tab_state.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,99 @@
 +// Copyright 2026 The Helium+ Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -373,6 +395,7 @@
 +inline constexpr char kCustomTitleKey[] = "helium_plus.custom_title";
 +inline constexpr char kAnchorUrlKey[] = "helium_plus.anchor_url";
 +inline constexpr char kAnchorTitleKey[] = "helium_plus.anchor_title";
++inline constexpr char kClosedKey[] = "helium_plus.closed";
 +
 +// Per-tab Helium+ state, owned by TabFeatures: a custom title and, for anchored
 +// tabs (pinned or grouped), the URL the tab comes back to. Saved with the
@@ -411,6 +434,11 @@
 +  // True when the user left the anchor page for another one: closing the tab
 +  // first brings it back to its anchor.
 +  bool IsDiverged() const { return diverged_; }
++  // True once the user closed the anchored tab: it sleeps on its anchor and is
++  // hidden in a collapsed group until activated again. A tab that only
++  // hibernates is not closed.
++  bool IsClosed() const { return closed_; }
++  void SetClosed(bool closed);
 +
 +  // content::WebContentsObserver:
 +  void DidFinishNavigation(content::NavigationHandle* handle) override;
@@ -429,8 +457,10 @@
 +  GURL anchor_url_;
 +  std::u16string anchor_title_;
 +  bool diverged_ = false;
++  bool closed_ = false;
 +  base::CallbackListSubscription pinned_subscription_;
 +  base::CallbackListSubscription group_subscription_;
++  base::CallbackListSubscription activated_subscription_;
 +  ui::ScopedUnownedUserData<TabState> scoped_unowned_user_data_;
 +};
 +

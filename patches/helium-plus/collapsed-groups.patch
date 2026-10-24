@@ -1,0 +1,151 @@
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
+@@ -201,6 +201,8 @@ void RootTabCollectionNode::OnTabStripMo
+       if (std::optional<tab_groups::TabGroupId> group_id = tab->GetGroup();
+           group_id.has_value() && GetController() &&
+           GetController()->IsGroupCollapsed(group_id.value()) &&
++          // Helium+: a selected tab shows in its collapsed vertical group.
++          orientation() != TabStripOrientation::kVertical &&
+           !GetController()->GetDragHandler().IsDraggingGroups()) {
+         if (const TabGroup* group =
+                 tab_strip_model->group_model()->GetTabGroup(group_id.value())) {
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium_plus/anchored_tabs.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_data.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+@@ -32,6 +33,7 @@
+ #include "components/tabs/public/tab_collection_types.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_group_tab_collection.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/list_selection_model.h"
+@@ -340,8 +342,24 @@ void TabGroupView::UpdateChildVisibility
+     return;
+   }
+   SetIsCollapsed(collapsed);
++  const bool keep_open_tabs = orientation_ == TabStripOrientation::kVertical;
+   for (auto* child : collection_node_->GetDirectChildren()) {
+-    child->SetVisible(!collapsed);
++    child->SetVisible(!collapsed || (keep_open_tabs && IsOpenTab(*child)));
++  }
++}
++
++// static
++bool TabGroupView::IsOpenTab(const views::View& child) {
++  const TabView* tab_view = views::AsViewClass<TabView>(&child);
++  const tabs::TabInterface* tab =
++      tab_view ? tab_view->GetTabInterface() : nullptr;
++  return tab &&
++         (tab->IsActivated() || !helium_plus::IsClosedAnchoredTab(*tab));
++}
++
++void TabGroupView::UpdateOpenTabsVisibility() {
++  if (is_collapsed_ && orientation_ == TabStripOrientation::kVertical) {
++    UpdateChildVisibilityForCollapseState(true);
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.h
+@@ -79,6 +79,11 @@ class TabGroupView : public TabCollectio
+ 
+   bool IsCollapsed() const;
+ 
++  // Helium+: like Arc, a collapsed vertical group keeps showing its open tabs
++  // (all but the ones the user closed; asleep tabs stay open).
++  static bool IsOpenTab(const views::View& child);
++  void UpdateOpenTabsVisibility();
++
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
+       const gfx::Point& point_in_local_coords);
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
+@@ -113,6 +113,9 @@ views::ProposedLayout TabGroupViewLayout
+           : TabCollectionNode::ChildViews();
+ 
+   const bool is_focused = tab_group_view->IsGroupFocused();
++  // Helium+: a collapsed group still lays out its open tabs under the header.
++  const bool is_group_collapsed = tab_group_view->IsCollapsed();
++  bool has_open_tabs = false;
+ 
+   // Layout children in order. Children will have their preferred height and
+   // fill available width.
+@@ -140,6 +143,10 @@ views::ProposedLayout TabGroupViewLayout
+       bounds.set_width(size_bounds.width().value() - bounds.x());
+     }
+     layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
++    if (is_group_collapsed && !TabGroupView::IsOpenTab(*child)) {
++      continue;
++    }
++    has_open_tabs = true;
+     height += bounds.height() + kTabVerticalPadding;
+     width = std::max(width, bounds.width());
+   }
+@@ -157,7 +164,6 @@ views::ProposedLayout TabGroupViewLayout
+   }
+ 
+   // Add extra padding below the group if not collapsed.
+-  const bool is_group_collapsed = tab_group_view->IsCollapsed();
+   if (!is_group_collapsed) {
+     height += kTabVerticalPadding;
+   }
+@@ -174,7 +180,7 @@ views::ProposedLayout TabGroupViewLayout
+   }
+ 
+   layouts.host_size = gfx::Size(
+-      width, is_group_collapsed
++      width, is_group_collapsed && !has_open_tabs
+                  ? header_bounds.height() + (2 * kGroupHeaderVerticalMargin)
+                  : std::max(height, dragged_view_bottom));
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -360,8 +360,12 @@ void TabStripCollectionController::Toggl
+   base::WeakPtr<const TabGroup> weak_group = group->AsWeakPtr();
+ 
+   tabs::TabInterface* active_tab = model_->GetActiveTab();
++  // Helium+: in a vertical tab strip, the active tab stays visible in its
++  // collapsed group.
++  const bool keeps_active_tab =
++      root_node_->orientation() == TabStripOrientation::kVertical;
+   if (!is_currently_collapsed && active_tab) {
+-    if (active_tab->GetGroup() == group->id()) {
++    if (active_tab->GetGroup() == group->id() && !keeps_active_tab) {
+       // If the active tab is in the group that is toggling to collapse, the
+       // active tab should switch to the next available tab. If there are no
+       // available tabs for the active tab to switch to, a new tab will
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -1206,6 +1206,10 @@ void TabView::UpdateTabData(const tabs::
+     InvalidateLayout();
+   }
+   close_button_->SetShowsMinus(tab_data_.anchor_diverged);
++  // Helium+: a collapsed group shows its open tabs.
++  if (auto* group_view = views::AsViewClass<TabGroupView>(parent())) {
++    group_view->UpdateOpenTabsVisibility();
++  }
+ }
+ 
+ void TabView::SetDataForTesting(const tabs::TabData& data) {
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_view.cc
+@@ -343,7 +343,9 @@ void TabStripView::OnTabChanged(const ta
+             ->GetCollectionHandle());
+     if (group_node) {
+       auto* group_view = views::AsViewClass<TabGroupView>(group_node->view());
+-      if (group_view && group_view->IsCollapsed()) {
++      // Helium+: a vertical collapsed group shows the active tab instead.
++      if (group_view && group_view->IsCollapsed() &&
++          group_view->orientation() != TabStripOrientation::kVertical) {
+         group_view->ToggleCollapsedState(
+             ToggleTabGroupCollapsedStateOrigin::kMenuAction);
+       }

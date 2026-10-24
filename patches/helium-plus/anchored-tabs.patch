@@ -82,7 +82,7 @@
            navigations, browser->GetProfile());
 --- /dev/null
 +++ b/chrome/browser/ui/helium_plus/anchored_tabs.cc
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,186 @@
 +// Copyright 2026 The Helium+ Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -213,6 +213,7 @@
 +  if (tab.IsActivated()) {
 +    ShowHomePage(model, *index);
 +  }
++  state->SetClosed(true);
 +  if (contents->GetLastCommittedURL() == state->anchor_url()) {
 +    PostHibernateIfHidden(contents);
 +    return true;
@@ -263,7 +264,8 @@
 +}
 +
 +bool IsClosedAnchoredTab(const tabs::TabInterface& tab) {
-+  return tab.GetContents()->WasDiscarded() && IsAtAnchor(tab);
++  const TabState* state = TabState::From(&tab);
++  return state && state->IsClosed();
 +}
 +
 +}  // namespace helium_plus
@@ -313,8 +315,8 @@
 +// back to the last URL they stored.
 +bool IsAtAnchor(const tabs::TabInterface& tab);
 +
-+// True when `tab` is asleep on its anchor URL: it is already closed, so its
-+// close button is hidden.
++// True when the user closed `tab`: it sleeps on its anchor URL and its close
++// button is hidden. A tab that only hibernates is not closed.
 +bool IsClosedAnchoredTab(const tabs::TabInterface& tab);
 +
 +}  // namespace helium_plus
@@ -367,9 +369,9 @@
    UpdateTitle(tab_data_.title, tab_data_.should_render_loading_title);
    alert_indicator_->TransitionToAlertState(tab_data_.alert_state);
    SetHoverCardDataFrom(tab_data_);
-+  // Helium+: the close button of anchored tabs depends on the discarded state,
-+  // and shows a "−" when the tab left its anchor.
-+  if (old_data.is_tab_discarded != tab_data_.is_tab_discarded) {
++  // Helium+: closed anchored tabs hide their close button, which shows a "−"
++  // when the tab left its anchor.
++  if (old_data.anchor_closed != tab_data_.anchor_closed) {
 +    InvalidateLayout();
 +  }
 +  close_button_->SetShowsMinus(tab_data_.anchor_diverged);
@@ -431,7 +433,7 @@
  #include "chrome/browser/ui/performance_controls/tab_resource_usage_tab_helper.h"
  #include "chrome/browser/ui/tab_ui_helper.h"
  #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
-@@ -57,6 +58,10 @@ TabData TabData::FromTabInterface(tabs::
+@@ -57,6 +58,11 @@ TabData TabData::FromTabInterface(tabs::
    tab_data.alert_state = tab_alert_controller->GetAlertToShow();
    tab_data.pinned = tab_interface->IsPinned();
    tab_data.blocked = tab_interface->IsBlocked();
@@ -439,27 +441,31 @@
 +      helium_plus::TabState::From(tab_interface);
 +  tab_data.anchor_diverged =
 +      helium_plus_state && helium_plus_state->IsDiverged();
++  tab_data.anchor_closed = helium_plus_state && helium_plus_state->IsClosed();
    tab_data.should_dim_favicon =
        tab_data.should_show_discard_status ||
        IsRestoredTabPendingLoad(tab_interface->GetContents());
-@@ -105,7 +110,8 @@ bool TabData::operator==(const TabData&
+@@ -105,7 +111,9 @@ bool TabData::operator==(const TabData&
           should_dim_favicon == other.should_dim_favicon &&
           alert_state == other.alert_state && pinned == other.pinned &&
           blocked == other.blocked && thumbnail == other.thumbnail &&
 -         tab_resource_usage == other.tab_resource_usage;
 +         tab_resource_usage == other.tab_resource_usage &&
-+         anchor_diverged == other.anchor_diverged;
++         anchor_diverged == other.anchor_diverged &&
++         anchor_closed == other.anchor_closed;
  }
  
  TabDataObserver::TabDataObserver(TabInterface* tab_interface)
 --- a/chrome/browser/ui/tabs/tab_data.h
 +++ b/chrome/browser/ui/tabs/tab_data.h
-@@ -71,6 +71,8 @@ struct TabData {
+@@ -71,6 +71,10 @@ struct TabData {
    // TabInterface properties:
    bool pinned = false;
    bool blocked = false;
 +  // Helium+: the anchored tab left its anchor page.
 +  bool anchor_diverged = false;
++  // Helium+: the user closed the anchored tab.
++  bool anchor_closed = false;
  
    scoped_refptr<ThumbnailImage> thumbnail;
    scoped_refptr<const TabResourceUsage> tab_resource_usage;
