@@ -1,0 +1,317 @@
+--- a/chrome/browser/performance_manager/policies/memory_saver_mode_policy.cc
++++ b/chrome/browser/performance_manager/policies/memory_saver_mode_policy.cc
+@@ -201,12 +201,13 @@ void MemorySaverModePolicy::DiscardPageT
+ base::TimeDelta MemorySaverModePolicy::GetTimeBeforeDiscardForCurrentMode()
+     const {
+   switch (mode_) {
++    // Helium+: shorter delays.
+     case MemorySaverModeAggressiveness::kConservative:
+-      return base::Hours(6);
++      return base::Hours(2);
+     case MemorySaverModeAggressiveness::kMedium:
+-      return base::Hours(4);
++      return base::Hours(1);
+     case MemorySaverModeAggressiveness::kAggressive:
+-      return base::Hours(2);
++      return base::Minutes(30);
+   }
+   NOTREACHED();
+ }
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3559,6 +3559,8 @@ static_library("ui") {
+       "views/frame/vertical_tab_strip_region_view.h",
+       "helium_plus/anchored_tabs.cc",
+       "helium_plus/anchored_tabs.h",
++      "helium_plus/hibernation_service.cc",
++      "helium_plus/hibernation_service.h",
+       "helium_plus/strings.cc",
+       "helium_plus/strings.h",
+       "helium_plus/tab_commands.cc",
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/hibernation_service.cc
+@@ -0,0 +1,185 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/hibernation_service.h"
++
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/performance_manager/public/user_tuning/user_tuning_utils.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/performance_manager/public/performance_manager.h"
++#include "components/tabs/public/tab_group.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/gfx/range/range.h"
++
++namespace helium_plus {
++
++namespace {
++
++// A collapsed group sleeps after this delay.
++constexpr base::TimeDelta kCollapsedGroupDelay = base::Minutes(5);
++// A profile with no active window sleeps after this delay.
++constexpr base::TimeDelta kBackgroundProfileDelay = base::Minutes(30);
++// While memory is low, at most one tab sleeps per interval.
++constexpr base::TimeDelta kMemoryPressureInterval = base::Minutes(1);
++
++void HibernateTab(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab ? tab->GetContents() : nullptr;
++  if (!contents || tab->IsVisible() || contents->WasDiscarded() ||
++      !performance_manager::PerformanceManager::IsAvailable()) {
++    return;
++  }
++  base::WeakPtr<performance_manager::PageNode> page_node =
++      performance_manager::PerformanceManager::GetPrimaryPageNodeForWebContents(
++          contents);
++  if (!page_node) {
++    return;
++  }
++  performance_manager::user_tuning::DiscardPage(
++      page_node.get(), ::mojom::LifecycleUnitDiscardReason::PROACTIVE,
++      /*ignore_minimum_time_in_background=*/true);
++}
++
++}  // namespace
++
++// static
++void HibernationService::EnsureStarted() {
++  static base::NoDestructor<HibernationService> service;
++}
++
++HibernationService::HibernationService()
++    : memory_pressure_registration_(
++          base::MemoryPressureListenerTag::kMemoryPressureListenerPolicy,
++          this) {
++  GlobalBrowserCollection* browsers = GlobalBrowserCollection::GetInstance();
++  browser_collection_observation_.Observe(browsers);
++  browsers->ForEach([this](BrowserWindowInterface* browser) {
++    Observe(browser->GetTabStripModel());
++    return true;
++  });
++}
++
++HibernationService::~HibernationService() = default;
++
++void HibernationService::OnBrowserCreated(BrowserWindowInterface* browser) {
++  Observe(browser->GetTabStripModel());
++}
++
++void HibernationService::OnBrowserActivated(BrowserWindowInterface* browser) {
++  Profile* active_profile = browser->GetProfile();
++  profile_timers_.erase(active_profile);
++
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [this, active_profile](BrowserWindowInterface* other) {
++        Profile* profile = other->GetProfile();
++        if (profile == active_profile || profile_timers_.contains(profile)) {
++          return true;
++        }
++        auto timer = std::make_unique<base::OneShotTimer>();
++        timer->Start(FROM_HERE, kBackgroundProfileDelay,
++                     base::BindOnce(&HibernationService::HibernateProfile,
++                                    base::Unretained(this), profile));
++        profile_timers_[profile] = std::move(timer);
++        return true;
++      });
++}
++
++void HibernationService::OnTabGroupChanged(const TabGroupChange& change) {
++  if (change.type != TabGroupChange::kVisualsChanged) {
++    return;
++  }
++  const TabGroupChange::VisualsChange* visuals = change.GetVisualsChange();
++  if (!visuals || !visuals->new_visuals) {
++    return;
++  }
++  const bool collapsed = visuals->new_visuals->is_collapsed();
++  const bool was_collapsed =
++      visuals->old_visuals && visuals->old_visuals->is_collapsed();
++  if (!collapsed) {
++    group_timers_.erase(change.group);
++    return;
++  }
++  if (was_collapsed) {
++    return;
++  }
++  auto group_timer = std::make_unique<GroupTimer>();
++  group_timer->model = change.model;
++  group_timer->timer.Start(
++      FROM_HERE, kCollapsedGroupDelay,
++      base::BindOnce(&HibernationService::HibernateGroup,
++                     base::Unretained(this), change.group));
++  group_timers_[change.group] = std::move(group_timer);
++}
++
++void HibernationService::OnTabStripModelDestroyed(TabStripModel* model) {
++  observed_models_.erase(model);
++  std::erase_if(group_timers_,
++                [model](const auto& entry) {
++                  return entry.second->model == model;
++                });
++}
++
++void HibernationService::OnMemoryPressure(base::MemoryPressureLevel level) {
++  // Critical pressure is already handled by Chromium's urgent discarding.
++  if (level != base::MEMORY_PRESSURE_LEVEL_MODERATE ||
++      !performance_manager::PerformanceManager::IsAvailable()) {
++    return;
++  }
++  const base::TimeTicks now = base::TimeTicks::Now();
++  if (now - last_memory_pressure_discard_ < kMemoryPressureInterval) {
++    return;
++  }
++  last_memory_pressure_discard_ = now;
++  performance_manager::user_tuning::DiscardAnyPage(
++      ::mojom::LifecycleUnitDiscardReason::URGENT);
++}
++
++void HibernationService::Observe(TabStripModel* model) {
++  if (!model || observed_models_.contains(model)) {
++    return;
++  }
++  observed_models_.insert(model);
++  model->AddObserver(this);
++}
++
++void HibernationService::HibernateProfile(Profile* profile) {
++  profile_timers_.erase(profile);
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [profile](BrowserWindowInterface* browser) {
++        if (browser->GetProfile() != profile) {
++          return true;
++        }
++        TabStripModel* model = browser->GetTabStripModel();
++        for (int i = 0; i < model->count(); ++i) {
++          HibernateTab(model->GetTabAtIndex(i));
++        }
++        return true;
++      });
++}
++
++void HibernationService::HibernateGroup(tab_groups::TabGroupId group) {
++  auto it = group_timers_.find(group);
++  if (it == group_timers_.end()) {
++    return;
++  }
++  TabStripModel* model = it->second->model;
++  group_timers_.erase(it);
++  if (!model->group_model() || !model->group_model()->ContainsTabGroup(group) ||
++      !model->IsGroupCollapsed(group)) {
++    return;
++  }
++  const gfx::Range tabs = model->group_model()->GetTabGroup(group)->ListTabs();
++  for (uint32_t i = tabs.start(); i < tabs.end(); ++i) {
++    HibernateTab(model->GetTabAtIndex(static_cast<int>(i)));
++  }
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/hibernation_service.h
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_HIBERNATION_SERVICE_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_HIBERNATION_SERVICE_H_
++
++#include <map>
++#include <memory>
++#include <set>
++
++#include "base/memory/memory_pressure_listener.h"
++#include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tab_groups/tab_group_id.h"
++
++class Profile;
++
++namespace helium_plus {
++
++// Puts tabs to sleep on its own: tabs of a group collapsed for a while, tabs of
++// a profile left in the background for a while, and one tab at a time while
++// the system is low on memory. Tabs left inactive are handled by Memory Saver.
++class HibernationService : public BrowserCollectionObserver,
++                           public TabStripModelObserver,
++                           public base::MemoryPressureListener {
++ public:
++  static void EnsureStarted();
++
++  HibernationService(const HibernationService&) = delete;
++  HibernationService& operator=(const HibernationService&) = delete;
++
++ private:
++  friend class base::NoDestructor<HibernationService>;
++
++  struct GroupTimer {
++    raw_ptr<TabStripModel> model;
++    base::OneShotTimer timer;
++  };
++
++  HibernationService();
++  ~HibernationService() override;
++
++  // BrowserCollectionObserver:
++  void OnBrowserCreated(BrowserWindowInterface* browser) override;
++  void OnBrowserActivated(BrowserWindowInterface* browser) override;
++
++  // TabStripModelObserver:
++  void OnTabGroupChanged(const TabGroupChange& change) override;
++  void OnTabStripModelDestroyed(TabStripModel* model) override;
++
++  // base::MemoryPressureListener:
++  void OnMemoryPressure(base::MemoryPressureLevel level) override;
++
++  void Observe(TabStripModel* model);
++  void HibernateProfile(Profile* profile);
++  void HibernateGroup(tab_groups::TabGroupId group);
++
++  base::ScopedObservation<GlobalBrowserCollection, BrowserCollectionObserver>
++      browser_collection_observation_{this};
++  std::set<raw_ptr<TabStripModel>> observed_models_;
++  std::map<raw_ptr<Profile>, std::unique_ptr<base::OneShotTimer>>
++      profile_timers_;
++  std::map<tab_groups::TabGroupId, std::unique_ptr<GroupTimer>> group_timers_;
++  base::MemoryPressureListenerRegistration memory_pressure_registration_;
++  base::TimeTicks last_memory_pressure_discard_;
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_HIBERNATION_SERVICE_H_
+--- a/chrome/browser/ui/helium_plus/tab_state.cc
++++ b/chrome/browser/ui/helium_plus/tab_state.cc
+@@ -12,6 +12,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/supports_user_data.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/helium_plus/hibernation_service.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "components/sessions/content/session_tab_helper.h"
+@@ -45,6 +46,8 @@ DEFINE_USER_DATA(TabState);
+ TabState::TabState(tabs::TabInterface& tab)
+     : ContentsObservingTabFeature(tab),
+       scoped_unowned_user_data_(tab.GetUnownedUserDataHost(), *this) {
++  HibernationService::EnsureStarted();
++
+   if (content::WebContents* contents = tab.GetContents()) {
+     if (auto* restored = static_cast<RestoredData*>(
+             contents->GetUserData(kRestoredDataKey))) {

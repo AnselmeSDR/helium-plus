@@ -1,0 +1,460 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3557,10 +3557,16 @@ static_library("ui") {
+       "views/frame/horizontal_tab_strip_region_view.h",
+       "views/frame/vertical_tab_strip_region_view.cc",
+       "views/frame/vertical_tab_strip_region_view.h",
++      "helium_plus/strings.cc",
++      "helium_plus/strings.h",
++      "helium_plus/tab_commands.cc",
++      "helium_plus/tab_commands.h",
+       "helium_plus/tab_state.cc",
+       "helium_plus/tab_state.h",
+       "views/helium/frame_corner_radius.cc",
+       "views/helium/frame_corner_radius.h",
++      "views/helium_plus/tab_rename_dialog.cc",
++      "views/helium_plus/tab_rename_dialog.h",
+       "views/helium/native_frame_materials.cc",
+       "views/helium/native_frame_materials.h",
+     ]
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/strings.cc
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/strings.h"
++
++#include "base/strings/string_util.h"
++#include "chrome/browser/browser_process.h"
++
++namespace helium_plus {
++
++namespace {
++
++bool IsFrench() {
++  return base::StartsWith(g_browser_process->GetApplicationLocale(), "fr");
++}
++
++}  // namespace
++
++std::u16string GetString(StringId id) {
++  const bool french = IsFrench();
++  switch (id) {
++    case StringId::kRenameTab:
++      return french ? u"Renommer l’onglet…" : u"Rename Tab…";
++    case StringId::kRenameTabTitle:
++      return french ? u"Renommer l’onglet" : u"Rename tab";
++    case StringId::kTabNameLabel:
++      return french ? u"Nom (vide : titre de la page)"
++                    : u"Name (empty: page title)";
++    case StringId::kReplaceAnchor:
++      return french ? u"Ancrer sur la page actuelle"
++                    : u"Anchor to Current Page";
++    case StringId::kCloseUngroupedTabs:
++      return french ? u"Fermer les onglets non groupés"
++                    : u"Close Ungrouped Tabs";
++  }
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/strings.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_STRINGS_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_STRINGS_H_
++
++#include <string>
++
++namespace helium_plus {
++
++// Helium+ UI strings, kept out of the Chromium .grd files so that patches stay
++// small. French when the browser runs in French, English otherwise.
++enum class StringId {
++  kRenameTab,
++  kRenameTabTitle,
++  kTabNameLabel,
++  kReplaceAnchor,
++  kCloseUngroupedTabs,
++};
++
++std::u16string GetString(StringId id);
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_STRINGS_H_
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/tab_commands.cc
+@@ -0,0 +1,155 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/tab_commands.h"
++
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/helium_plus/strings.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
++#include "chrome/browser/ui/tab_ui_helper.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/views/helium_plus/tab_rename_dialog.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/menus/simple_menu_model.h"
++#include "url/gurl.h"
++
++namespace helium_plus {
++
++namespace {
++
++bool IsUngrouped(const TabStripModel& model, int index) {
++  return !model.IsTabPinned(index) &&
++         !model.GetTabGroupForTab(index).has_value();
++}
++
++bool HasUngroupedTabs(const TabStripModel& model) {
++  for (int i = 0; i < model.count(); ++i) {
++    if (IsUngrouped(model, i)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++const TabState* GetTabState(const TabStripModel& model, int index) {
++  const tabs::TabInterface* tab = model.GetTabAtIndex(index);
++  return tab ? TabState::From(tab) : nullptr;
++}
++
++bool CanReplaceAnchor(const TabStripModel& model, int index) {
++  const TabState* state = GetTabState(model, index);
++  if (!state || !state->IsAnchored()) {
++    return false;
++  }
++  const GURL& url = model.GetWebContentsAt(index)->GetLastCommittedURL();
++  return url.is_valid() && url != state->anchor_url();
++}
++
++void RenameTab(TabStripModel& model, int index) {
++  tabs::TabInterface* tab = model.GetTabAtIndex(index);
++  content::WebContents* host = model.GetActiveWebContents();
++  if (!tab || !host) {
++    return;
++  }
++  ShowTabRenameDialog(
++      host, TabUIHelper::From(tab)->GetTitle(),
++      base::BindOnce(
++          [](tabs::TabHandle handle, std::u16string name) {
++            tabs::TabInterface* renamed_tab = handle.Get();
++            if (TabState* state =
++                    renamed_tab ? TabState::From(renamed_tab) : nullptr) {
++              state->SetCustomTitle(std::move(name));
++            }
++          },
++          tab->GetHandle()));
++}
++
++}  // namespace
++
++bool IsTabCommandEnabled(const TabStripModel& model,
++                         int index,
++                         tabs::TabContextMenuCommand command) {
++  if (!model.ContainsIndex(index)) {
++    return false;
++  }
++  switch (command) {
++    case tabs::CommandRenameTab:
++      return true;
++    case tabs::CommandReplaceAnchor:
++      return CanReplaceAnchor(model, index);
++    case tabs::CommandCloseUngroupedTabs:
++      return HasUngroupedTabs(model);
++    default:
++      return false;
++  }
++}
++
++void ExecuteTabCommand(TabStripModel& model,
++                       int index,
++                       tabs::TabContextMenuCommand command) {
++  if (!IsTabCommandEnabled(model, index, command)) {
++    return;
++  }
++  switch (command) {
++    case tabs::CommandRenameTab:
++      RenameTab(model, index);
++      break;
++    case tabs::CommandReplaceAnchor:
++      TabState::From(model.GetTabAtIndex(index))->SetAnchorToCurrentPage();
++      break;
++    case tabs::CommandCloseUngroupedTabs:
++      CloseUngroupedTabs(model);
++      break;
++    default:
++      break;
++  }
++}
++
++void AddTabMenuItems(ui::SimpleMenuModel& menu,
++                     const TabStripModel& model,
++                     int index,
++                     size_t selected_count) {
++  menu.AddSeparator(ui::NORMAL_SEPARATOR);
++  if (selected_count == 1) {
++    menu.AddItem(tabs::CommandRenameTab, GetString(StringId::kRenameTab));
++    const TabState* state = GetTabState(model, index);
++    if (state && state->IsAnchored()) {
++      menu.AddItem(tabs::CommandReplaceAnchor,
++                   GetString(StringId::kReplaceAnchor));
++    }
++  }
++  menu.AddItem(tabs::CommandCloseUngroupedTabs,
++               GetString(StringId::kCloseUngroupedTabs));
++}
++
++void CloseUngroupedTabs(TabStripModel& model) {
++  std::vector<tabs::TabHandle> handles;
++  for (int i = 0; i < model.count(); ++i) {
++    if (IsUngrouped(model, i)) {
++      handles.push_back(model.GetTabAtIndex(i)->GetHandle());
++    }
++  }
++  if (handles.empty()) {
++    return;
++  }
++  if (handles.size() == static_cast<size_t>(model.count())) {
++    model.delegate()->AddTabAt(model.profile()->GetHomePage(), -1,
++                               /*foreground=*/true);
++  }
++  for (tabs::TabHandle handle : handles) {
++    if (tabs::TabInterface* tab = handle.Get()) {
++      model.CloseWebContents(tab->GetContents(),
++                             TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB |
++                                 TabCloseTypes::CLOSE_USER_GESTURE);
++    }
++  }
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/tab_commands.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_TAB_COMMANDS_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_TAB_COMMANDS_H_
++
++#include <cstddef>
++
++#include "components/tabs/public/tab_context_menu_command.h"
++
++class TabStripModel;
++
++namespace ui {
++class SimpleMenuModel;
++}
++
++namespace helium_plus {
++
++// Tab context menu commands added by Helium+.
++bool IsTabCommandEnabled(const TabStripModel& model,
++                         int index,
++                         tabs::TabContextMenuCommand command);
++void ExecuteTabCommand(TabStripModel& model,
++                       int index,
++                       tabs::TabContextMenuCommand command);
++
++// Adds the Helium+ items to the context menu of the tab at `index`.
++void AddTabMenuItems(ui::SimpleMenuModel& menu,
++                     const TabStripModel& model,
++                     int index,
++                     size_t selected_count);
++
++// Closes the tabs that are neither pinned nor grouped, keeping the window open.
++void CloseUngroupedTabs(TabStripModel& model);
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_TAB_COMMANDS_H_
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -28,6 +28,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium_plus/tab_commands.h"
+ #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_context_menu_delegate.h"
+ #include "chrome/browser/ui/tabs/existing_tab_group_sub_menu_model.h"
+@@ -627,6 +628,8 @@ void TabMenuModel::Build(int index) {
+   }
+ #endif
+ 
++  helium_plus::AddTabMenuItems(*this, *tab_strip_, index, indices.size());
++
+   AddSeparator(ui::NORMAL_SEPARATOR);
+   AddItemWithStringId(TabStripModel::CommandDiscard,
+                       tab_strip_->IsTabInForeground(index)
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -58,6 +58,7 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/helium_plus/tab_commands.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/features.h"
+@@ -2869,6 +2870,11 @@ bool TabStripModel::IsContextMenuCommand
+ 
+     case CommandToggleVertical:
+       return true;
++
++    case CommandRenameTab:
++    case CommandReplaceAnchor:
++    case CommandCloseUngroupedTabs:
++      return helium_plus::IsTabCommandEnabled(*this, context_index, command_id);
+   }
+   SCOPED_CRASH_KEY_NUMBER("TabStripModel", "command_id", command_id);
+   NOTREACHED() << "Unsupported command: " << command_id;
+@@ -3080,6 +3086,12 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+ 
++    case CommandRenameTab:
++    case CommandReplaceAnchor:
++    case CommandCloseUngroupedTabs:
++      helium_plus::ExecuteTabCommand(*this, context_index, command_id);
++      break;
++
+     case CommandToggleTabMuted: {
+       const bool mute = WillContextMenuMuteTabs(context_index);
+       for (int index : GetIndicesForCommand(context_index)) {
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/tab_rename_dialog.cc
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium_plus/tab_rename_dialog.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/raw_ptr.h"
++#include "base/strings/string_util.h"
++#include "chrome/browser/ui/helium_plus/strings.h"
++#include "components/constrained_window/constrained_window_views.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/base/mojom/ui_base_types.mojom-shared.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++
++namespace helium_plus {
++
++namespace {
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kTabNameField);
++
++class TabRenameDialogDelegate : public ui::DialogModelDelegate {
++ public:
++  explicit TabRenameDialogDelegate(
++      base::OnceCallback<void(std::u16string)> callback)
++      : callback_(std::move(callback)) {}
++
++  void OnAccepted() {
++    std::u16string name(base::TrimWhitespace(
++        dialog_model()->GetTextfieldByUniqueId(kTabNameField)->text(),
++        base::TRIM_ALL));
++    std::move(callback_).Run(std::move(name));
++  }
++
++ private:
++  base::OnceCallback<void(std::u16string)> callback_;
++};
++
++}  // namespace
++
++void ShowTabRenameDialog(content::WebContents* web_contents,
++                         std::u16string current_name,
++                         base::OnceCallback<void(std::u16string)> callback) {
++  if (!web_contents) {
++    return;
++  }
++
++  auto delegate = std::make_unique<TabRenameDialogDelegate>(std::move(callback));
++  TabRenameDialogDelegate* delegate_ptr = delegate.get();
++  auto dialog_model =
++      ui::DialogModel::Builder(std::move(delegate))
++          .SetTitle(GetString(StringId::kRenameTabTitle))
++          .AddTextfield(kTabNameField, GetString(StringId::kTabNameLabel),
++                        std::move(current_name))
++          .SetInitiallyFocusedField(kTabNameField)
++          .AddOkButton(base::BindOnce(&TabRenameDialogDelegate::OnAccepted,
++                                      base::Unretained(delegate_ptr)))
++          .AddCancelButton(base::DoNothing())
++          .Build();
++  auto dialog = views::BubbleDialogModelHost::CreateModal(
++      std::move(dialog_model), ui::mojom::ModalType::kChild);
++  constrained_window::ShowWebModalDialogViews(dialog.release(), web_contents);
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/tab_rename_dialog.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_TAB_RENAME_DIALOG_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_TAB_RENAME_DIALOG_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace helium_plus {
++
++// Shows a tab-modal dialog over `web_contents` asking for a tab name. Runs
++// `callback` with the entered name when the user accepts.
++void ShowTabRenameDialog(content::WebContents* web_contents,
++                         std::u16string current_name,
++                         base::OnceCallback<void(std::u16string)> callback);
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_TAB_RENAME_DIALOG_H_
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -42,6 +42,10 @@ enum TabContextMenuCommand {
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  // Helium+
++  CommandRenameTab,
++  CommandReplaceAnchor,
++  CommandCloseUngroupedTabs,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 

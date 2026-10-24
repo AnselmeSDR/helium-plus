@@ -1,0 +1,500 @@
+--- a/chrome/browser/sessions/session_service.cc
++++ b/chrome/browser/sessions/session_service.cc
+@@ -43,6 +43,7 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
+ #include "chrome/browser/ui/session_crashed_bubble.h"
+ #include "chrome/browser/ui/startup/profile_launch_observer.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+@@ -63,6 +64,7 @@
+ #include "components/sessions/core/session_types.h"
+ #include "components/sessions/core/tab_restore_service.h"
+ #include "components/tab_groups/tab_group_id.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_details.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/session_storage_namespace_handle.h"
+@@ -681,6 +683,14 @@ void SessionService::BuildCommandsForTab
+     command_storage_manager()->AppendRebuildCommand(
+         sessions::CreateSplitTabCommand(session_id, std::move(split)));
+   }
++
++  std::map<std::string, std::string> helium_plus_data;
++  helium_plus::TabState::PopulateExtraData(
++      tabs::TabInterface::MaybeGetFromContents(tab), &helium_plus_data);
++  for (const auto& [key, value] : helium_plus_data) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id, key, value));
++  }
+ }
+ 
+ void SessionService::ScheduleResetCommands() {
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3557,6 +3557,8 @@ static_library("ui") {
+       "views/frame/horizontal_tab_strip_region_view.h",
+       "views/frame/vertical_tab_strip_region_view.cc",
+       "views/frame/vertical_tab_strip_region_view.h",
++      "helium_plus/tab_state.cc",
++      "helium_plus/tab_state.h",
+       "views/helium/frame_corner_radius.cc",
+       "views/helium/frame_corner_radius.h",
+       "views/helium/native_frame_materials.cc",
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -206,6 +207,8 @@ std::map<std::string, std::string> Brows
+ 
+   glic::PopulateGlicExtraData(tab_strip_model_->GetTabAtIndex(index),
+                               &extra_data);
++  helium_plus::TabState::PopulateExtraData(
++      tab_strip_model_->GetTabAtIndex(index), &extra_data);
+ 
+   return extra_data;
+ }
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/sessions/session_service_lookup.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_activation_tracker.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+@@ -86,6 +87,7 @@ std::unique_ptr<WebContents> CreateResto
+   glic::RestoreGlicStateFromExtraData(web_contents.get(), extra_data);
+   send_tab_to_self::SendTabToSelfActivationTracker::RestoreFromExtraData(
+       web_contents.get(), extra_data);
++  helium_plus::TabState::StashRestoredData(web_contents.get(), extra_data);
+ 
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+       ContentSerializedNavigationBuilder::ToNavigationEntries(
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/tab_state.cc
+@@ -0,0 +1,261 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/tab_state.h"
++
++#include <memory>
++#include <optional>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/supports_user_data.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/invalidate_type.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/reload_type.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/page_transition_types.h"
++
++namespace helium_plus {
++
++namespace {
++
++const char kRestoredDataKey[] = "helium_plus_restored_data";
++
++// Restored extra data waiting for the tab to be created.
++struct RestoredData : public base::SupportsUserData::Data {
++  std::map<std::string, std::string> extra_data;
++};
++
++GURL GetCurrentUrl(content::WebContents* contents) {
++  const GURL& url = contents->GetLastCommittedURL();
++  return url.is_valid() ? url : contents->GetVisibleURL();
++}
++
++}  // namespace
++
++DEFINE_USER_DATA(TabState);
++
++TabState::TabState(tabs::TabInterface& tab)
++    : ContentsObservingTabFeature(tab),
++      scoped_unowned_user_data_(tab.GetUnownedUserDataHost(), *this) {
++  if (content::WebContents* contents = tab.GetContents()) {
++    if (auto* restored = static_cast<RestoredData*>(
++            contents->GetUserData(kRestoredDataKey))) {
++      RestoreFrom(restored->extra_data);
++      contents->RemoveUserData(kRestoredDataKey);
++    }
++  }
++
++  pinned_subscription_ = tab.RegisterPinnedStateChanged(base::BindRepeating(
++      [](TabState* state, tabs::TabInterface*, bool) {
++        state->OnAnchoringChanged();
++      },
++      base::Unretained(this)));
++  group_subscription_ = tab.RegisterGroupChanged(base::BindRepeating(
++      [](TabState* state, tabs::TabInterface*,
++         std::optional<tab_groups::TabGroupId>) {
++        state->OnAnchoringChanged();
++      },
++      base::Unretained(this)));
++}
++
++TabState::~TabState() = default;
++
++// static
++TabState* TabState::From(tabs::TabInterface* tab) {
++  return Get(tab->GetUnownedUserDataHost());
++}
++
++// static
++const TabState* TabState::From(const tabs::TabInterface* tab) {
++  return Get(tab->GetUnownedUserDataHost());
++}
++
++// static
++TabState* TabState::FromWebContents(content::WebContents* contents) {
++  tabs::TabInterface* tab =
++      contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
++  return tab ? From(tab) : nullptr;
++}
++
++// static
++void TabState::StashRestoredData(
++    content::WebContents* contents,
++    const std::map<std::string, std::string>& extra_data) {
++  auto data = std::make_unique<RestoredData>();
++  for (const char* key : {kCustomTitleKey, kAnchorUrlKey, kAnchorTitleKey}) {
++    auto it = extra_data.find(key);
++    if (it != extra_data.end() && !it->second.empty()) {
++      data->extra_data.insert(*it);
++    }
++  }
++  if (data->extra_data.empty()) {
++    return;
++  }
++  contents->SetUserData(kRestoredDataKey, std::move(data));
++}
++
++// static
++void TabState::PopulateExtraData(
++    const tabs::TabInterface* tab,
++    std::map<std::string, std::string>* extra_data) {
++  const TabState* state = tab ? From(tab) : nullptr;
++  if (!state) {
++    return;
++  }
++  if (!state->custom_title_.empty()) {
++    (*extra_data)[kCustomTitleKey] = base::UTF16ToUTF8(state->custom_title_);
++  }
++  if (state->anchor_url_.is_valid()) {
++    (*extra_data)[kAnchorUrlKey] = state->anchor_url_.spec();
++    if (!state->anchor_title_.empty()) {
++      (*extra_data)[kAnchorTitleKey] = base::UTF16ToUTF8(state->anchor_title_);
++    }
++  }
++}
++
++void TabState::SetCustomTitle(std::u16string title) {
++  if (title == custom_title_) {
++    return;
++  }
++  custom_title_ = std::move(title);
++  Persist(kCustomTitleKey, base::UTF16ToUTF8(custom_title_));
++  NotifyTitleChanged();
++}
++
++bool TabState::IsAnchored() const {
++  return tab().IsPinned() || tab().GetGroup().has_value();
++}
++
++void TabState::SetAnchorToCurrentPage() {
++  content::WebContents* contents = tab().GetContents();
++  if (!contents) {
++    return;
++  }
++  const GURL url = GetCurrentUrl(contents);
++  if (!url.is_valid() || url.IsAboutBlank()) {
++    return;
++  }
++  SetAnchor(url, contents->GetTitle());
++}
++
++void TabState::DidFinishNavigation(content::NavigationHandle* handle) {
++  if (!handle->IsInPrimaryMainFrame() || !handle->HasCommitted() ||
++      !IsAnchored()) {
++    return;
++  }
++  // A tab anchored before its first page committed gets anchored here.
++  if (!anchor_url_.is_valid()) {
++    SetAnchorToCurrentPage();
++    return;
++  }
++  UpdateDiverged(handle);
++}
++
++void TabState::TitleWasSet(content::NavigationEntry* entry) {
++  if (!entry || !anchor_url_.is_valid() || !anchor_title_.empty() ||
++      entry->GetURL() != anchor_url_) {
++    return;
++  }
++  SetAnchor(anchor_url_, entry->GetTitle());
++}
++
++void TabState::OnAnchoringChanged() {
++  if (!IsAnchored()) {
++    SetAnchor(GURL(), std::u16string());
++    return;
++  }
++  if (!anchor_url_.is_valid()) {
++    SetAnchorToCurrentPage();
++  }
++}
++
++void TabState::SetAnchor(GURL url, std::u16string title) {
++  if (url == anchor_url_ && title == anchor_title_) {
++    return;
++  }
++  if (url != anchor_url_) {
++    SetDiverged(false);
++  }
++  anchor_url_ = std::move(url);
++  anchor_title_ = std::move(title);
++  Persist(kAnchorUrlKey,
++          anchor_url_.is_valid() ? anchor_url_.spec() : std::string());
++  Persist(kAnchorTitleKey, base::UTF16ToUTF8(anchor_title_));
++}
++
++void TabState::UpdateDiverged(content::NavigationHandle* handle) {
++  // The anchor and its redirects are on the anchor. Pages of a web app
++  // (same-document navigations), client redirects and reloads keep the state.
++  const GURL anchor = anchor_url_.GetWithoutRef();
++  if (handle->GetURL().GetWithoutRef() == anchor ||
++      (!handle->GetRedirectChain().empty() &&
++       handle->GetRedirectChain().front().GetWithoutRef() == anchor)) {
++    SetDiverged(false);
++    return;
++  }
++  const ui::PageTransition transition = handle->GetPageTransition();
++  if (handle->IsSameDocument() ||
++      handle->GetReloadType() != content::ReloadType::NONE ||
++      ui::PageTransitionCoreTypeIs(transition, ui::PAGE_TRANSITION_RELOAD) ||
++      (transition & ui::PAGE_TRANSITION_CLIENT_REDIRECT)) {
++    return;
++  }
++  SetDiverged(true);
++}
++
++void TabState::SetDiverged(bool diverged) {
++  if (diverged_ == diverged) {
++    return;
++  }
++  diverged_ = diverged;
++  if (content::WebContents* contents = tab().GetContents()) {
++    contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
++  }
++}
++
++void TabState::RestoreFrom(
++    const std::map<std::string, std::string>& extra_data) {
++  if (auto it = extra_data.find(kCustomTitleKey); it != extra_data.end()) {
++    custom_title_ = base::UTF8ToUTF16(it->second);
++  }
++  if (auto it = extra_data.find(kAnchorUrlKey); it != extra_data.end()) {
++    anchor_url_ = GURL(it->second);
++  }
++  if (auto it = extra_data.find(kAnchorTitleKey); it != extra_data.end()) {
++    anchor_title_ = base::UTF8ToUTF16(it->second);
++  }
++}
++
++void TabState::Persist(const char* key, const std::string& value) {
++  content::WebContents* contents = tab().GetContents();
++  if (!contents) {
++    return;
++  }
++  SessionService* service = SessionServiceFactory::GetForProfile(
++      Profile::FromBrowserContext(contents->GetBrowserContext()));
++  const SessionID window_id =
++      sessions::SessionTabHelper::IdForWindowContainingTab(contents);
++  const SessionID tab_id = sessions::SessionTabHelper::IdForTab(contents);
++  if (!service || !window_id.is_valid() || !tab_id.is_valid()) {
++    return;
++  }
++  service->AddTabExtraData(window_id, tab_id, key, value);
++}
++
++void TabState::NotifyTitleChanged() {
++  if (content::WebContents* contents = tab().GetContents()) {
++    contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TITLE);
++  }
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/tab_state.h
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_TAB_STATE_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_TAB_STATE_H_
++
++#include <map>
++#include <string>
++
++#include "base/callback_list.h"
++#include "chrome/browser/ui/tabs/contents_observing_tab_feature.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++#include "url/gurl.h"
++
++namespace content {
++class NavigationEntry;
++class NavigationHandle;
++class WebContents;
++}  // namespace content
++
++namespace helium_plus {
++
++// Session extra data keys.
++inline constexpr char kCustomTitleKey[] = "helium_plus.custom_title";
++inline constexpr char kAnchorUrlKey[] = "helium_plus.anchor_url";
++inline constexpr char kAnchorTitleKey[] = "helium_plus.anchor_title";
++
++// Per-tab Helium+ state, owned by TabFeatures: a custom title and, for anchored
++// tabs (pinned or grouped), the URL the tab comes back to. Saved with the
++// session as tab extra data.
++class TabState : public tabs::ContentsObservingTabFeature {
++ public:
++  DECLARE_USER_DATA(TabState);
++
++  explicit TabState(tabs::TabInterface& tab);
++  TabState(const TabState&) = delete;
++  TabState& operator=(const TabState&) = delete;
++  ~TabState() override;
++
++  static TabState* From(tabs::TabInterface* tab);
++  static const TabState* From(const tabs::TabInterface* tab);
++  static TabState* FromWebContents(content::WebContents* contents);
++
++  // Keeps restored extra data on `contents` until its tab is created.
++  static void StashRestoredData(
++      content::WebContents* contents,
++      const std::map<std::string, std::string>& extra_data);
++
++  // Adds the state of the tab to session `extra_data`.
++  static void PopulateExtraData(
++      const tabs::TabInterface* tab,
++      std::map<std::string, std::string>* extra_data);
++
++  const std::u16string& custom_title() const { return custom_title_; }
++  // An empty title goes back to the page title.
++  void SetCustomTitle(std::u16string title);
++
++  bool IsAnchored() const;
++  const GURL& anchor_url() const { return anchor_url_; }
++  const std::u16string& anchor_title() const { return anchor_title_; }
++  void SetAnchorToCurrentPage();
++  // True when the user left the anchor page for another one: closing the tab
++  // first brings it back to its anchor.
++  bool IsDiverged() const { return diverged_; }
++
++  // content::WebContentsObserver:
++  void DidFinishNavigation(content::NavigationHandle* handle) override;
++  void TitleWasSet(content::NavigationEntry* entry) override;
++
++ private:
++  void OnAnchoringChanged();
++  void SetAnchor(GURL url, std::u16string title);
++  void UpdateDiverged(content::NavigationHandle* handle);
++  void SetDiverged(bool diverged);
++  void RestoreFrom(const std::map<std::string, std::string>& extra_data);
++  void Persist(const char* key, const std::string& value);
++  void NotifyTitleChanged();
++
++  std::u16string custom_title_;
++  GURL anchor_url_;
++  std::u16string anchor_title_;
++  bool diverged_ = false;
++  base::CallbackListSubscription pinned_subscription_;
++  base::CallbackListSubscription group_subscription_;
++  ui::ScopedUnownedUserData<TabState> scoped_unowned_user_data_;
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_TAB_STATE_H_
+--- a/chrome/browser/ui/tab_ui_helper.cc
++++ b/chrome/browser/ui/tab_ui_helper.cc
+@@ -19,6 +19,7 @@
+ #include "chrome/browser/sessions/session_restore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
+ #include "chrome/browser/ui/performance_controls/memory_saver_utils.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+@@ -127,6 +128,11 @@ base::CallbackListSubscription TabUIHelp
+ }
+ 
+ std::u16string TabUIHelper::GetTitle() const {
++  if (const auto* helium_plus_state = helium_plus::TabState::From(&tab());
++      helium_plus_state && !helium_plus_state->custom_title().empty()) {
++    return helium_plus_state->custom_title();
++  }
++
+   if (auto* tab_features = tab().GetTabFeatures()) {
+     const tab_groups::SavedTabGroupWebContentsListener* wc_listener =
+         tab_features->saved_tab_group_web_contents_listener();
+--- a/chrome/browser/ui/tabs/public/tab_features.h
++++ b/chrome/browser/ui/tabs/public/tab_features.h
+@@ -90,6 +90,10 @@ class TabCaptureContentsBorderHelper;
+ class TabContextDecryptionTokenTabHelper;
+ class TabResourceUsageTabHelper;
+ class TabUIHelper;
++
++namespace helium_plus {
++class TabState;
++}  // namespace helium_plus
+ class ThumbnailTabHelper;
+ class TranslatePageActionController;
+ class UMABrowsingActivityTabHelper;
+@@ -692,6 +696,7 @@ class TabFeatures {
+       contextual_cueing_web_contents_observer_;
+ 
+   std::unique_ptr<TabUIHelper> tab_ui_helper_;
++  std::unique_ptr<helium_plus::TabState> helium_plus_tab_state_;
+ 
+   std::unique_ptr<QwacWebContentsObserver> qwac_web_contents_observer_;
+ 
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -104,6 +104,7 @@
+ #include "chrome/browser/ui/search_engine_choice/search_engine_choice_tab_helper.h"
+ #include "chrome/browser/ui/side_panel/side_panel_registry.h"
+ #include "chrome/browser/ui/sync/browser_synced_tab_delegate.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/back_to_opener/back_to_opener_controller.h"
+@@ -659,6 +660,7 @@ void TabFeatures::Init(TabInterface& tab
+       GetUserDataFactory().CreateInstance<TabAttachmentTracker>(tab, &tab);
+ 
+   tab_ui_helper_ = GetUserDataFactory().CreateInstance<TabUIHelper>(tab, tab);
++  helium_plus_tab_state_ = std::make_unique<helium_plus::TabState>(tab);
+ 
+   task_manager::WebContentsTags::CreateForTabContents(tab.GetContents());
+ 
