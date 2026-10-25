@@ -1,9 +1,9 @@
 name: Helium+ update
-# Every other Monday: merges the latest Helium release, reapplies our patches
+# Every other Saturday: merges the latest Helium release, reapplies our patches
 # (Claude Code fixes conflicts), opens a pull request and starts the build.
 on:
   schedule:
-    - cron: "0 3 * * 1"
+    - cron: "0 3 * * 6"
   workflow_dispatch:
 
 permissions:

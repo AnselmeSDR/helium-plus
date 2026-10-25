@@ -118,7 +118,7 @@ tout seul vers le Helium officiel.
 
 ## Mise à jour depuis Helium
 
-Routine GitHub Actions, un lundi sur deux (semaine ISO paire), lançable à la main :
+Routine GitHub Actions, un samedi sur deux à 3 h UTC (semaine ISO paire ; build d'environ 14 h), lançable à la main :
 1. `helium-plus-update.yml` → `.github/helium-plus/update.sh` : s'il y a une nouvelle version de
    Helium, branche `update/<version>`, fusion de `upstream/main`, sources Chromium, `quilt push -a`.
    Conflits git ou patches qui ne s'appliquent plus : Claude Code (`claude -p`, consignes dans
