@@ -1,0 +1,712 @@
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -100,6 +100,7 @@
+ #import "chrome/browser/ui/cocoa/tab_menu_bridge.h"
+ #include "chrome/browser/ui/dialogs/browser_dialogs.h"
+ #include "chrome/browser/ui/extensions/application_launch.h"
++#include "chrome/browser/ui/helium_plus/profile_switcher.h"
+ #include "chrome/browser/ui/profiles/profile_picker.h"
+ #include "chrome/browser/ui/startup/first_run_service.h"
+ #include "chrome/browser/ui/startup/google_chrome_scheme_util.h"
+@@ -1886,6 +1887,12 @@ class AppControllerProfileObserver : pub
+     }
+   }
+ 
++  // Helium+: the windows of other profiles are hidden, not closed (see
++  // profile_switcher.h): show one again rather than opening a new window.
++  if (helium_plus::ShowHiddenBrowserWindow()) {
++    return NO;
++  }
++
+   base::FilePath lastProfilePath = GetStartupProfilePathMac();
+   DCHECK_NE(lastProfilePath, ProfileManager::GetSystemProfilePath());
+ 
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3561,6 +3561,8 @@ static_library("ui") {
+       "helium_plus/anchored_tabs.h",
+       "helium_plus/hibernation_service.cc",
+       "helium_plus/hibernation_service.h",
++      "helium_plus/profile_switcher.cc",
++      "helium_plus/profile_switcher.h",
+       "helium_plus/strings.cc",
+       "helium_plus/strings.h",
+       "helium_plus/tab_commands.cc",
+@@ -3571,6 +3573,8 @@ static_library("ui") {
+       "views/helium/frame_corner_radius.h",
+       "views/helium_plus/group_tabs_popover.cc",
+       "views/helium_plus/group_tabs_popover.h",
++      "views/helium_plus/profile_switcher_view.cc",
++      "views/helium_plus/profile_switcher_view.h",
+       "views/helium_plus/tab_rename_dialog.cc",
+       "views/helium_plus/tab_rename_dialog.h",
+       "views/helium/native_frame_materials.cc",
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/profile_switcher.cc
+@@ -0,0 +1,142 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/profile_switcher.h"
++
++#include <algorithm>
++
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_entry.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_window.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "ui/base/base_window.h"
++
++namespace helium_plus {
++
++namespace {
++
++BrowserWindowInterface* FindLastActiveWindow(Profile* profile) {
++  BrowserWindowInterface* found = nullptr;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&found](BrowserWindowInterface* browser) {
++        if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++          return true;
++        }
++        found = browser;
++        return false;
++      },
++      BrowserCollection::Order::kActivation);
++  return found;
++}
++
++void ShowInPlaceOf(BrowserWindowInterface* from, BrowserWindowInterface* to) {
++  if (from == to) {
++    return;
++  }
++  ui::BaseWindow* from_window = from->GetWindow();
++  ui::BaseWindow* to_window = to->GetWindow();
++  // Fullscreen windows live in their own space: only swap regular windows.
++  const bool swap = !from_window->IsFullscreen() && !to_window->IsFullscreen();
++  if (swap) {
++    to_window->SetBounds(from_window->GetBounds());
++  }
++  // Same tab strip width and collapse state, as if it were the same window.
++  auto* from_strip = tabs::VerticalTabStripStateController::From(from);
++  auto* to_strip = tabs::VerticalTabStripStateController::From(to);
++  if (from_strip && to_strip) {
++    to_strip->SetUncollapsedWidth(from_strip->GetUncollapsedWidth());
++    if (to_strip->IsCollapsed() != from_strip->IsCollapsed()) {
++      to_strip->RequestCollapse(from_strip->IsCollapsed());
++    }
++  }
++  if (to_window->IsMinimized()) {
++    to_window->Restore();
++  }
++  to_window->Show();
++  if (swap) {
++    from_window->Hide();
++  }
++}
++
++}  // namespace
++
++std::vector<ProfileAttributesEntry*> GetSwitchableProfiles() {
++  std::vector<ProfileAttributesEntry*> profiles =
++      g_browser_process->profile_manager()
++          ->GetProfileAttributesStorage()
++          .GetAllProfilesAttributesSortedForDisplay();
++  std::erase_if(profiles, [](ProfileAttributesEntry* entry) {
++    return entry->IsOmitted();
++  });
++  return profiles;
++}
++
++void SwitchToProfile(BrowserWindowInterface* from, const base::FilePath& path) {
++  if (path == from->GetProfile()->GetPath()) {
++    return;
++  }
++  Profile* profile =
++      g_browser_process->profile_manager()->GetProfileByPath(path);
++  if (BrowserWindowInterface* to =
++          profile ? FindLastActiveWindow(profile) : nullptr) {
++    ShowInPlaceOf(from, to);
++    return;
++  }
++  profiles::SwitchToProfile(path, /*always_create=*/false,
++                            base::BindOnce(
++                                [](base::WeakPtr<BrowserWindowInterface> from,
++                                   BrowserWindowInterface* to) {
++                                  if (from && to) {
++                                    ShowInPlaceOf(from.get(), to);
++                                  }
++                                },
++                                from->GetWeakPtr()));
++}
++
++void SwitchToAdjacentProfile(BrowserWindowInterface* from, bool forward) {
++  const std::vector<ProfileAttributesEntry*> profiles = GetSwitchableProfiles();
++  const base::FilePath& current = from->GetProfile()->GetPath();
++  auto it =
++      std::ranges::find(profiles, current, &ProfileAttributesEntry::GetPath);
++  if (it == profiles.end()) {
++    return;
++  }
++  // Like Arc, no wrapping around past the first or last profile.
++  if (forward ? std::next(it) == profiles.end() : it == profiles.begin()) {
++    return;
++  }
++  SwitchToProfile(from,
++                  (*(forward ? std::next(it) : std::prev(it)))->GetPath());
++}
++
++bool ShowHiddenBrowserWindow() {
++  BrowserWindowInterface* hidden = nullptr;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&hidden](BrowserWindowInterface* browser) {
++        ui::BaseWindow* window = browser->GetWindow();
++        if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++            window->IsVisible() || window->IsMinimized()) {
++          return true;
++        }
++        hidden = browser;
++        return false;
++      },
++      BrowserCollection::Order::kActivation);
++  if (!hidden) {
++    return false;
++  }
++  hidden->GetWindow()->Show();
++  return true;
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/profile_switcher.h
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_PROFILE_SWITCHER_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_PROFILE_SWITCHER_H_
++
++#include <vector>
++
++class BrowserWindowInterface;
++class ProfileAttributesEntry;
++
++namespace base {
++class FilePath;
++}
++
++namespace helium_plus {
++
++// Like Arc spaces, each profile keeps its own window (its own cookies and
++// accounts) but only one is shown at a time: switching profile shows the other
++// profile's window in place of the current one, which is hidden, not closed.
++
++// Profiles to switch between, in their stored order (`profile.profiles_order`
++// in Local State), like Arc spaces.
++std::vector<ProfileAttributesEntry*> GetSwitchableProfiles();
++
++// Shows the window of the profile at `path` in place of `from`, opening one if
++// the profile has none.
++void SwitchToProfile(BrowserWindowInterface* from, const base::FilePath& path);
++
++// Switches to the previous or next profile, if there is one.
++void SwitchToAdjacentProfile(BrowserWindowInterface* from, bool forward);
++
++// Shows the most recently active hidden browser window, if any, and returns
++// whether one was shown.
++bool ShowHiddenBrowserWindow();
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_PROFILE_SWITCHER_H_
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -43,6 +43,7 @@
+ #include "chrome/browser/ui/views/frame/safe_invoke/safe_invoke.h"
+ #include "chrome/browser/ui/views/frame/shadow_frame_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium_plus/profile_switcher_view.h"
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+@@ -156,6 +157,11 @@ VerticalTabStripRegionView::VerticalTabS
+       gfx::Insets::TLBR(kBottomContainerGap, region_horizontal_padding,
+                         0, region_horizontal_padding));
+ 
++  // Helium+: profile icons and two-finger swipe to switch profile, like Arc.
++  helium_plus::ProfileSwitcherView::AddToTabStrip(
++      content_area_view_, browser_view->browser(), state_controller_, this,
++      gfx::Insets::VH(kBottomContainerGap, region_horizontal_padding));
++
+   gemini_button_ =
+       content_area_view_->AddChildView(std::make_unique<views::View>());
+ 
+@@ -907,6 +913,16 @@ void VerticalTabStripRegionView::UpdateI
+ 
+ void VerticalTabStripRegionView::OnCollapseStateChanged(
+     tabs::VerticalTabStripCollapseState state) {
++  // Helium+: follow a width set on the state controller, so that every profile
++  // window has the same tab strip width (see helium_plus/profile_switcher.h).
++  if (!state_controller_->IsResizing() &&
++      target_collapse_state_.uncollapsed_width !=
++          state_controller_->GetUncollapsedWidth()) {
++    target_collapse_state_.uncollapsed_width =
++        state_controller_->GetUncollapsedWidth();
++    InvalidateLayout();
++  }
++
+   // Apply padding immediately at the start of the animation by including
+   // the collapsing state.
+   bool collapsed = state != tabs::VerticalTabStripCollapseState::kExpanded;
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/profile_switcher_view.cc
+@@ -0,0 +1,333 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium_plus/profile_switcher_view.h"
++
++#include <cmath>
++#include <string>
++#include <string_view>
++
++#include "base/feature_list.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ref.h"
++#include "base/time/time.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_entry.h"
++#include "chrome/browser/profiles/profile_avatar_icon_util.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium_plus/profile_switcher.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_ink_drop_util.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/events/event.h"
++#include "ui/events/event_handler.h"
++#include "ui/gfx/vector_icon_types.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/layout/flex_layout_types.h"
++#include "ui/views/view_class_properties.h"
++
++namespace helium_plus {
++
++namespace {
++
++// Same feel as Chromium's swipe between focused tab groups
++// (VerticalTabStripFocusSwipeController).
++constexpr float kAxisLockThreshold = 15.0f;
++constexpr float kSwipeThreshold = 75.0f;
++constexpr base::TimeDelta kGestureResetTimeout = base::Milliseconds(300);
++
++// The gesture that switched profile goes on over the window shown in its
++// place: it must not switch again.
++base::TimeTicks g_last_switch_gesture_event;
++
++// Icon shown instead of the avatar, like an Arc space icon: its name is stored
++// under this key in the profile's Local State entry (profile.info_cache).
++constexpr char kProfileIconKey[] = "helium_plus_icon";
++
++struct NamedIcon {
++  std::string_view name;
++  raw_ref<const gfx::VectorIcon> icon;
++};
++
++const gfx::VectorIcon* GetProfileIcon(const base::FilePath& path) {
++  static const NamedIcon kIcons[] = {
++      {"code", raw_ref(vector_icons::kCodeIcon)},
++      {"computer", raw_ref(vector_icons::kDesktopWindowsIcon)},
++      {"game", raw_ref(vector_icons::kVideogameAssetIcon)},
++      {"home", raw_ref(vector_icons::kHomeIcon)},
++      {"work", raw_ref(vector_icons::kWorkIcon)},
++  };
++  const base::DictValue* entry = g_browser_process->local_state()
++                                     ->GetDict(prefs::kProfileAttributes)
++                                     .FindDict(path.BaseName().AsUTF8Unsafe());
++  const std::string* name =
++      entry ? entry->FindString(kProfileIconKey) : nullptr;
++  if (!name) {
++    return nullptr;
++  }
++  for (const NamedIcon& icon : kIcons) {
++    if (icon.name == *name) {
++      return &*icon.icon;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++class ProfileSwitcherView::SwipeHandler : public ui::EventHandler {
++ public:
++  SwipeHandler(BrowserWindowInterface* browser, views::View* swipe_area)
++      : browser_(browser), swipe_area_(swipe_area) {
++    swipe_area_->AddPreTargetHandler(this);
++  }
++  SwipeHandler(const SwipeHandler&) = delete;
++  SwipeHandler& operator=(const SwipeHandler&) = delete;
++  ~SwipeHandler() override { swipe_area_->RemovePreTargetHandler(this); }
++
++  // ui::EventHandler:
++  void OnScrollEvent(ui::ScrollEvent* event) override {
++    // Chromium's swipe between focused tab groups takes precedence.
++    if (base::FeatureList::IsEnabled(features::kTabGroupsFocusing)) {
++      return;
++    }
++    if (event->type() == ui::EventType::kScrollFlingStart ||
++        event->type() == ui::EventType::kScrollFlingCancel) {
++      ConsumeIfSwiping(event);
++      Reset();
++      return;
++    }
++    // Momentum scrolling never switches profile.
++    if (event->momentum_phase() != ui::EventMomentumPhase::NONE) {
++      ConsumeIfSwiping(event);
++      if (event->momentum_phase() == ui::EventMomentumPhase::END) {
++        Reset();
++      }
++      return;
++    }
++    const base::TimeTicks now = base::TimeTicks::Now();
++    if (event->scroll_event_phase() == ui::ScrollEventPhase::kBegan ||
++        now - g_last_switch_gesture_event > kGestureResetTimeout) {
++      g_last_switch_gesture_event = base::TimeTicks();
++    }
++    if (!g_last_switch_gesture_event.is_null()) {
++      g_last_switch_gesture_event = now;
++      event->SetHandled();
++      return;
++    }
++    if (event->scroll_event_phase() == ui::ScrollEventPhase::kBegan ||
++        (!last_event_time_.is_null() &&
++         now - last_event_time_ > kGestureResetTimeout)) {
++      Reset();
++    }
++    last_event_time_ = now;
++    if (event->scroll_event_phase() == ui::ScrollEventPhase::kEnd) {
++      ConsumeIfSwiping(event);
++      Reset();
++      return;
++    }
++    ProcessOffset(event);
++  }
++
++ private:
++  enum class State { kNone, kHorizontal, kVertical };
++
++  void ProcessOffset(ui::ScrollEvent* event) {
++    if (state_ == State::kVertical) {
++      return;
++    }
++    cumulative_x_ += event->x_offset();
++    cumulative_y_ += event->y_offset();
++    if (state_ == State::kNone) {
++      if (std::abs(cumulative_y_) >= kAxisLockThreshold &&
++          std::abs(cumulative_y_) > std::abs(cumulative_x_)) {
++        state_ = State::kVertical;
++        return;
++      }
++      if (std::abs(cumulative_x_) >= kAxisLockThreshold &&
++          std::abs(cumulative_x_) > std::abs(cumulative_y_)) {
++        state_ = State::kHorizontal;
++      }
++    }
++    if (state_ != State::kHorizontal) {
++      return;
++    }
++    ConsumeIfSwiping(event);
++    if (std::abs(cumulative_x_) >= kSwipeThreshold) {
++      // Fingers moving left show the next profile, like Arc.
++      const bool forward = cumulative_x_ < 0;
++      Reset();
++      g_last_switch_gesture_event = base::TimeTicks::Now();
++      SwitchToAdjacentProfile(browser_, forward);
++    }
++  }
++
++  void ConsumeIfSwiping(ui::Event* event) {
++    if (state_ == State::kHorizontal) {
++      event->SetHandled();
++      event->StopPropagation();
++    }
++  }
++
++  void Reset() {
++    state_ = State::kNone;
++    cumulative_x_ = 0.0f;
++    cumulative_y_ = 0.0f;
++  }
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<views::View> swipe_area_;
++  State state_ = State::kNone;
++  float cumulative_x_ = 0.0f;
++  float cumulative_y_ = 0.0f;
++  base::TimeTicks last_event_time_;
++};
++
++ProfileSwitcherView::ProfileSwitcherView(
++    BrowserWindowInterface* browser,
++    tabs::VerticalTabStripStateController* state_controller,
++    views::View* swipe_area)
++    : browser_(browser) {
++  // Icons 2px apart, shrinking when they do not all fit in a narrow tab strip.
++  SetDefault(views::kMarginsKey, gfx::Insets(1));
++  SetDefault(views::kFlexBehaviorKey,
++             views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToZero,
++                                      views::MaximumFlexSizeRule::kPreferred));
++  if (!browser_->GetProfile()->IsRegularProfile()) {
++    SetVisible(false);
++    return;
++  }
++  swipe_handler_ = std::make_unique<SwipeHandler>(browser_, swipe_area);
++  OnCollapseChanged(state_controller->GetCollapseState());
++  collapse_subscription_ =
++      state_controller->RegisterOnCollapseChanged(base::BindRepeating(
++          &ProfileSwitcherView::OnCollapseChanged, base::Unretained(this)));
++  storage_observation_.Observe(
++      &g_browser_process->profile_manager()->GetProfileAttributesStorage());
++  Rebuild();
++}
++
++ProfileSwitcherView::~ProfileSwitcherView() = default;
++
++// static
++void ProfileSwitcherView::AddToTabStrip(
++    views::View* parent,
++    BrowserWindowInterface* browser,
++    tabs::VerticalTabStripStateController* state_controller,
++    views::View* swipe_area,
++    const gfx::Insets& margins) {
++  // Takes the space left below the tabs (after the new tab button, when shown)
++  // and gives it back first when they need it.
++  parent->AddChildView(std::make_unique<views::View>())
++      ->SetProperty(
++          views::kFlexBehaviorKey,
++          views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToZero,
++                                   views::MaximumFlexSizeRule::kUnbounded)
++              .WithOrder(2));
++  parent
++      ->AddChildView(std::make_unique<ProfileSwitcherView>(
++          browser, state_controller, swipe_area))
++      ->SetProperty(views::kMarginsKey, margins);
++}
++
++void ProfileSwitcherView::Rebuild() {
++  RemoveAllChildViews();
++  const std::vector<ProfileAttributesEntry*> profiles = GetSwitchableProfiles();
++  SetVisible(profiles.size() > 1);
++  if (!GetVisible()) {
++    return;
++  }
++
++  const int icon_size =
++      GetLayoutConstant(LayoutConstant::kVerticalTabStripButtonIconSize);
++  const int button_size =
++      GetLayoutConstant(LayoutConstant::kVerticalTabStripCollapseButtonSize);
++  const base::FilePath& current = browser_->GetProfile()->GetPath();
++  for (ProfileAttributesEntry* entry : profiles) {
++    const base::FilePath path = entry->GetPath();
++    auto button = std::make_unique<views::ImageButton>(base::BindRepeating(
++        [](BrowserWindowInterface* browser, const base::FilePath& path) {
++          SwitchToProfile(browser, path);
++        },
++        browser_, path));
++    const gfx::VectorIcon* icon = GetProfileIcon(path);
++    button->SetImageModel(
++        views::Button::STATE_NORMAL,
++        icon ? ui::ImageModel::FromVectorIcon(
++                   *icon, kColorTabForegroundInactiveFrameActive, icon_size)
++             : ui::ImageModel::FromImage(profiles::GetSizedAvatarIcon(
++                   entry->GetAvatarIcon(icon_size), icon_size, icon_size,
++                   profiles::SHAPE_CIRCLE)));
++    button->SetImageHorizontalAlignment(views::ImageButton::ALIGN_CENTER);
++    button->SetImageVerticalAlignment(views::ImageButton::ALIGN_MIDDLE);
++    button->SetPreferredSize(gfx::Size(button_size, button_size));
++    button->SetTooltipText(entry->GetName());
++    button->GetViewAccessibility().SetName(entry->GetName());
++    ConfigureInkDrop(button.get());
++    if (path == current) {
++      button->SetBackground(views::CreateRoundedRectBackground(
++          kColorTabBackgroundActiveFrameActive,
++          GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius)));
++    }
++    AddChildView(std::move(button));
++  }
++}
++
++void ProfileSwitcherView::OnCollapseChanged(
++    tabs::VerticalTabStripCollapseState state) {
++  // Stacked vertically when the tab strip is collapsed to icons.
++  const bool expanded = state == tabs::VerticalTabStripCollapseState::kExpanded;
++  SetOrientation(expanded ? views::LayoutOrientation::kHorizontal
++                          : views::LayoutOrientation::kVertical);
++  SetMainAxisAlignment(expanded ? views::LayoutAlignment::kCenter
++                                : views::LayoutAlignment::kEnd);
++  SetCrossAxisAlignment(expanded ? views::LayoutAlignment::kEnd
++                                 : views::LayoutAlignment::kCenter);
++}
++
++void ProfileSwitcherView::OnProfileAdded(const base::FilePath&) {
++  Rebuild();
++}
++
++void ProfileSwitcherView::OnProfileWasRemoved(const base::FilePath&,
++                                              const std::u16string&) {
++  Rebuild();
++}
++
++void ProfileSwitcherView::OnProfileNameChanged(const base::FilePath&,
++                                               const std::u16string&) {
++  Rebuild();
++}
++
++void ProfileSwitcherView::OnProfileAvatarChanged(const base::FilePath&) {
++  Rebuild();
++}
++
++void ProfileSwitcherView::OnProfileHighResAvatarLoaded(const base::FilePath&) {
++  Rebuild();
++}
++
++void ProfileSwitcherView::OnProfileIsOmittedChanged(const base::FilePath&) {
++  Rebuild();
++}
++
++void ProfileSwitcherView::OnProfileThemeColorsChanged(const base::FilePath&) {
++  Rebuild();
++}
++
++BEGIN_METADATA(ProfileSwitcherView)
++END_METADATA
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/profile_switcher_view.h
+@@ -0,0 +1,85 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_PROFILE_SWITCHER_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_PROFILE_SWITCHER_VIEW_H_
++
++#include <memory>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_attributes_storage_observer.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/layout/flex_layout_view.h"
++
++class BrowserWindowInterface;
++
++namespace gfx {
++class Insets;
++}
++
++namespace tabs {
++class VerticalTabStripStateController;
++enum class VerticalTabStripCollapseState;
++}  // namespace tabs
++
++namespace helium_plus {
++
++// Like Arc's spaces bar: one icon per profile at the bottom of the vertical tab
++// strip, the current profile highlighted. Clicking an icon, or swiping
++// horizontally with two fingers across `swipe_area`, switches profile (see
++// profile_switcher.h). Hidden when there is a single profile.
++class ProfileSwitcherView : public views::FlexLayoutView,
++                            public ProfileAttributesStorageObserver {
++  METADATA_HEADER(ProfileSwitcherView, views::FlexLayoutView)
++
++ public:
++  ProfileSwitcherView(BrowserWindowInterface* browser,
++                      tabs::VerticalTabStripStateController* state_controller,
++                      views::View* swipe_area);
++  ProfileSwitcherView(const ProfileSwitcherView&) = delete;
++  ProfileSwitcherView& operator=(const ProfileSwitcherView&) = delete;
++  ~ProfileSwitcherView() override;
++
++  // Adds the icons at the end of `parent`, the vertical tab strip content,
++  // below an empty space that keeps them at the bottom while the tabs do not
++  // need it.
++  static void AddToTabStrip(
++      views::View* parent,
++      BrowserWindowInterface* browser,
++      tabs::VerticalTabStripStateController* state_controller,
++      views::View* swipe_area,
++      const gfx::Insets& margins);
++
++ private:
++  class SwipeHandler;
++
++  void Rebuild();
++  void OnCollapseChanged(tabs::VerticalTabStripCollapseState state);
++
++  // ProfileAttributesStorageObserver:
++  void OnProfileAdded(const base::FilePath& profile_path) override;
++  void OnProfileWasRemoved(const base::FilePath& profile_path,
++                           const std::u16string& profile_name) override;
++  void OnProfileNameChanged(const base::FilePath& profile_path,
++                            const std::u16string& old_profile_name) override;
++  void OnProfileAvatarChanged(const base::FilePath& profile_path) override;
++  void OnProfileHighResAvatarLoaded(
++      const base::FilePath& profile_path) override;
++  void OnProfileIsOmittedChanged(const base::FilePath& profile_path) override;
++  void OnProfileThemeColorsChanged(const base::FilePath& profile_path) override;
++
++  const raw_ptr<BrowserWindowInterface> browser_;
++  std::unique_ptr<SwipeHandler> swipe_handler_;
++  base::CallbackListSubscription collapse_subscription_;
++  base::ScopedObservation<ProfileAttributesStorage,
++                          ProfileAttributesStorageObserver>
++      storage_observation_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_PROFILE_SWITCHER_VIEW_H_
+--- a/chrome/browser/prefs/session_startup_pref.cc
++++ b/chrome/browser/prefs/session_startup_pref.cc
+@@ -66,12 +66,9 @@ SessionStartupPref::Type SessionStartupP
+ #if BUILDFLAG(IS_CHROMEOS)
+   return SessionStartupPref::LAST;
+ #else
+-#if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC)
+-  if (features::kSetDefaultToContinueSession.Get()) {
+-    return SessionStartupPref::LAST;
+-  }
+-#endif
+-  return SessionStartupPref::DEFAULT;
++  // Helium+: like Arc spaces, a profile always reopens its tabs, also when the
++  // profile switcher opens its window (see helium_plus/profile_switcher.h).
++  return SessionStartupPref::LAST;
+ #endif
+ }
+ 
