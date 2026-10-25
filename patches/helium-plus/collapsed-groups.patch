@@ -11,7 +11,7 @@
                  tab_strip_model->group_model()->GetTabGroup(group_id.value())) {
 --- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
-@@ -6,6 +6,7 @@
+@@ -6,12 +6,14 @@
  
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
@@ -19,7 +19,14 @@
  #include "chrome/browser/ui/tabs/tab_enums.h"
  #include "chrome/browser/ui/tabs/tab_group_data.h"
  #include "chrome/browser/ui/tabs/tab_style.h"
-@@ -32,6 +33,7 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium_plus/group_tabs_popover.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+@@ -32,6 +34,7 @@
  #include "components/tabs/public/tab_collection_types.h"
  #include "components/tabs/public/tab_group.h"
  #include "components/tabs/public/tab_group_tab_collection.h"
@@ -27,7 +34,27 @@
  #include "content/public/browser/navigation_controller.h"
  #include "ui/base/metadata/metadata_impl_macros.h"
  #include "ui/base/models/list_selection_model.h"
-@@ -340,8 +342,24 @@ void TabGroupView::UpdateChildVisibility
+@@ -109,6 +112,9 @@ TabGroupView::TabGroupView(TabCollection
+           base::BindRepeating(&TabGroupView::OnDataChanged,
+                               base::Unretained(this)));
+   OnDataChanged();
++  if (orientation_ == TabStripOrientation::kVertical) {
++    tabs_popover_ = std::make_unique<helium_plus::GroupTabsPopover>(*this);
++  }
+ }
+ 
+ TabGroupView::~TabGroupView() = default;
+@@ -328,6 +334,9 @@ void TabGroupView::SetIsCollapsed(bool i
+     return;
+   }
+   is_collapsed_ = is_collapsed;
++  if (tabs_popover_) {
++    tabs_popover_->Hide();
++  }
+   // Reset the cached available space so stale collapsed bounds (which only
+   // accommodated the header chip) do not constrain group tabs when expanding.
+   available_space_ = views::SizeBound();
+@@ -340,8 +349,24 @@ void TabGroupView::UpdateChildVisibility
      return;
    }
    SetIsCollapsed(collapsed);
@@ -53,9 +80,49 @@
    }
  }
  
+@@ -469,11 +494,23 @@ void TabGroupView::UpdateHoverCard(int u
+     return;
+   }
+ 
+-  if (TabHoverCardController* hover_card_controller =
+-          collection_node_->GetController()->GetHoverCardController()) {
+-    hover_card_controller->UpdateHoverCard(
+-        group_header_,
+-        static_cast<TabSlotController::HoverCardUpdateType>(update_type));
++  const auto type = static_cast<TabSlotController::HoverCardUpdateType>(
++      update_type);
++  TabHoverCardController* hover_card_controller =
++      collection_node_->GetController()->GetHoverCardController();
++  // Helium+: a collapsed vertical group lists its tabs in a popover instead.
++  if (tabs_popover_ && IsCollapsed()) {
++    if (type == TabSlotController::HoverCardUpdateType::kHover) {
++      tabs_popover_->OnHeaderHovered();
++    }
++    if (hover_card_controller) {
++      hover_card_controller->UpdateHoverCard(nullptr, type);
++    }
++    return;
++  }
++
++  if (hover_card_controller) {
++    hover_card_controller->UpdateHoverCard(group_header_, type);
+   }
+ }
+ 
 --- a/chrome/browser/ui/views/tabs/common/tab_group_view.h
 +++ b/chrome/browser/ui/views/tabs/common/tab_group_view.h
-@@ -79,6 +79,11 @@ class TabGroupView : public TabCollectio
+@@ -21,6 +21,10 @@ class TabCollectionNode;
+ class TabGroupHeaderView;
+ class TabGroupLineView;
+ 
++namespace helium_plus {
++class GroupTabsPopover;
++}
++
+ namespace tabs {
+ class TabGroupDataObserver;
+ }
+@@ -79,6 +83,11 @@ class TabGroupView : public TabCollectio
  
    bool IsCollapsed() const;
  
@@ -67,6 +134,16 @@
    std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
        const gfx::Point& point_in_local_coords);
  
+@@ -141,6 +150,9 @@ class TabGroupView : public TabCollectio
+   // reacting immediately to visual data updates during animation.
+   bool is_collapsed_ = false;
+ 
++  // Helium+: lists the tabs of a collapsed vertical group on header hover.
++  std::unique_ptr<helium_plus::GroupTabsPopover> tabs_popover_;
++
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
+ 
+   std::unique_ptr<tabs::TabGroupDataObserver> tab_group_data_observer_;
 --- a/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
 +++ b/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
 @@ -113,6 +113,9 @@ views::ProposedLayout TabGroupViewLayout
@@ -149,3 +226,275 @@
          group_view->ToggleCollapsedState(
              ToggleTabGroupCollapsedStateOrigin::kMenuAction);
        }
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3569,6 +3569,8 @@ static_library("ui") {
+       "helium_plus/tab_state.h",
+       "views/helium/frame_corner_radius.cc",
+       "views/helium/frame_corner_radius.h",
++      "views/helium_plus/group_tabs_popover.cc",
++      "views/helium_plus/group_tabs_popover.h",
+       "views/helium_plus/tab_rename_dialog.cc",
+       "views/helium_plus/tab_rename_dialog.h",
+       "views/helium/native_frame_materials.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/group_tabs_popover.cc
+@@ -0,0 +1,196 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium_plus/group_tabs_popover.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/controls/hover_button.h"
++#include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/common/tab_group_header_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "ui/base/mojom/ui_base_types.mojom-shared.h"
++#include "ui/color/color_id.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/outsets.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/view_utils.h"
++
++namespace helium_plus {
++
++namespace {
++
++constexpr base::TimeDelta kShowDelay = base::Milliseconds(300);
++constexpr int kPopoverWidth = 280;
++constexpr int kPopoverMaxHeight = 480;
++// Space between the tab strip and the popover.
++constexpr int kStripGap = 8;
++
++// Returns the header row widened to the whole tab strip, plus the gap.
++gfx::Rect GetAnchorRect(const views::View& header) {
++  gfx::Rect rect = header.GetBoundsInScreen();
++  for (const views::View* view = &header; view; view = view->parent()) {
++    if (views::IsViewClass<VerticalTabStripRegionView>(view)) {
++      const gfx::Rect strip = view->GetBoundsInScreen();
++      rect.set_x(strip.x());
++      rect.set_width(strip.width());
++      break;
++    }
++  }
++  rect.Outset(gfx::Outsets::VH(0, kStripGap));
++  return rect;
++}
++
++}  // namespace
++
++// Keeps the popover open while the mouse is over it, or over the header row
++// up to the popover.
++class GroupTabsPopover::Host : public views::MouseWatcherHost {
++ public:
++  explicit Host(GroupTabsPopover& popover) : popover_(popover) {}
++
++  // views::MouseWatcherHost:
++  bool Contains(const gfx::Point& screen_point, EventType type) override {
++    if (!popover_->widget_) {
++      return false;
++    }
++    const gfx::Rect popover_bounds =
++        popover_->widget_->GetWindowBoundsInScreen();
++    const gfx::Rect header_bounds =
++        popover_->group_view_->group_header()->GetBoundsInScreen();
++    const int left = std::min(popover_bounds.x(), header_bounds.x());
++    const int right = std::max(popover_bounds.right(), header_bounds.right());
++    const gfx::Rect header_row(left, header_bounds.y(), right - left,
++                               header_bounds.height());
++    return popover_bounds.Contains(screen_point) ||
++           header_row.Contains(screen_point);
++  }
++
++ private:
++  const raw_ref<GroupTabsPopover> popover_;
++};
++
++GroupTabsPopover::GroupTabsPopover(TabGroupView& group_view)
++    : group_view_(group_view) {}
++
++GroupTabsPopover::~GroupTabsPopover() = default;
++
++void GroupTabsPopover::OnHeaderHovered() {
++  if (widget_) {
++    return;
++  }
++  show_timer_.Start(
++      FROM_HERE, kShowDelay,
++      base::BindOnce(&GroupTabsPopover::Show, base::Unretained(this)));
++}
++
++void GroupTabsPopover::Hide() {
++  show_timer_.Stop();
++  if (mouse_watcher_) {
++    mouse_watcher_->Stop();
++  }
++  if (widget_ && !widget_->IsClosed()) {
++    widget_->CloseWithReason(views::Widget::ClosedReason::kUnspecified);
++  }
++}
++
++void GroupTabsPopover::Show() {
++  TabGroupHeaderView* header = group_view_->group_header();
++  const TabCollectionNode* node = group_view_->collection_node();
++  if (widget_ || !node || !group_view_->IsCollapsed() ||
++      !header->IsMouseHovered() || !header->GetWidget()) {
++    return;
++  }
++
++  auto tab_list = std::make_unique<views::View>();
++  tab_list->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kVertical));
++  for (const views::View* child : node->GetDirectChildren()) {
++    const TabView* tab_view = views::AsViewClass<TabView>(child);
++    const tabs::TabInterface* tab =
++        tab_view ? tab_view->GetTabInterface() : nullptr;
++    if (!tab) {
++      continue;
++    }
++    tab_list->AddChildView(std::make_unique<HoverButton>(
++        base::BindRepeating(&GroupTabsPopover::ActivateTab,
++                            weak_factory_.GetWeakPtr(), tab->GetHandle()),
++        tab_view->data().favicon, tab_view->data().title));
++  }
++  if (tab_list->children().empty()) {
++    return;
++  }
++  auto contents = std::make_unique<views::ScrollView>();
++  contents->SetContents(std::move(tab_list));
++  contents->ClipHeightTo(0, kPopoverMaxHeight);
++  contents->SetHorizontalScrollBarMode(
++      views::ScrollView::ScrollBarMode::kDisabled);
++  // Opaque, as the tab titles use subpixel text rendering.
++  contents->SetBackgroundColor(ui::kColorBubbleBackground);
++
++  // Opens away from the window edge the tab strip is on.
++  const bool strip_on_right =
++      header->GetBoundsInScreen().CenterPoint().x() >
++      header->GetWidget()->GetWindowBoundsInScreen().CenterPoint().x();
++  delegate_ = std::make_unique<views::BubbleDialogDelegate>(
++      nullptr, strip_on_right ? views::BubbleBorder::RIGHT_TOP
++                              : views::BubbleBorder::LEFT_TOP);
++  delegate_->SetAnchorRect(GetAnchorRect(*header));
++  delegate_->set_parent_window(header->GetWidget()->GetNativeView());
++  delegate_->SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
++  delegate_->SetShowCloseButton(false);
++  delegate_->SetShowTitle(false);
++  delegate_->SetCanActivate(false);
++  delegate_->set_margins(gfx::Insets::VH(4, 0));
++  delegate_->set_fixed_width(kPopoverWidth);
++  delegate_->SetContentsView(std::move(contents));
++
++  widget_ = views::BubbleDialogDelegate::CreateBubble(
++      delegate_.get(), base::BindOnce(&GroupTabsPopover::OnClosed,
++                                      weak_factory_.GetWeakPtr()));
++  widget_->ShowInactive();
++
++  mouse_watcher_ =
++      std::make_unique<views::MouseWatcher>(std::make_unique<Host>(*this), this);
++  mouse_watcher_->Start(header->GetWidget()->GetNativeWindow());
++}
++
++void GroupTabsPopover::ActivateTab(tabs::TabHandle handle) {
++  Hide();
++  tabs::TabInterface* tab = handle.Get();
++  if (!tab) {
++    return;
++  }
++  TabStripModel* model = tab->GetBrowserWindowInterface()->GetTabStripModel();
++  const int index = model->GetIndexOfTab(tab);
++  if (index != TabStripModel::kNoTab) {
++    model->ActivateTabAt(index);
++  }
++}
++
++void GroupTabsPopover::OnClosed(views::Widget::ClosedReason reason) {
++  mouse_watcher_.reset();
++  // The widget is still closing: delete it, then its delegate, later.
++  auto task_runner = base::SingleThreadTaskRunner::GetCurrentDefault();
++  task_runner->DeleteSoon(FROM_HERE, std::move(widget_));
++  task_runner->DeleteSoon(FROM_HERE, std::move(delegate_));
++}
++
++void GroupTabsPopover::MouseMovedOutOfHost() {
++  Hide();
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/group_tabs_popover.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_GROUP_TABS_POPOVER_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_GROUP_TABS_POPOVER_H_
++
++#include <memory>
++
++#include "base/memory/raw_ref.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/views/mouse_watcher.h"
++#include "ui/views/widget/widget.h"
++
++class TabGroupView;
++
++namespace views {
++class BubbleDialogDelegate;
++}
++
++namespace helium_plus {
++
++// Like Arc, hovering the header of a collapsed vertical tab group shows a
++// popover listing all its tabs, closed ones included; clicking one activates
++// it. The popover closes once the mouse leaves the header and the popover.
++class GroupTabsPopover : public views::MouseWatcherListener {
++ public:
++  explicit GroupTabsPopover(TabGroupView& group_view);
++  GroupTabsPopover(const GroupTabsPopover&) = delete;
++  GroupTabsPopover& operator=(const GroupTabsPopover&) = delete;
++  ~GroupTabsPopover() override;
++
++  // Shows the popover after a short delay if the header is still hovered.
++  void OnHeaderHovered();
++  void Hide();
++
++ private:
++  class Host;
++
++  void Show();
++  void ActivateTab(tabs::TabHandle tab);
++  void OnClosed(views::Widget::ClosedReason reason);
++
++  // views::MouseWatcherListener:
++  void MouseMovedOutOfHost() override;
++
++  const raw_ref<TabGroupView> group_view_;
++  base::OneShotTimer show_timer_;
++  std::unique_ptr<views::BubbleDialogDelegate> delegate_;
++  std::unique_ptr<views::Widget> widget_;
++  std::unique_ptr<views::MouseWatcher> mouse_watcher_;
++  base::WeakPtrFactory<GroupTabsPopover> weak_factory_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_GROUP_TABS_POPOVER_H_
