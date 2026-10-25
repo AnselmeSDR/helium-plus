@@ -113,9 +113,25 @@ build avec temps restant dans le titre Ghostty ; compiler un seul fichier :
 `autoninja -C out/Default ../../chemin/fichier.cc^`.
 
 Mise à jour officielle : Sparkle n'est activé que si `PROD_MACOS_SPARKLE_ED_PUB_KEY` est défini
-(`devutils/shared.sh`) ; ne jamais le définir dans notre CI.
+(`devutils/shared.sh`) ; ne jamais le définir dans notre CI : Helium+ ne doit pas se mettre à jour
+tout seul vers le Helium officiel.
 
 ## Mise à jour depuis Helium
+
+Routine GitHub Actions, un lundi sur deux (semaine ISO paire), lançable à la main :
+1. `helium-plus-update.yml` → `.github/helium-plus/update.sh` : s'il y a une nouvelle version de
+   Helium, branche `update/<version>`, fusion de `upstream/main`, sources Chromium, `quilt push -a`.
+   Conflits git ou patches qui ne s'appliquent plus : Claude Code (`claude -p`, consignes dans
+   `.github/helium-plus/resolve-conflicts.md`, secret `CLAUDE_CODE_OAUTH_TOKEN`). Puis PR vers
+   `main` et lancement du build ; en cas d'échec, une issue.
+2. `helium-plus-build.yml` : build arm64 via `building.yml` (celui de Helium), non signé
+   (`github_prepare_artifacts.sh` saute certificat et deltas Sparkle sans `MACOS_CERTIFICATE`),
+   publié en pré-release, commentaire sur la PR (notification GitHub).
+3. Validation en local, après test de l'app : fusionner la branche dans `main` et pousser
+   (`git fetch github update/<version>`, remote `github` = GitHub en lecture), ce qui ferme la PR.
+   Pour recompiler en local ensuite : `he reset` puis `he setup` si Chromium a changé de version.
+
+À la main :
 
 ```sh
 git fetch upstream && git merge upstream/main
@@ -133,7 +149,6 @@ Puis réappliquer et corriger nos patches (`quilt push -a` dans `build/src`), re
 - Mise en veille automatique : inactivité, RAM saturée, groupe replié, profil en arrière-plan
 - Traductions propres (i18n Helium) si les textes de `strings.cc` ne suffisent plus
 - Réglages (délais de mise en veille, ancrage au démarrage) dans les paramètres
-- CI GitHub pour les builds de release (sans clé Sparkle)
 
 Référence : PR abandonnée [imputnet/helium#1578](https://github.com/imputnet/helium/pull/1578)
 (anchored tabs, sur Chromium 148 ; la partie onglets verticaux est à réécrire : Chromium 156 a
