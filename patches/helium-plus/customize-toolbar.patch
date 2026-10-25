@@ -70,3 +70,17 @@
  };
  
  #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
+--- a/chrome/browser/ui/webui/side_panel/customize_chrome/customize_chrome_ui.cc
++++ b/chrome/browser/ui/webui/side_panel/customize_chrome/customize_chrome_ui.cc
+@@ -270,8 +270,10 @@ CustomizeChromeUI::CustomizeChromeUI(con
+        IDS_NTP_CUSTOMIZE_TOOLBAR_ENTERPRISE_ENABLED_LABEL},
+       {"toolbarButtonA11yLabel", IDS_NTP_CUSTOMIZE_TOOLBAR_BUTTON_A11Y_LABEL},
+       {"chooseToolbarIconsLabel", IDS_NTP_CUSTOMIZE_TOOLBAR_CHOOSE_ICONS_LABEL},
++      // Helium+: "Reset to Default" shares its translation with the zoom
++      // reset button (French: "Rétablir le niveau de zoom par défaut").
+       {"resetToDefaultButtonLabel",
+-       IDS_NTP_CUSTOMIZE_TOOLBAR_RESET_TO_DEFAULT_BUTTON_LABEL},
++       IDS_SETTINGS_SECURITY_BUNDLE_RESET_TO_DEFAULTS_BUTTON_LABEL},
+       {"resetToDefaultButtonAnnouncement",
+        IDS_NTP_CUSTOMIZE_TOOLBAR_RESET_TO_DEFAULT_ANNOUNCEMENT},
+       {"reorderTipLabel", IDS_NTP_CUSTOMIZE_TOOLBAR_REORDER_TIP_LABEL},
