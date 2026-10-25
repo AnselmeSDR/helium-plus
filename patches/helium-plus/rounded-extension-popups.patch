@@ -1,0 +1,29 @@
+--- a/chrome/browser/ui/views/extensions/extension_popup.cc
++++ b/chrome/browser/ui/views/extensions/extension_popup.cc
+@@ -10,10 +10,14 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "chrome/browser/devtools/devtools_window.h"
+ #include "chrome/browser/extensions/extension_view_host.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/extensions/security_dialog_tracker.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/common/pref_names.h"
+ #include "components/javascript_dialogs/app_modal_dialog_queue.h"
++#include "components/prefs/pref_service.h"
+ #include "components/web_modal/web_modal_utils.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/web_contents.h"
+@@ -268,7 +272,10 @@ ExtensionPopup::ExtensionPopup(
+       deferred_close_weak_ptr_factory_(this) {
+   g_last_popup_for_testing = this;
+   SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
+-  set_use_round_corners(false);
++  // Helium+: rounded like web contents when the rounded frame is enabled.
++  set_use_round_corners(browser_ &&
++                        browser_->GetProfile()->GetPrefs()->GetBoolean(
++                            prefs::kHeliumRoundedFrame));
+ 
+   set_margins(gfx::Insets());
+   SetLayoutManager(std::make_unique<views::FillLayout>());

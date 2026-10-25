@@ -72,6 +72,11 @@ reçoivent que des appels d'une ou deux lignes.
    « Reset to Default » prend un autre libellé : sur Mac (titlecase) sa traduction est partagée
    avec le zoom (« Rétablir le niveau de zoom par défaut »), les traductions Chromium étant
    indexées par le texte anglais.
+8. `rounded-extension-popups.patch` : la bulle d'une extension (`ExtensionPopup`) n'a des coins
+   arrondis que si l'option « Show a rounded frame around web contents »
+   (`prefs::kHeliumRoundedFrame`) est activée (`set_use_round_corners`, à `false` d'origine :
+   bulle toujours carrée). Lenteur d'ouverture : la bulle n'apparaît qu'une fois la page chargée, et le
+   build local (component build) démarre ses processus lentement : juger sur le build CI.
 
 Textes d'interface : `helium_plus/strings.cc` (français si le navigateur est en français, anglais
 sinon), pas de `.grd` pour éviter les gros patches et les recompilations complètes.
