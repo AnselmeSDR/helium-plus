@@ -509,3 +509,17 @@
 +}  // namespace helium_plus
 +
 +#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_GROUP_TABS_POPOVER_H_
+--- a/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
+@@ -149,9 +149,8 @@ TabGroupHeaderView::TabGroupHeaderView(
+                     base::BindRepeating(&TabGroupHeaderView::ShowEditorBubble,
+                                         base::Unretained(this))))
+               : nullptr),
+-      collapse_icon_(orientation == TabStripOrientation::kVertical
+-                         ? AddChildView(std::make_unique<views::ImageView>())
+-                         : nullptr),
++      // Helium+: no collapse chevron, clicking the header is enough.
++      collapse_icon_(nullptr),
+       delegate_(delegate),
+       orientation_(orientation),
+       editor_bubble_tracker_(state_controller) {
