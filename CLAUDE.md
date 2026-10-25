@@ -55,11 +55,23 @@ reçoivent que des appels d'une ou deux lignes.
    pression mémoire, un onglet par minute ; délais de Memory Saver allongés
    (`memory_saver_mode_policy.cc`).
 5. `right-aligned-tab-groups.patch` : barre verticale à droite, le trait et le retrait des groupes
-   passent à droite (`TabGroupViewLayout::CalculateVerticalLayout`).
+   passent à droite (`TabGroupViewLayout::CalculateVerticalLayout`) ; barre réduite : seul le trait
+   bouge, les icônes restent centrées.
 6. `collapsed-groups.patch` : en vertical, comme Arc, un groupe replié garde visibles ses onglets
    ouverts (actif ou non fermés, en veille compris : `TabGroupView::IsOpenTab`) ; sélectionner un onglet ne déplie plus son
    groupe (`RootTabCollectionNode`) et replier un groupe n'en fait plus sortir l'onglet actif
-   (`TabStripCollectionController::ToggleTabGroupCollapsedState`).
+   (`TabStripCollectionController::ToggleTabGroupCollapsedState`). Le trait du groupe longe ses
+   onglets ouverts ; pas de chevron dans l'en-tête (`collapse_icon_` nul). Survoler l'en-tête
+   d'un groupe replié ouvre `helium_plus::GroupTabsPopover` (`views/helium_plus/`, à la place de
+   la carte de survol) : tous les onglets du groupe, fermés compris, un clic active l'onglet ;
+   fermé par `views::MouseWatcher` quand la souris quitte l'en-tête et la bulle. Le contenu d'une
+   bulle doit avoir un fond opaque (texte en rendu sous-pixel, sinon DCHECK dans `Label`).
+7. `customize-toolbar.patch` : l'option « Nouvel onglet » de Personnaliser › Barre d'outils
+   (`prefs::kShowDynamicNewTabButton`, réservée par Helium à la disposition dynamique) masque aussi
+   « + Nouvel onglet » de la barre verticale (`VerticalTabStripBottomContainer`). Le bouton
+   « Reset to Default » prend un autre libellé : sur Mac (titlecase) sa traduction est partagée
+   avec le zoom (« Rétablir le niveau de zoom par défaut »), les traductions Chromium étant
+   indexées par le texte anglais.
 
 Textes d'interface : `helium_plus/strings.cc` (français si le navigateur est en français, anglais
 sinon), pas de `.grd` pour éviter les gros patches et les recompilations complètes.
