@@ -1,0 +1,43 @@
+name: Helium+ update
+# Every other Monday: merges the latest Helium release, reapplies our patches
+# (Claude Code fixes conflicts), opens a pull request and starts the build.
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency: helium-plus-update
+
+jobs:
+  update:
+    name: Update to the latest Helium release
+    runs-on: macos-latest
+    timeout-minutes: 300
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Update
+        run: .github/helium-plus/update.sh
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Notify failure
+        if: failure()
+        run: |
+          gh issue create --title "Mise à jour Helium+ en échec" \
+            --body "@AnselmeSDR la mise à jour automatique a échoué : $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        env:
+          GH_TOKEN: ${{ github.token }}
