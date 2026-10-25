@@ -1,0 +1,58 @@
+name: Helium+ build
+# Builds Helium+ for Apple Silicon, unsigned and without Sparkle updates, then
+# publishes the disk image as a pre-release and reports on the pull request.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request to notify when the build is done"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/building.yml
+    secrets: inherit
+    with:
+      arch: arm64
+      os: macos-latest
+
+  publish:
+    name: Publish the disk image
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the disk image
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: helium_*_arm64-macos.dmg
+          path: dmg
+          merge-multiple: true
+      - name: Publish and notify
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          dmg=$(find dmg -name '*.dmg' 2>/dev/null | head -1)
+          if [ -n "$dmg" ]; then
+            version=$(basename "$dmg" | sed -E 's/^helium_(.*)_arm64-macos\.dmg$/\1/')
+            url=$(gh release create "helium-plus-$version-$GITHUB_RUN_NUMBER" "$dmg" \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+              --title "Helium+ $version" \
+              --notes "Build arm64 non signé : au premier lancement, clic droit › Ouvrir.")
+            message="Helium+ $version est prêt à tester : $url"
+          else
+            message="Le build a échoué : $run_url"
+          fi
+          if [ -n "$PR" ]; then
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "@AnselmeSDR $message"
+          else
+            echo "$message"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
