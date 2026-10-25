@@ -1,0 +1,339 @@
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/context_hub/prefs.h"
+ #include "chrome/browser/contextual_cueing/prefs.h"
+ #include "chrome/browser/crash_upload_list/helium_crash_reporting.h"
++#include "chrome/browser/ui/helium_plus/shared_settings.h"
+ #include "chrome/browser/download/download_prefs.h"
+ #include "chrome/browser/engagement/important_sites_util.h"
+ #include "components/enterprise/browser/reporting/prefs.h"
+@@ -1537,6 +1538,7 @@ void RegisterLocalState(PrefRegistrySimp
+   registry->RegisterIntegerPref(
+       prefs::kHeliumCrashReportingMode,
+       static_cast<int>(helium::CrashReportingMode::kAsk));
++  helium_plus::SharedSettings::RegisterLocalStatePrefs(registry);
+   ChromeContentBrowserClient::RegisterLocalStatePrefs(registry);
+ #if BUILDFLAG(CHROME_FOR_TESTING)
+   chrome_for_testing::RegisterPrefs(registry);
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3563,6 +3563,8 @@ static_library("ui") {
+       "helium_plus/hibernation_service.h",
+       "helium_plus/profile_switcher.cc",
+       "helium_plus/profile_switcher.h",
++      "helium_plus/shared_settings.cc",
++      "helium_plus/shared_settings.h",
+       "helium_plus/strings.cc",
+       "helium_plus/strings.h",
+       "helium_plus/tab_commands.cc",
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/shared_settings.cc
+@@ -0,0 +1,223 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/shared_settings.h"
++
++#include <algorithm>
++#include <string_view>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace helium_plus {
++
++namespace {
++
++// Last value of each shared setting, keyed by pref name (none: default value).
++constexpr char kSharedSettingsPref[] = "helium_plus.shared_settings";
++
++// Settings pages: Helium, appearance, startup, privacy, site settings,
++// performance, search engine, languages, downloads, accessibility.
++constexpr std::string_view kSharedPrefixes[] = {
++    "helium.",
++    "vertical_tabs.",
++    "browser.theme.",
++    "intl.",
++    "spellcheck.",
++    "performance_tuning.",
++    "profile.default_content_setting_values.",
++    "settings.a11y.",
++    "accessibility.captions.",
++};
++// Profile state under the prefixes above, not settings.
++constexpr std::string_view kNotSharedPrefixes[] = {
++    "helium.private_sync.",
++    "settings.a11y.read_anything.",
++};
++constexpr std::string_view kSharedNames[] = {
++    "bookmark_bar.show_on_all_tabs",
++    "bookmark_bar.show_tab_groups",
++    "bookmark_bar.visibility_state",
++    "bookmark_bar.show_apps_shortcut",
++    "side_panel.is_right_aligned",
++    "webkit.webprefs.default_font_size",
++    "webkit.webprefs.default_fixed_font_size",
++    "webkit.webprefs.minimum_font_size",
++    "webkit.webprefs.fonts.standard.Zyyy",
++    "webkit.webprefs.fonts.serif.Zyyy",
++    "webkit.webprefs.fonts.sansserif.Zyyy",
++    "webkit.webprefs.fonts.fixed.Zyyy",
++    "browser.show_home_button",
++    "homepage",
++    "homepage_is_newtabpage",
++    "session.restore_on_startup",
++    "session.startup_urls",
++    "toolbar.pinned_actions",
++    "ntp.shortcust_visible",
++    "ntp.custom_links_visible",
++    "default_search_provider_data.template_url_data",
++    "omnibox.prevent_url_elisions",
++    "browser.enable_spellchecking",
++    "translate.enabled",
++    "translate_blocked_languages",
++    "translate_allowlists",
++    "profile.cookie_controls_mode",
++    "https_only_mode_enabled",
++    "enable_do_not_track",
++    "net.network_prediction_options",
++    "safebrowsing.enabled",
++    "safebrowsing.enhanced",
++    "credentials_enable_service",
++    "credentials_enable_autosignin",
++    "autofill.profile_enabled",
++    "autofill.credit_card_enabled",
++    "download.default_directory",
++    "download.prompt_for_download",
++    "savefile.default_directory",
++};
++
++bool IsSharedSetting(std::string_view name) {
++  if (std::ranges::find(kSharedNames, name) != std::ranges::end(kSharedNames)) {
++    return true;
++  }
++  const auto starts_with = [name](std::string_view prefix) {
++    return base::StartsWith(name, prefix);
++  };
++  return std::ranges::any_of(kSharedPrefixes, starts_with) &&
++         std::ranges::none_of(kNotSharedPrefixes, starts_with);
++}
++
++// The value to share: none when the setting is at its default.
++base::Value GetSharedValue(const PrefService::Preference& pref) {
++  return pref.HasUserSetting() ? pref.GetValue()->Clone() : base::Value();
++}
++
++void ApplySharedValue(PrefService* prefs,
++                      const std::string& name,
++                      const base::Value& value) {
++  const PrefService::Preference* pref = prefs->FindPreference(name);
++  if (!pref || !pref->IsUserModifiable() || GetSharedValue(*pref) == value) {
++    return;
++  }
++  if (value.is_none()) {
++    prefs->ClearPref(name);
++  } else {
++    prefs->Set(name, value);
++  }
++}
++
++}  // namespace
++
++// static
++void SharedSettings::RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterDictionaryPref(kSharedSettingsPref);
++}
++
++// static
++void SharedSettings::EnsureStarted() {
++  static base::NoDestructor<SharedSettings> shared_settings;
++}
++
++SharedSettings::SharedSettings() {
++  ProfileManager* profile_manager = g_browser_process->profile_manager();
++  profile_manager_observation_.Observe(profile_manager);
++  for (Profile* profile : profile_manager->GetLoadedProfiles()) {
++    AddProfile(profile);
++  }
++}
++
++SharedSettings::~SharedSettings() = default;
++
++void SharedSettings::AddProfile(Profile* profile) {
++  if (!profile->IsRegularProfile() || registrars_.contains(profile)) {
++    return;
++  }
++  PrefService* prefs = profile->GetPrefs();
++  std::vector<std::string> names;
++  prefs->IteratePreferenceValues(base::BindRepeating(
++      [](std::vector<std::string>* names, const std::string& name,
++         const base::Value&) {
++        if (IsSharedSetting(name)) {
++          names->push_back(name);
++        }
++      },
++      &names));
++
++  // The values shared by the other profiles win; a setting no profile has
++  // shared yet takes this profile's value.
++  {
++    ScopedDictPrefUpdate update(g_browser_process->local_state(),
++                                kSharedSettingsPref);
++    for (const std::string& name : names) {
++      const PrefService::Preference* pref = prefs->FindPreference(name);
++      if (!pref->IsUserModifiable()) {
++        continue;
++      }
++      if (const base::Value* shared = update->Find(name)) {
++        ApplySharedValue(prefs, name, *shared);
++      } else {
++        update->Set(name, GetSharedValue(*pref));
++      }
++    }
++  }
++
++  auto registrar = std::make_unique<PrefChangeRegistrar>();
++  registrar->Init(prefs);
++  for (const std::string& name : names) {
++    registrar->Add(name,
++                   base::BindRepeating(&SharedSettings::OnSettingChanged,
++                                       base::Unretained(this), profile, name));
++  }
++  registrars_[profile] = std::move(registrar);
++  profile_observations_.AddObservation(profile);
++}
++
++void SharedSettings::OnSettingChanged(Profile* profile,
++                                      const std::string& name) {
++  const PrefService::Preference* pref =
++      profile->GetPrefs()->FindPreference(name);
++  if (!pref || !pref->IsUserModifiable()) {
++    return;
++  }
++  base::Value value = GetSharedValue(*pref);
++  PrefService* local_state = g_browser_process->local_state();
++  // Also reached when applying the shared value to the other profiles.
++  if (const base::Value* shared =
++          local_state->GetDict(kSharedSettingsPref).Find(name);
++      shared && *shared == value) {
++    return;
++  }
++  ScopedDictPrefUpdate(local_state, kSharedSettingsPref)
++      ->Set(name, value.Clone());
++  for (const auto& [other, registrar] : registrars_) {
++    if (other != profile) {
++      ApplySharedValue(other->GetPrefs(), name, value);
++    }
++  }
++}
++
++void SharedSettings::OnProfileAdded(Profile* profile) {
++  AddProfile(profile);
++}
++
++void SharedSettings::OnProfileManagerDestroying() {
++  profile_observations_.RemoveAllObservations();
++  registrars_.clear();
++  profile_manager_observation_.Reset();
++}
++
++void SharedSettings::OnProfileWillBeDestroyed(Profile* profile) {
++  profile_observations_.RemoveObservation(profile);
++  registrars_.erase(profile);
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/shared_settings.h
+@@ -0,0 +1,63 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_SHARED_SETTINGS_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_SHARED_SETTINGS_H_
++
++#include <map>
++#include <memory>
++#include <string>
++
++#include "base/no_destructor.h"
++#include "base/scoped_multi_source_observation.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_manager_observer.h"
++#include "chrome/browser/profiles/profile_observer.h"
++
++class PrefChangeRegistrar;
++class PrefRegistrySimple;
++class Profile;
++
++namespace helium_plus {
++
++// Like Arc, the settings are the same in every profile: a setting changed in
++// one profile is applied to the others. Only settings are shared (see
++// `IsSharedSetting()`), not the profile's data (history, accounts, site data,
++// extensions). The last value of each setting is kept in Local State, so that
++// the profiles loaded later get it too.
++class SharedSettings : public ProfileManagerObserver, public ProfileObserver {
++ public:
++  static void RegisterLocalStatePrefs(PrefRegistrySimple* registry);
++  static void EnsureStarted();
++
++  SharedSettings(const SharedSettings&) = delete;
++  SharedSettings& operator=(const SharedSettings&) = delete;
++
++ private:
++  friend class base::NoDestructor<SharedSettings>;
++
++  SharedSettings();
++  ~SharedSettings() override;
++
++  void AddProfile(Profile* profile);
++  void OnSettingChanged(Profile* profile, const std::string& name);
++
++  // ProfileManagerObserver:
++  void OnProfileAdded(Profile* profile) override;
++  void OnProfileManagerDestroying() override;
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile* profile) override;
++
++  std::map<Profile*, std::unique_ptr<PrefChangeRegistrar>> registrars_;
++  base::ScopedObservation<ProfileManager, ProfileManagerObserver>
++      profile_manager_observation_{this};
++  base::ScopedMultiSourceObservation<Profile, ProfileObserver>
++      profile_observations_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_SHARED_SETTINGS_H_
+--- a/chrome/browser/ui/helium_plus/tab_state.cc
++++ b/chrome/browser/ui/helium_plus/tab_state.cc
+@@ -13,6 +13,7 @@
+ #include "base/supports_user_data.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/helium_plus/hibernation_service.h"
++#include "chrome/browser/ui/helium_plus/shared_settings.h"
+ #include "chrome/browser/ui/helium_plus/tab_import.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+@@ -50,6 +51,7 @@ TabState::TabState(tabs::TabInterface& t
+     : ContentsObservingTabFeature(tab),
+       scoped_unowned_user_data_(tab.GetUnownedUserDataHost(), *this) {
+   HibernationService::EnsureStarted();
++  SharedSettings::EnsureStarted();
+   TabImport::EnsureStarted();
+ 
+   if (content::WebContents* contents = tab.GetContents()) {
