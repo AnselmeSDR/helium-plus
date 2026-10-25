@@ -167,7 +167,18 @@
      height += bounds.height() + kTabVerticalPadding;
      width = std::max(width, bounds.width());
    }
-@@ -157,7 +164,6 @@ views::ProposedLayout TabGroupViewLayout
+@@ -149,15 +156,16 @@ views::ProposedLayout TabGroupViewLayout
+   if (!children.empty()) {
+     group_line_bounds.set_height(height - group_line_bounds.y());
+   }
++  // Helium+: the line also runs along the open tabs of a collapsed group.
+   const bool show_group_line =
+-      !tab_group_view->IsGroupFocused() && !tab_group_view->is_collapsed();
++      !tab_group_view->IsGroupFocused() &&
++      (!tab_group_view->is_collapsed() || has_open_tabs);
+   if (tab_group_view->group_line_) {
+     layouts.child_layouts.emplace_back(tab_group_view->group_line_.get(),
+                                        show_group_line, group_line_bounds);
    }
  
    // Add extra padding below the group if not collapsed.
@@ -175,7 +186,7 @@
    if (!is_group_collapsed) {
      height += kTabVerticalPadding;
    }
-@@ -174,7 +180,7 @@ views::ProposedLayout TabGroupViewLayout
+@@ -174,7 +182,7 @@ views::ProposedLayout TabGroupViewLayout
    }
  
    layouts.host_size = gfx::Size(
