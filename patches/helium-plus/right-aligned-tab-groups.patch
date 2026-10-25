@@ -8,13 +8,14 @@
  #include "chrome/browser/ui/tabs/tab_style.h"
  #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
  #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
-@@ -176,6 +177,21 @@ views::ProposedLayout TabGroupViewLayout
+@@ -176,6 +177,27 @@ views::ProposedLayout TabGroupViewLayout
        width, is_group_collapsed
                   ? header_bounds.height() + (2 * kGroupHeaderVerticalMargin)
                   : std::max(height, dragged_view_bottom));
 +
 +  // Helium+: with the tab strip on the right, mirror the group so that its
-+  // line and the tab inset are on the right side.
++  // line and the tab inset are on the right side. A collapsed tab strip
++  // centers its icons: only the line moves.
 +  const TabStripCollectionController* controller =
 +      tab_group_view->collection_node_
 +          ? tab_group_view->collection_node_->GetController()
@@ -23,8 +24,13 @@
 +      controller->GetStateController()->IsTabStripRightAligned() &&
 +      size_bounds.width().is_bounded()) {
 +    const int total_width = size_bounds.width().value();
++    const bool is_expanded = tab_strip_collapse_state ==
++                             tabs::VerticalTabStripCollapseState::kExpanded;
 +    for (auto& child_layout : layouts.child_layouts) {
-+      child_layout.bounds.set_x(total_width - child_layout.bounds.right());
++      if (is_expanded ||
++          child_layout.child_view == tab_group_view->group_line_) {
++        child_layout.bounds.set_x(total_width - child_layout.bounds.right());
++      }
 +    }
 +  }
    return layouts;
