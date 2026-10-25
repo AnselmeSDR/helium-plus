@@ -1,0 +1,316 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3567,6 +3567,8 @@ static_library("ui") {
+       "helium_plus/strings.h",
+       "helium_plus/tab_commands.cc",
+       "helium_plus/tab_commands.h",
++      "helium_plus/tab_import.cc",
++      "helium_plus/tab_import.h",
+       "helium_plus/tab_state.cc",
+       "helium_plus/tab_state.h",
+       "views/helium/frame_corner_radius.cc",
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/tab_import.cc
+@@ -0,0 +1,225 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/tab_import.h"
++
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/command_line.h"
++#include "base/containers/fixed_flat_map.h"
++#include "base/containers/span.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/sessions/content/content_serialized_navigation_builder.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/tab_groups/tab_group_color.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/common/referrer.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "ui/base/page_transition_types.h"
++#include "url/gurl.h"
++
++namespace helium_plus {
++
++namespace {
++
++constexpr char kImportSwitch[] = "helium-plus-import";
++
++// Leaves time for session restore to fill the window first.
++constexpr base::TimeDelta kImportDelay = base::Seconds(2);
++
++tab_groups::TabGroupColorId GetColor(const std::string* name) {
++  static constexpr auto kColors =
++      base::MakeFixedFlatMap<std::string_view, tab_groups::TabGroupColorId>({
++          {"grey", tab_groups::TabGroupColorId::kGrey},
++          {"blue", tab_groups::TabGroupColorId::kBlue},
++          {"red", tab_groups::TabGroupColorId::kRed},
++          {"yellow", tab_groups::TabGroupColorId::kYellow},
++          {"green", tab_groups::TabGroupColorId::kGreen},
++          {"pink", tab_groups::TabGroupColorId::kPink},
++          {"purple", tab_groups::TabGroupColorId::kPurple},
++          {"cyan", tab_groups::TabGroupColorId::kCyan},
++          {"orange", tab_groups::TabGroupColorId::kOrange},
++      });
++  const auto it = name ? kColors.find(*name) : kColors.end();
++  return it != kColors.end() ? it->second : tab_groups::TabGroupColorId::kGrey;
++}
++
++std::optional<base::DictValue> ReadPlan(const base::FilePath& path) {
++  std::string json;
++  if (!base::ReadFileToString(path, &json)) {
++    return std::nullopt;
++  }
++  return base::JSONReader::ReadDict(json, base::JSON_PARSE_RFC);
++}
++
++void AddTab(BrowserWindowInterface* browser,
++            const base::Value& tab,
++            int index,
++            std::optional<tab_groups::TabGroupId> group,
++            bool pin) {
++  const std::string* url_spec =
++      tab.is_dict() ? tab.GetDict().FindString("url") : nullptr;
++  const GURL url = url_spec ? GURL(*url_spec) : GURL();
++  if (!url.is_valid()) {
++    return;
++  }
++  const std::string* title = tab.GetDict().FindString("title");
++  const std::string* name = tab.GetDict().FindString("name");
++
++  std::unique_ptr<content::NavigationEntry> entry =
++      content::NavigationController::CreateNavigationEntry(
++          url, content::Referrer(), std::nullopt, std::nullopt,
++          ui::PAGE_TRANSITION_AUTO_BOOKMARK, false, std::string(),
++          browser->GetProfile(), /*blob_url_loader_factory=*/nullptr);
++  if (title) {
++    entry->SetTitle(base::UTF8ToUTF16(*title));
++  }
++  const sessions::SerializedNavigationEntry navigation =
++      sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
++          0, entry.get());
++
++  std::map<std::string, std::string> extra_data;
++  if (pin || group) {
++    extra_data[kAnchorUrlKey] = url.spec();
++    if (title) {
++      extra_data[kAnchorTitleKey] = *title;
++    }
++    extra_data[kClosedKey] = "1";
++  }
++  if (name && !name->empty()) {
++    extra_data[kCustomTitleKey] = *name;
++  }
++
++  chrome::AddRestoredTab(
++      browser, base::span_from_ref(navigation), index,
++      /*selected_navigation=*/0, /*extension_app_id=*/std::string(), group,
++      /*select=*/false, pin, base::TimeTicks(), base::Time(),
++      /*session_storage_namespace=*/nullptr,
++      sessions::SerializedUserAgentOverride(), extra_data,
++      /*from_session_restore=*/true, /*is_active_browser=*/std::nullopt,
++      chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
++}
++
++void ImportPlan(base::WeakPtr<BrowserWindowInterface> browser,
++                const base::FilePath& path,
++                std::optional<base::DictValue> plan) {
++  if (!browser || !plan) {
++    return;
++  }
++  TabStripModel* model = browser->GetTabStripModel();
++
++  if (const base::ListValue* pinned = plan->FindList("pinned")) {
++    for (const base::Value& tab : *pinned) {
++      AddTab(browser.get(), tab, model->IndexOfFirstNonPinnedTab(),
++             std::nullopt, /*pin=*/true);
++    }
++  }
++
++  if (const base::ListValue* groups = plan->FindList("groups")) {
++    for (const base::Value& group : *groups) {
++      const base::ListValue* tabs =
++          group.is_dict() ? group.GetDict().FindList("tabs") : nullptr;
++      if (!tabs) {
++        continue;
++      }
++      const tab_groups::TabGroupId id = tab_groups::TabGroupId::GenerateNew();
++      for (const base::Value& tab : *tabs) {
++        AddTab(browser.get(), tab, model->count(), id, /*pin=*/false);
++      }
++      if (!model->group_model()->ContainsTabGroup(id)) {
++        continue;
++      }
++      const std::string* title = group.GetDict().FindString("title");
++      model->ChangeTabGroupVisuals(
++          id, tab_groups::TabGroupVisualData(
++                  title ? base::UTF8ToUTF16(*title) : std::u16string(),
++                  GetColor(group.GetDict().FindString("color")),
++                  group.GetDict().FindBool("collapsed").value_or(true)));
++    }
++  }
++
++  if (const base::ListValue* tabs = plan->FindList("tabs")) {
++    for (const base::Value& tab : *tabs) {
++      AddTab(browser.get(), tab, model->count(), std::nullopt, /*pin=*/false);
++    }
++  }
++
++  base::ThreadPool::PostTask(
++      FROM_HERE, {base::MayBlock()},
++      base::BindOnce(base::IgnoreResult(&base::Move), path,
++                     path.AddExtensionASCII("done")));
++}
++
++}  // namespace
++
++// static
++void TabImport::EnsureStarted() {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  if (!command_line.HasSwitch(kImportSwitch)) {
++    return;
++  }
++  static base::NoDestructor<TabImport> import(
++      command_line.GetSwitchValuePath(kImportSwitch));
++}
++
++TabImport::TabImport(base::FilePath dir) : dir_(std::move(dir)) {
++  GlobalBrowserCollection* browsers = GlobalBrowserCollection::GetInstance();
++  browser_collection_observation_.Observe(browsers);
++  browsers->ForEach([this](BrowserWindowInterface* browser) {
++    MaybeImport(browser);
++    return true;
++  });
++}
++
++TabImport::~TabImport() = default;
++
++void TabImport::MaybeImport(BrowserWindowInterface* browser) {
++  Profile* profile = browser->GetProfile();
++  if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++      !profile->IsRegularProfile() ||
++      !handled_profiles_.insert(profile->GetPath()).second) {
++    return;
++  }
++  const base::FilePath plan =
++      dir_.Append(profile->GetBaseName()).AddExtensionASCII("json");
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<BrowserWindowInterface> browser,
++             const base::FilePath& plan) {
++            base::ThreadPool::PostTaskAndReplyWithResult(
++                FROM_HERE, {base::MayBlock()}, base::BindOnce(&ReadPlan, plan),
++                base::BindOnce(&ImportPlan, browser, plan));
++          },
++          browser->GetWeakPtr(), plan),
++      kImportDelay);
++}
++
++void TabImport::OnBrowserCreated(BrowserWindowInterface* browser) {
++  MaybeImport(browser);
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/tab_import.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_TAB_IMPORT_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_TAB_IMPORT_H_
++
++#include <set>
++
++#include "base/files/file_path.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++
++namespace helium_plus {
++
++// Recreates tabs from a plan, e.g. Arc spaces converted by an import script.
++// With --helium-plus-import=<dir>, the first window of each profile gets the
++// tabs of <dir>/<profile directory name>.json, unloaded like restored tabs:
++//   {"pinned": [tab, ...],
++//    "groups": [{"title": ..., "color": "blue", "collapsed": true,
++//                "tabs": [tab, ...]}, ...],
++//    "tabs": [tab, ...]}
++// where a tab is {"url": ..., "title": ..., "name": custom title (optional)}.
++// Pinned and grouped tabs are anchored to their URL and closed, like Arc's
++// pinned tabs that are not open. The plan is then renamed to .json.done so that
++// it is imported only once.
++class TabImport : public BrowserCollectionObserver {
++ public:
++  static void EnsureStarted();
++
++  TabImport(const TabImport&) = delete;
++  TabImport& operator=(const TabImport&) = delete;
++
++ private:
++  friend class base::NoDestructor<TabImport>;
++
++  explicit TabImport(base::FilePath dir);
++  ~TabImport() override;
++
++  void MaybeImport(BrowserWindowInterface* browser);
++
++  // BrowserCollectionObserver:
++  void OnBrowserCreated(BrowserWindowInterface* browser) override;
++
++  const base::FilePath dir_;
++  std::set<base::FilePath> handled_profiles_;
++  base::ScopedObservation<GlobalBrowserCollection, BrowserCollectionObserver>
++      browser_collection_observation_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_TAB_IMPORT_H_
+--- a/chrome/browser/ui/helium_plus/tab_state.cc
++++ b/chrome/browser/ui/helium_plus/tab_state.cc
+@@ -13,6 +13,7 @@
+ #include "base/supports_user_data.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/helium_plus/hibernation_service.h"
++#include "chrome/browser/ui/helium_plus/tab_import.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "components/sessions/content/session_tab_helper.h"
+@@ -49,6 +50,7 @@ TabState::TabState(tabs::TabInterface& t
+     : ContentsObservingTabFeature(tab),
+       scoped_unowned_user_data_(tab.GetUnownedUserDataHost(), *this) {
+   HibernationService::EnsureStarted();
++  TabImport::EnsureStarted();
+ 
+   if (content::WebContents* contents = tab.GetContents()) {
+     if (auto* restored = static_cast<RestoredData*>(
