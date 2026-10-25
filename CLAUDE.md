@@ -77,6 +77,38 @@ reçoivent que des appels d'une ou deux lignes.
    (`prefs::kHeliumRoundedFrame`) est activée (`set_use_round_corners`, à `false` d'origine :
    bulle toujours carrée). Lenteur d'ouverture : la bulle n'apparaît qu'une fois la page chargée, et le
    build local (component build) démarre ses processus lentement : juger sur le build CI.
+9. `profile-switcher.patch` : un profil = un espace Arc (cookies et comptes séparés).
+   `helium_plus::ProfileSwitcherView` (bas de la barre verticale, `vertical_tab_strip_region_view.cc`) :
+   une icône par profil, dans l'ordre `profile.profiles_order` de Local State, et balayage à deux
+   doigts dans la barre. Icônes tout en bas (espace vide extensible au-dessus, `AddToTabStrip`),
+   rétrécies si la barre est étroite. Icône vectorielle à la place de l'avatar si l'entrée du
+   profil dans Local State (`profile.info_cache.<dossier>`) a `helium_plus_icon` : `game`,
+   `computer`, `home`, `work`, `code` (icônes de `components/vector_icons`). Chaque profil garde sa
+   fenêtre : `profile_switcher.cc` affiche celle du profil cible aux mêmes dimensions, même largeur
+   et état replié de la barre verticale, et masque (sans fermer) l'actuelle (la largeur est posée
+   sur `VerticalTabStripStateController` ; `VerticalTabStripRegionView::OnCollapseStateChanged`
+   la recopie dans sa propre `target_collapse_state_`, sinon elle garde celle de la session) ; clic sur l'icône du
+   Dock : `ShowHiddenBrowserWindow` (`app_controller_mac.mm`). Réglage « Au démarrage » par défaut
+   sur « Reprendre » (`session_startup_pref.cc`) : une fenêtre de profil ouverte par la bascule
+   restaure ses onglets (`--restore-last-session` ne vaut que pour le lancement). Les préférences
+   « suivies » (`session.restore_on_startup`, extensions…) écrites à la main dans `Preferences`
+   sont effacées par Chromium (signature dans `Secure Preferences`) : passer par le navigateur
+   (DevTools `Extensions.loadUnpacked`, réglages).
+10. `tab-import.patch` : `helium_plus::TabImport` (démarré par `TabState`), avec
+    `--helium-plus-import=<dossier>` : crée dans la première fenêtre de chaque profil les onglets de
+    `<dossier>/<dossier du profil>.json` (épinglés, groupes repliés, onglets libres ; format dans
+    `tab_import.h`), non chargés, ancrés et fermés comme les onglets épinglés d'Arc, puis renomme le
+    fichier en `.json.done`. Sert à l'import des espaces Arc (script hors dépôt : plans par espace,
+    copie des cookies/mots de passe rechiffrés avec la clé du profil cible ; Arc stocke une partie de
+    ses cookies chiffrés en TEXT et non en BLOB).
+11. `shared-settings.patch` : `helium_plus::SharedSettings` (démarré par `TabState`) : comme Arc,
+    mêmes réglages dans tous les profils. Un réglage modifié dans un profil est appliqué aux autres
+    profils chargés et gardé dans Local State (`helium_plus.shared_settings`, nom → valeur, `null` =
+    défaut) pour les profils chargés plus tard. Liste dans `IsSharedSetting()` (préfixes `helium.`,
+    `vertical_tabs.`, `browser.theme.`, `intl.`… et noms explicites) : réglages seulement, pas les
+    données du profil (historique, comptes, données de sites, extensions, moteurs de recherche de
+    `Web Data`). Ajouter un réglage = l'ajouter à la liste ; une liste trop large (préfixes vides)
+    partage aussi l'état interne du profil.
 
 Textes d'interface : `helium_plus/strings.cc` (français si le navigateur est en français, anglais
 sinon), pas de `.grd` pour éviter les gros patches et les recompilations complètes.
