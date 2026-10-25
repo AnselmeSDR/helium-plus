@@ -1,0 +1,72 @@
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -5,11 +5,15 @@
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h"
+ 
+ #include "base/functional/bind.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/views/view_class_properties.h"
+ 
+@@ -41,6 +45,14 @@ VerticalTabStripBottomContainer::Vertica
+       state_controller->RegisterOnCollapseChanged(base::BindRepeating(
+           &VerticalTabStripBottomContainer::OnCollapseStateChanged,
+           base::Unretained(this)));
++
++  if (browser_) {
++    show_new_tab_button_.Init(
++        prefs::kShowDynamicNewTabButton, browser_->GetProfile()->GetPrefs(),
++        base::BindRepeating(&VerticalTabStripBottomContainer::UpdateVisibility,
++                            base::Unretained(this)));
++    UpdateVisibility();
++  }
+ }
+ 
+ VerticalTabStripBottomContainer::~VerticalTabStripBottomContainer() = default;
+@@ -100,5 +112,9 @@ void VerticalTabStripBottomContainer::Up
+           false, views::MinimumFlexSizeRule::kPreferred));
+ }
+ 
++void VerticalTabStripBottomContainer::UpdateVisibility() {
++  SetVisible(show_new_tab_button_.GetValue());
++}
++
+ BEGIN_METADATA(VerticalTabStripBottomContainer)
+ END_METADATA
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
+@@ -7,6 +7,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "components/prefs/pref_member.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/views/layout/flex_layout_view.h"
+ 
+@@ -43,6 +44,7 @@ class VerticalTabStripBottomContainer :
+   void OnNewTabButtonContextMenuClosed();
+ 
+   void UpdateButtonStyles(bool collapsed);
++  void UpdateVisibility();
+ 
+   raw_ptr<BrowserWindowInterface> browser_ = nullptr;
+   raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
+@@ -50,6 +52,10 @@ class VerticalTabStripBottomContainer :
+   base::CallbackListSubscription new_tab_button_pressed_subscription_;
+ 
+   std::unique_ptr<ExpandOnHoverLock> expand_on_hover_lock_;
++
++  // Helium+: the "New tab" toolbar customization also shows or hides this
++  // button.
++  BooleanPrefMember show_new_tab_button_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_VERTICAL_VERTICAL_TAB_STRIP_BOTTOM_CONTAINER_H_
