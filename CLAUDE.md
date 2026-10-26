@@ -138,6 +138,61 @@ two-line calls.
     `TabGroupSyncService` matches each restored group with its saved tabs, reopening the missing
     ones (loaded) and closing the extra local ones, so a group is only compacted after
     `OnInitialized` (`AreSavedGroupsConnected`).
+15. `folder-groups.patch`: like Dia, in the vertical strip a group header looks like a folder.
+    `helium_plus::FolderIconView` (`views/helium_plus/`, in `TabGroupHeaderView`): closed or open
+    folder icon in the group color; semibold name, discreet border, transparent background except
+    on hover (`CreateFolderBackground`), 30 px header (`tab_group_view_layout.cc`), tabs indented
+    (`TabGroupView::kTabLeadingPadding`). The group line stays. A label painted without an opaque
+    background needs `SetSkipSubpixelRenderingOpacityCheck(true)` (DCHECK in `Label`).
+16. `shared-theme.patch`: `helium_plus::SharedTheme` (started by `SharedSettings`): the theme
+    extension is shared too (theme colors and grayscale already are, note 11). A theme change in a
+    profile is kept in Local State (`helium_plus.shared_theme`: id, directory, and for a package
+    its public key and `from_webstore`) and applied to the other loaded profiles, then to each
+    profile once its extensions are ready. Applying: enabled theme → `SetTheme`, disabled →
+    `RevertToExtensionTheme`, missing → unpacked theme loaded from its directory
+    (`UnpackedInstaller`), package (Chrome Web Store) copied without `_metadata` then installed
+    (`CrxInstaller::InstallUnpackedCrx`, which moves the files it installs). No theme extension:
+    `SetIsGrayscale(false)` drops it (and disables it, like Chromium), then the shared settings are
+    applied again; `SharedSettings` ignores the theme settings changed meanwhile
+    (`SharedTheme::IsApplying`).
+17. `borderless-pinned-tabs.patch`: vertical pinned tabs (tiles at the top of the strip), split
+    ones and closed pinned entries have no outline anymore; an empty border keeps their insets
+    (`TabView::UpdateBorder`, `SplitTabView::UpdateBorder`, `ClosedTabView`).
+18. `group-icons.patch`: like Arc folders, a group has an icon instead of the folder.
+    `helium_plus::GroupIcons` (user data of `TabGroupSyncService`): profile pref
+    `helium_plus.group_icons`, keyed by saved group id (restored groups get new local ids, see
+    `session_restore.cc`), `{"icon": name}` (list in `GetLibrary()`, `components/vector_icons`) or
+    `{"svg": drawing}`. SVG file: chosen with `ui::SelectFileDialog`, parsed out of process
+    (`DataDecoder::ParseXml`), turned into Skia paths (`SkParsePath`; path, rect, circle, ellipse,
+    line, polyline, polygon, groups, `transform`, fill/stroke, `style` attribute), drawn in the
+    group color (`SvgIconSource`, through `cc::PaintCanvas`). Choice in the group editor bubble
+    (`views/helium_plus/group_icon_picker.cc`, one line in `tab_group_editor_bubble_view.cc`);
+    `FolderIconView` observes `GroupIcons`. Collapsed vertical strip: the header only shows the
+    icon, centered (`TabGroupHeaderView::icon_only()`, `SetFolderHeaderIconOnly`), the group's tabs
+    get a zero height in `tab_group_view_layout.cc` (their visibility is managed elsewhere and left
+    as is), hovering or clicking the icon opens `GroupTabsPopover`. Icons of deleted saved groups
+    are dropped once `TabGroupSyncService` is initialized.
+19. `closed-tabs-drag.patch`: dragging the only tab of a group, or the open tabs of a group keeping
+    closed tabs, moves them, not the group (Chromium drags the group when all its tabs are selected:
+    `TabDragHandlerImpl::GetFullySelectedGroups`, `ClosedTabsService::GroupHasClosedTabs`; the
+    header still drags the group). As moving all the tabs of a group moves the group
+    (`kRetainCollectionTypes`), they leave it with `RemoveFromGroup` when they enter another
+    container (`HandleDraggedTabsIntoNode`); an emptied group is deleted. A group keeping closed
+    tabs stays: once the drag of its last tab passes the drag threshold,
+    `TabDragHandlerImpl::KeepGroupForDrag` ends it, makes the closed tab next to it a tab again
+    (`ClosedTabsService::KeepGroupForDrag`, closed and not loaded, through `Restore`, shared with
+    `Open`) and initializes the drag again from the press (kept with its location relative to the
+    source dragged view). The group keeps its id (saved group, icon) when the tab leaves; if the tab
+    stays, the next update compacts that tab again. Fallback if that fails: the dragged tabs stay in
+    the group (`TabGroupView::KeepsDraggedTabs`, checked first in
+    `UnpinnedTabContainerView::GetTabDragTarget`), and `HandleDraggedTabsIntoNode` skips moving them
+    within it (TabCollection CHECK otherwise). In an expanded group, a tab dragged alone takes its
+    place among the closed tabs: `tab_group_view_layout.cc` inserts it among the closed tabs around
+    it by the drag position (same rule as `GetTargetForTabDrag`), the layout is redone at each drag
+    update (`DraggedTabsContainer::LaysOutDragPosition`), and the drop (`HandleTabDrop` →
+    `OnTabsDropped`) gives the closed tabs to the tabs in the displayed order
+    (`ClosedTabsService::Arrange`, then a new snapshot so the next update doesn't move them back). A
+    closed tab hidden while its keeper was out of the group shows again once back in it.
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.
