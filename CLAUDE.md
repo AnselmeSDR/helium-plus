@@ -93,7 +93,9 @@ two-line calls.
    it into its own `target_collapse_state_`, otherwise it keeps the session one); click on the
    Dock icon: `ShowHiddenBrowserWindow` (`app_controller_mac.mm`). "On startup" setting defaults
    to "Continue where you left off" (`session_startup_pref.cc`): a profile window opened by the
-   switcher restores its tabs (`--restore-last-session` only applies at launch). "Tracked"
+   switcher restores its tabs (`--restore-last-session` only applies at launch). On startup, only
+   the last used profile reopens (`ProfileManager::GetLastOpenedProfiles`): the others load when
+   switched to, so a single window opens and their tabs and extensions use no memory. "Tracked"
    preferences (`session.restore_on_startup`, extensions…) written by hand into `Preferences` are
    wiped by Chromium (signature in `Secure Preferences`): go through the browser (DevTools
    `Extensions.loadUnpacked`, settings).

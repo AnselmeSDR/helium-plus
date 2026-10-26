@@ -710,3 +710,28 @@
  #endif
  }
  
+--- a/chrome/browser/profiles/profile_manager.cc
++++ b/chrome/browser/profiles/profile_manager.cc
+@@ -594,9 +594,20 @@ std::vector<Profile*> ProfileManager::Ge
+ 
+   std::vector<Profile*> to_return;
+   if (local_state->HasPrefPath(prefs::kProfilesLastActive)) {
++    // Helium+: only the last used profile reopens; the other profiles (one per
++    // space) load when switched to, so that a single window opens and their
++    // tabs and extensions use no memory (see helium_plus/profile_switcher.h).
++    const base::ListValue& last_active =
++        local_state->GetList(prefs::kProfilesLastActive);
++    const base::Value last_used(
++        local_state->GetString(prefs::kProfileLastUsed));
+     // Make a copy because the list might change in the calls to GetProfile.
+-    const base::ListValue profile_list =
+-        local_state->GetList(prefs::kProfilesLastActive).Clone();
++    base::ListValue profile_list;
++    if (std::ranges::find(last_active, last_used) != last_active.end()) {
++      profile_list.Append(last_used.Clone());
++    } else if (!last_active.empty()) {
++      profile_list.Append(last_active.back().Clone());
++    }
+     for (const auto& entry : profile_list) {
+       const std::string* profile_base_name = entry.GetIfString();
+       if (!profile_base_name || profile_base_name->empty() ||
