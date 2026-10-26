@@ -61,7 +61,9 @@ reçoivent que des appels d'une ou deux lignes.
    ouverts (actif ou non fermés, en veille compris : `TabGroupView::IsOpenTab`) ; sélectionner un onglet ne déplie plus son
    groupe (`RootTabCollectionNode`) et replier un groupe n'en fait plus sortir l'onglet actif
    (`TabStripCollectionController::ToggleTabGroupCollapsedState`). Le trait du groupe longe ses
-   onglets ouverts ; pas de chevron dans l'en-tête (`collapse_icon_` nul). Survoler l'en-tête
+   onglets ouverts ; pas de chevron dans l'en-tête (`collapse_icon_` nul). Glisser-déposer : un
+   groupe vertical replié reste une cible (`UnpinnedTabContainerView::GetTabDragTarget`, liens
+   compris) et ne se déplie pas quand on y dépose un onglet (`TabGroupView::AttachChildView`). Survoler l'en-tête
    d'un groupe replié ouvre `helium_plus::GroupTabsPopover` (`views/helium_plus/`, à la place de
    la carte de survol) : tous les onglets du groupe, fermés compris, un clic active l'onglet ;
    fermé par `views::MouseWatcher` quand la souris quitte l'en-tête et la bulle. Le contenu d'une

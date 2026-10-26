@@ -44,7 +44,18 @@
  }
  
  TabGroupView::~TabGroupView() = default;
-@@ -328,6 +334,9 @@ void TabGroupView::SetIsCollapsed(bool i
+@@ -267,7 +273,9 @@ bool TabGroupView::IsValid() const {
+ 
+ void TabGroupView::AttachChildView(std::unique_ptr<views::View> child_view,
+                                    const gfx::Rect& previous_bounds_in_screen) {
+-  if (IsCollapsed()) {
++  // Helium+: a vertical collapsed group shows the added tab, which is open,
++  // without expanding.
++  if (IsCollapsed() && orientation_ != TabStripOrientation::kVertical) {
+     // When child views are added to a group when in collapsed state,
+     // expand it to reveal the newly added views.
+     ToggleCollapsedState(ToggleTabGroupCollapsedStateOrigin::kMenuAction);
+@@ -328,6 +336,9 @@ void TabGroupView::SetIsCollapsed(bool i
      return;
    }
    is_collapsed_ = is_collapsed;
@@ -54,7 +65,7 @@
    // Reset the cached available space so stale collapsed bounds (which only
    // accommodated the header chip) do not constrain group tabs when expanding.
    available_space_ = views::SizeBound();
-@@ -340,8 +349,24 @@ void TabGroupView::UpdateChildVisibility
+@@ -340,8 +351,24 @@ void TabGroupView::UpdateChildVisibility
      return;
    }
    SetIsCollapsed(collapsed);
@@ -80,7 +91,18 @@
    }
  }
  
-@@ -469,11 +494,23 @@ void TabGroupView::UpdateHoverCard(int u
+@@ -401,6 +428,10 @@ std::optional<BrowserRootView::DropIndex
+   for (const auto& child_node : collection_node_->children()) {
+     auto* view = child_node->view();
+     CHECK(view);
++    // Helium+: skip the tabs hidden in a vertical collapsed group.
++    if (!view->GetVisible()) {
++      continue;
++    }
+     const int view_end =
+         is_horizontal ? view->bounds().right() : view->bounds().bottom();
+     if (loc_coord > view_end) {
+@@ -469,11 +500,23 @@ void TabGroupView::UpdateHoverCard(int u
      return;
    }
  
@@ -523,3 +545,27 @@
        delegate_(delegate),
        orientation_(orientation),
        editor_bubble_tracker_(state_controller) {
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -136,7 +136,9 @@ UnpinnedTabContainerView::GetLinkDropInd
+ 
+     if (child_node->type() == TabCollectionNode::Type::GROUP) {
+       auto* group_view = views::AsViewClass<TabGroupView>(view);
+-      if (group_view->IsCollapsed()) {
++      // Helium+: links can be dropped between the open tabs of a vertical
++      // collapsed group.
++      if (group_view->IsCollapsed() && is_horizontal) {
+         gfx::Point loc_in_group = views::View::ConvertPointToTarget(
+             this, group_view, loc_in_container);
+         const bool is_leading =
+@@ -297,7 +299,9 @@ DraggedTabsContainer& UnpinnedTabContain
+       continue;
+     }
+     auto* group_view = views::AsViewClass<TabGroupView>(layout.child_view);
+-    if (!group_view || group_view->IsCollapsed()) {
++    // Helium+: a vertical collapsed group shows its open tabs, which can be
++    // reordered and joined like in an expanded group.
++    if (!group_view || (group_view->IsCollapsed() && is_horizontal)) {
+       continue;
+     }
+ 
