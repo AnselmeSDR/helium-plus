@@ -1,0 +1,477 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3567,6 +3567,8 @@ static_library("ui") {
+       "helium_plus/profile_switcher.h",
+       "helium_plus/shared_settings.cc",
+       "helium_plus/shared_settings.h",
++      "helium_plus/shared_theme.cc",
++      "helium_plus/shared_theme.h",
+       "helium_plus/strings.cc",
+       "helium_plus/strings.h",
+       "helium_plus/tab_commands.cc",
+--- a/chrome/browser/ui/helium_plus/shared_settings.cc
++++ b/chrome/browser/ui/helium_plus/shared_settings.cc
+@@ -13,6 +13,7 @@
+ #include "base/values.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/helium_plus/shared_theme.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
+@@ -120,6 +121,7 @@ void ApplySharedValue(PrefService* prefs
+ // static
+ void SharedSettings::RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
+   registry->RegisterDictionaryPref(kSharedSettingsPref);
++  SharedTheme::RegisterLocalStatePrefs(registry);
+ }
+ 
+ // static
+@@ -133,10 +135,19 @@ SharedSettings::SharedSettings() {
+   for (Profile* profile : profile_manager->GetLoadedProfiles()) {
+     AddProfile(profile);
+   }
++  SharedTheme::EnsureStarted();
+ }
+ 
+ SharedSettings::~SharedSettings() = default;
+ 
++// static
++void SharedSettings::ApplySharedSettings(Profile* profile) {
++  for (const auto [name, value] :
++       g_browser_process->local_state()->GetDict(kSharedSettingsPref)) {
++    ApplySharedValue(profile->GetPrefs(), name, value);
++  }
++}
++
+ void SharedSettings::AddProfile(Profile* profile) {
+   if (!profile->IsRegularProfile() || registrars_.contains(profile)) {
+     return;
+@@ -183,6 +194,9 @@ void SharedSettings::AddProfile(Profile*
+ 
+ void SharedSettings::OnSettingChanged(Profile* profile,
+                                       const std::string& name) {
++  if (SharedTheme::IsApplying()) {
++    return;
++  }
+   const PrefService::Preference* pref =
+       profile->GetPrefs()->FindPreference(name);
+   if (!pref || !pref->IsUserModifiable()) {
+--- a/chrome/browser/ui/helium_plus/shared_settings.h
++++ b/chrome/browser/ui/helium_plus/shared_settings.h
+@@ -32,6 +32,9 @@ class SharedSettings : public ProfileMan
+   static void RegisterLocalStatePrefs(PrefRegistrySimple* registry);
+   static void EnsureStarted();
+ 
++  // Applies the shared settings to `profile` again.
++  static void ApplySharedSettings(Profile* profile);
++
+   SharedSettings(const SharedSettings&) = delete;
+   SharedSettings& operator=(const SharedSettings&) = delete;
+ 
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/shared_theme.cc
+@@ -0,0 +1,313 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/shared_theme.h"
++
++#include <string>
++
++#include "base/auto_reset.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/memory/raw_ptr.h"
++#include "base/one_shot_event.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/themes/theme_service.h"
++#include "chrome/browser/themes/theme_service_factory.h"
++#include "chrome/browser/themes/theme_service_observer.h"
++#include "chrome/browser/ui/helium_plus/shared_settings.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "extensions/browser/crx_installer.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_system.h"
++#include "extensions/browser/unpacked_installer.h"
++#include "extensions/common/constants.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/manifest.h"
++
++namespace helium_plus {
++
++namespace {
++
++// The theme extension of the profiles: its id (empty: none), the directory to
++// load it from and, if it was installed from a package (Chrome Web Store), its
++// public key and origin.
++constexpr char kSharedThemePref[] = "helium_plus.shared_theme";
++constexpr char kIdKey[] = "id";
++constexpr char kPathKey[] = "path";
++constexpr char kKeyKey[] = "key";
++constexpr char kFromWebstoreKey[] = "from_webstore";
++
++// Copies the theme at `path` into a new temporary directory, without the
++// signature of the original files. Returns the copy, or an empty path.
++base::FilePath CopyTheme(const base::FilePath& path) {
++  base::FilePath temp_dir;
++  if (!base::CreateNewTempDirectory(FILE_PATH_LITERAL("helium_plus_theme"),
++                                    &temp_dir)) {
++    return base::FilePath();
++  }
++  const base::FilePath copy = temp_dir.Append(path.BaseName());
++  if (!base::CopyDirectory(path, copy, /*recursive=*/true)) {
++    base::DeletePathRecursively(temp_dir);
++    return base::FilePath();
++  }
++  base::DeletePathRecursively(copy.Append(extensions::kMetadataFolder));
++  return copy;
++}
++
++}  // namespace
++
++class SharedTheme::ProfileTheme : public ThemeServiceObserver {
++ public:
++  explicit ProfileTheme(Profile* profile) : profile_(profile) {
++    observation_.Observe(ThemeServiceFactory::GetForProfile(profile));
++  }
++
++  // ThemeServiceObserver:
++  void OnThemeChanged() override {
++    SharedTheme::Get()->OnThemeChanged(profile_);
++  }
++
++  // Whether the theme extension is being loaded into the profile.
++  bool loading = false;
++
++ private:
++  const raw_ptr<Profile> profile_;
++  base::ScopedObservation<ThemeService, ThemeServiceObserver> observation_{
++      this};
++};
++
++// static
++void SharedTheme::RegisterLocalStatePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterDictionaryPref(kSharedThemePref);
++}
++
++// static
++void SharedTheme::EnsureStarted() {
++  Get();
++}
++
++// static
++bool SharedTheme::IsApplying() {
++  return Get()->applying_;
++}
++
++// static
++SharedTheme* SharedTheme::Get() {
++  static base::NoDestructor<SharedTheme> shared_theme;
++  return shared_theme.get();
++}
++
++SharedTheme::SharedTheme() {
++  ProfileManager* profile_manager = g_browser_process->profile_manager();
++  profile_manager_observation_.Observe(profile_manager);
++  for (Profile* profile : profile_manager->GetLoadedProfiles()) {
++    AddProfile(profile);
++  }
++}
++
++SharedTheme::~SharedTheme() = default;
++
++void SharedTheme::AddProfile(Profile* profile) {
++  if (!profile->IsRegularProfile() ||
++      profile_observations_.IsObservingSource(profile)) {
++    return;
++  }
++  profile_observations_.AddObservation(profile);
++  // The ThemeService gets ready on the same signal: wait for it too.
++  extensions::ExtensionSystem::Get(profile)->ready().Post(
++      FROM_HERE,
++      base::BindOnce(
++          [](SharedTheme* shared_theme, Profile* profile) {
++            base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++                FROM_HERE,
++                base::BindOnce(&SharedTheme::OnProfileReady,
++                               base::Unretained(shared_theme), profile));
++          },
++          base::Unretained(this), profile));
++}
++
++void SharedTheme::OnProfileReady(Profile* profile) {
++  if (!profile_observations_.IsObservingSource(profile) ||
++      profiles_.contains(profile)) {
++    return;
++  }
++  profiles_[profile] = std::make_unique<ProfileTheme>(profile);
++  if (g_browser_process->local_state()
++          ->GetDict(kSharedThemePref)
++          .FindString(kIdKey)) {
++    ApplyTheme(profile);
++  } else {
++    SaveTheme(profile);
++  }
++}
++
++void SharedTheme::OnThemeChanged(Profile* profile) {
++  if (applying_ || !profiles_.contains(profile)) {
++    return;
++  }
++  SaveTheme(profile);
++  for (const auto& [other, profile_theme] : profiles_) {
++    if (other != profile) {
++      ApplyTheme(other);
++    }
++  }
++}
++
++void SharedTheme::SaveTheme(Profile* profile) {
++  ThemeService* theme_service = ThemeServiceFactory::GetForProfile(profile);
++  PrefService* local_state = g_browser_process->local_state();
++  base::DictValue theme;
++  if (!theme_service->UsingExtensionTheme()) {
++    theme.Set(kIdKey, std::string());
++    local_state->SetDict(kSharedThemePref, std::move(theme));
++    return;
++  }
++  const std::string id = theme_service->GetThemeID();
++  theme.Set(kIdKey, id);
++  const extensions::Extension* extension =
++      extensions::ExtensionRegistry::Get(profile)->enabled_extensions().GetByID(
++          id);
++  if (!extension) {
++    // Still loading: keep where it comes from.
++    const std::string* shared_id =
++        local_state->GetDict(kSharedThemePref).FindString(kIdKey);
++    if (!shared_id || *shared_id != id) {
++      local_state->SetDict(kSharedThemePref, std::move(theme));
++    }
++    return;
++  }
++  theme.Set(kPathKey, extension->path().AsUTF8Unsafe());
++  if (!extensions::Manifest::IsUnpackedLocation(extension->location())) {
++    theme.Set(kKeyKey, extension->public_key());
++    theme.Set(kFromWebstoreKey, extension->from_webstore());
++  }
++  local_state->SetDict(kSharedThemePref, std::move(theme));
++}
++
++void SharedTheme::ApplyTheme(Profile* profile) {
++  const base::DictValue& shared =
++      g_browser_process->local_state()->GetDict(kSharedThemePref);
++  const std::string* id = shared.FindString(kIdKey);
++  ThemeService* theme_service = ThemeServiceFactory::GetForProfile(profile);
++  if (!id || theme_service->UsingPolicyTheme()) {
++    return;
++  }
++  base::AutoReset<bool> applying(&applying_, true);
++  if (id->empty()) {
++    if (theme_service->UsingExtensionTheme()) {
++      // Dropping the theme extension also resets the theme settings: they get
++      // their shared values again.
++      theme_service->SetIsGrayscale(false);
++      SharedSettings::ApplySharedSettings(profile);
++    }
++    return;
++  }
++  if (theme_service->UsingExtensionTheme() &&
++      theme_service->GetThemeID() == *id) {
++    return;
++  }
++  extensions::ExtensionRegistry* registry =
++      extensions::ExtensionRegistry::Get(profile);
++  if (const extensions::Extension* extension =
++          registry->enabled_extensions().GetByID(*id);
++      extension && extension->is_theme()) {
++    theme_service->SetTheme(extension);
++    return;
++  }
++  if (registry->disabled_extensions().GetByID(*id)) {
++    theme_service->RevertToExtensionTheme(*id);
++    return;
++  }
++  // Loading a theme applies it.
++  const std::string* path = shared.FindString(kPathKey);
++  ProfileTheme& profile_theme = *profiles_[profile];
++  if (!path || path->empty() || profile_theme.loading) {
++    return;
++  }
++  profile_theme.loading = true;
++  const base::FilePath theme_path = base::FilePath::FromUTF8Unsafe(*path);
++  if (const std::string* key = shared.FindString(kKeyKey)) {
++    // Installing a package moves its files: install a copy.
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(&CopyTheme, theme_path),
++        base::BindOnce(&SharedTheme::InstallThemeCopy, base::Unretained(this),
++                       profile, *id, *key,
++                       shared.FindBool(kFromWebstoreKey).value_or(false)));
++    return;
++  }
++  scoped_refptr<extensions::UnpackedInstaller> installer =
++      extensions::UnpackedInstaller::Create(profile);
++  installer->set_be_noisy_on_failure(false);
++  installer->set_completion_callback(base::BindOnce(
++      [](SharedTheme* shared_theme, Profile* profile,
++         const extensions::Extension*, const base::FilePath&,
++         const std::u16string&) { shared_theme->OnThemeLoaded(profile); },
++      base::Unretained(this), profile));
++  installer->Load(theme_path);
++}
++
++void SharedTheme::InstallThemeCopy(Profile* profile,
++                                   const std::string& id,
++                                   const std::string& key,
++                                   bool from_webstore,
++                                   const base::FilePath& copy) {
++  if (copy.empty() || !profiles_.contains(profile)) {
++    if (!copy.empty()) {
++      base::ThreadPool::PostTask(
++          FROM_HERE, {base::MayBlock()},
++          base::GetDeletePathRecursivelyCallback(copy.DirName()));
++    }
++    OnThemeLoaded(profile);
++    return;
++  }
++  scoped_refptr<extensions::CrxInstaller> installer =
++      extensions::CrxInstaller::CreateSilent(profile);
++  installer->set_delete_source(true);
++  installer->set_install_source(extensions::mojom::ManifestLocation::kInternal);
++  installer->set_creation_flags(from_webstore
++                                    ? extensions::Extension::FROM_WEBSTORE
++                                    : extensions::Extension::NO_FLAGS);
++  installer->AddInstallerCallback(base::BindOnce(
++      [](SharedTheme* shared_theme, Profile* profile,
++         const base::FilePath& temp_dir,
++         const std::optional<extensions::CrxInstallError>&) {
++        base::ThreadPool::PostTask(
++            FROM_HERE, {base::MayBlock()},
++            base::GetDeletePathRecursivelyCallback(temp_dir));
++        shared_theme->OnThemeLoaded(profile);
++      },
++      base::Unretained(this), profile, copy.DirName()));
++  installer->InstallUnpackedCrx(id, key, copy);
++}
++
++void SharedTheme::OnThemeLoaded(Profile* profile) {
++  if (auto it = profiles_.find(profile); it != profiles_.end()) {
++    it->second->loading = false;
++  }
++}
++
++void SharedTheme::OnProfileAdded(Profile* profile) {
++  AddProfile(profile);
++}
++
++void SharedTheme::OnProfileManagerDestroying() {
++  profiles_.clear();
++  profile_observations_.RemoveAllObservations();
++  profile_manager_observation_.Reset();
++}
++
++void SharedTheme::OnProfileWillBeDestroyed(Profile* profile) {
++  profiles_.erase(profile);
++  profile_observations_.RemoveObservation(profile);
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/shared_theme.h
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_SHARED_THEME_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_SHARED_THEME_H_
++
++#include <map>
++#include <memory>
++#include <string>
++
++#include "base/no_destructor.h"
++#include "base/scoped_multi_source_observation.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_manager_observer.h"
++#include "chrome/browser/profiles/profile_observer.h"
++
++namespace base {
++class FilePath;
++}  // namespace base
++
++class PrefRegistrySimple;
++class Profile;
++
++namespace helium_plus {
++
++// Like Arc, the same theme in every profile. Its colors, grayscale and color
++// scheme are shared settings (see SharedSettings); this also shares the theme
++// extension: a profile that does not have it loads it from the profile that
++// installed it (a copy for a package, from the Chrome Web Store), and a profile
++// using a theme extension drops it when the others no longer use one. The theme
++// is kept in Local State for the profiles loaded later.
++class SharedTheme : public ProfileManagerObserver, public ProfileObserver {
++ public:
++  static void RegisterLocalStatePrefs(PrefRegistrySimple* registry);
++  static void EnsureStarted();
++
++  // Whether the shared theme is being applied to a profile: its theme settings
++  // change before getting the shared values again, which must not be shared.
++  static bool IsApplying();
++
++  SharedTheme(const SharedTheme&) = delete;
++  SharedTheme& operator=(const SharedTheme&) = delete;
++
++ private:
++  friend class base::NoDestructor<SharedTheme>;
++  class ProfileTheme;
++
++  static SharedTheme* Get();
++
++  SharedTheme();
++  ~SharedTheme() override;
++
++  void AddProfile(Profile* profile);
++  void OnProfileReady(Profile* profile);
++  void OnThemeChanged(Profile* profile);
++  // Keeps the theme of `profile` as the shared theme.
++  void SaveTheme(Profile* profile);
++  void ApplyTheme(Profile* profile);
++  // Installs into `profile` the copy of a theme installed from a package.
++  void InstallThemeCopy(Profile* profile,
++                        const std::string& id,
++                        const std::string& key,
++                        bool from_webstore,
++                        const base::FilePath& copy);
++  void OnThemeLoaded(Profile* profile);
++
++  // ProfileManagerObserver:
++  void OnProfileAdded(Profile* profile) override;
++  void OnProfileManagerDestroying() override;
++
++  // ProfileObserver:
++  void OnProfileWillBeDestroyed(Profile* profile) override;
++
++  // The profiles whose extensions are loaded.
++  std::map<Profile*, std::unique_ptr<ProfileTheme>> profiles_;
++  bool applying_ = false;
++  base::ScopedObservation<ProfileManager, ProfileManagerObserver>
++      profile_manager_observation_{this};
++  base::ScopedMultiSourceObservation<Profile, ProfileObserver>
++      profile_observations_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_SHARED_THEME_H_
