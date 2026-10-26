@@ -1,0 +1,649 @@
+--- a/chrome/browser/ui/helium_plus/closed_tabs.cc
++++ b/chrome/browser/ui/helium_plus/closed_tabs.cc
+@@ -31,6 +31,7 @@
+ #include "components/tabs/public/tab_group.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/page_transition_types.h"
++#include "ui/gfx/range/range.h"
+ 
+ namespace helium_plus {
+ 
+@@ -237,10 +238,17 @@ ClosedTabsService* ClosedTabsService::Ge
+ 
+ // static
+ void ClosedTabsService::Open(TabStripModel& model, int id) {
++  Restore(model, id, /*select=*/true);
++}
++
++// static
++std::optional<int> ClosedTabsService::Restore(TabStripModel& model,
++                                              int id,
++                                              bool select) {
+   ClosedTabsService* service = Get();
+   auto state_it = service->states_.find(&model);
+   if (state_it == service->states_.end() || !service->Flush(model)) {
+-    return;
++    return std::nullopt;
+   }
+ 
+   for (int index = 0; index < model.count(); ++index) {
+@@ -258,7 +266,7 @@ void ClosedTabsService::Open(TabStripMod
+     }
+     // Connecting a group to its saved tabs would close the tab added to it.
+     if (keeper->GetGroup() && !service->AreSavedGroupsConnected(model)) {
+-      return;
++      return std::nullopt;
+     }
+ 
+     // The new tab takes the closed tabs between it and the keeper.
+@@ -278,17 +286,117 @@ void ClosedTabsService::Open(TabStripMod
+       after.erase(after_it, after.end());
+       insert_index = SkipSplit(model, index + 1, /*forward=*/true);
+     }
+-    TabState* new_state = AddTab(model, *closed_tab, insert_index,
+-                                 keeper->GetGroup(), keeper->IsPinned(),
+-                                 /*select=*/true);
++    TabState* new_state =
++        AddTab(model, *closed_tab, insert_index, keeper->GetGroup(),
++               keeper->IsPinned(), select);
+     if (!new_state) {
+-      return;
++      return std::nullopt;
+     }
+     keeper_state->SetClosedTabs(std::move(before), std::move(after));
+     new_state->SetClosedTabs(std::move(new_before), std::move(new_after));
+     service->TakeSnapshot(model, state_it->second);
++    return insert_index;
++  }
++  return std::nullopt;
++}
++
++// static
++bool ClosedTabsService::CanKeepGroupForDrag(TabStripModel& model,
++                                            const tabs::TabInterface& tab) {
++  const std::optional<tab_groups::TabGroupId> group = tab.GetGroup();
++  const TabState* state = TabState::From(&tab);
++  TabGroupModel* groups = model.group_model();
++  return group && state && HasClosedTabs(*state) && groups &&
++         groups->ContainsTabGroup(*group) &&
++         groups->GetTabGroup(*group)->tab_count() == 1;
++}
++
++// static
++std::optional<int> ClosedTabsService::KeepGroupForDrag(
++    TabStripModel& model,
++    const tabs::TabInterface& tab) {
++  if (!CanKeepGroupForDrag(model, tab)) {
++    return std::nullopt;
++  }
++  const TabState* state = TabState::From(&tab);
++  return Restore(model,
++                 state->closed_after().empty()
++                     ? state->closed_before().back().id
++                     : state->closed_after().front().id,
++                 /*select=*/false);
++}
++
++// static
++bool ClosedTabsService::GroupHasClosedTabs(
++    TabStripModel& model,
++    const tab_groups::TabGroupId& group) {
++  TabGroupModel* groups = model.group_model();
++  if (!groups || !groups->ContainsTabGroup(group)) {
++    return false;
++  }
++  const gfx::Range range = groups->GetTabGroup(group)->ListTabs();
++  for (size_t index = range.start(); index < range.end(); ++index) {
++    const TabState* state = TabState::From(model.GetTabAtIndex(index));
++    if (state && HasClosedTabs(*state)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// static
++void ClosedTabsService::Arrange(const std::vector<DisplayItem>& order) {
++  std::map<int, ClosedTab> closed_tabs;
++  TabStripModel* model = nullptr;
++  for (const DisplayItem& item : order) {
++    const tabs::TabHandle* handle = std::get_if<tabs::TabHandle>(&item);
++    if (!handle) {
++      continue;
++    }
++    tabs::TabInterface* tab = handle->Get();
++    TabState* state = tab ? TabState::From(tab) : nullptr;
++    if (!state) {
++      return;
++    }
++    model = tab->GetBrowserWindowInterface()->GetTabStripModel();
++    for (const ClosedTabs* list :
++         {&state->closed_before(), &state->closed_after()}) {
++      for (const ClosedTab& closed_tab : *list) {
++        closed_tabs.emplace(closed_tab.id, closed_tab);
++      }
++    }
++  }
++  if (!model) {
++    return;
++  }
++
++  std::vector<Item> items;
++  for (const DisplayItem& item : order) {
++    if (const tabs::TabHandle* handle = std::get_if<tabs::TabHandle>(&item)) {
++      items.emplace_back(TabState::From(handle->Get()));
++      continue;
++    }
++    auto it = closed_tabs.find(std::get<int>(item));
++    if (it == closed_tabs.end()) {
++      return;
++    }
++    items.emplace_back(std::move(it->second));
++    closed_tabs.erase(it);
++  }
++  // No closed tab may be lost.
++  if (!closed_tabs.empty()) {
+     return;
+   }
++  Distribute(std::move(items));
++
++  // The tabs moved by the drag keep their closed tabs: the next update starts
++  // from their new order, unless tabs left the tab strip meanwhile.
++  ClosedTabsService* service = Get();
++  auto state_it = service->states_.find(model);
++  if (state_it != service->states_.end() &&
++      !std::ranges::any_of(state_it->second.slots, &Slot::removed)) {
++    service->TakeSnapshot(*model, state_it->second);
++  }
+ }
+ 
+ ClosedTabsService::ClosedTabsService() {
+--- a/chrome/browser/ui/helium_plus/closed_tabs.h
++++ b/chrome/browser/ui/helium_plus/closed_tabs.h
+@@ -8,6 +8,7 @@
+ #include <map>
+ #include <optional>
+ #include <set>
++#include <variant>
+ #include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -37,6 +38,28 @@ class ClosedTabsService : public Browser
+   // Opens the closed tab `id` of `model` in its place and activates it.
+   static void Open(TabStripModel& model, int id);
+ 
++  // Whether the tabs of `group` keep closed tabs.
++  static bool GroupHasClosedTabs(TabStripModel& model,
++                                 const tab_groups::TabGroupId& group);
++
++  // Whether `tab` is the last tab of a group keeping closed tabs, which
++  // Chromium would delete if `tab` left it.
++  static bool CanKeepGroupForDrag(TabStripModel& model,
++                                  const tabs::TabInterface& tab);
++  // Before `tab` is dragged, makes the closed tab next to it a tab again
++  // (closed, not loaded) when CanKeepGroupForDrag(): the group stays if `tab`
++  // leaves it, otherwise the next update closes it again. Returns the index of
++  // the new tab.
++  static std::optional<int> KeepGroupForDrag(TabStripModel& model,
++                                             const tabs::TabInterface& tab);
++
++  // A tab or the id of a closed tab.
++  using DisplayItem = std::variant<tabs::TabHandle, int>;
++  // Places the closed tabs of a container among its tabs as in `order`, the
++  // display order of its tabs and closed tabs, once a tab was dropped among
++  // them. Does nothing if `order` misses any of them.
++  static void Arrange(const std::vector<DisplayItem>& order);
++
+   ClosedTabsService(const ClosedTabsService&) = delete;
+   ClosedTabsService& operator=(const ClosedTabsService&) = delete;
+ 
+@@ -92,6 +115,9 @@ class ClosedTabsService : public Browser
+   };
+ 
+   static ClosedTabsService* Get();
++  // Adds a tab for the closed tab `id` of `model` in its place, activated if
++  // `select`. Returns its index.
++  static std::optional<int> Restore(TabStripModel& model, int id, bool select);
+ 
+   ClosedTabsService();
+   ~ClosedTabsService() override;
+--- a/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
++++ b/chrome/browser/ui/views/tabs/common/dragged_tabs_container.cc
+@@ -145,6 +145,15 @@ bool DraggedTabsContainer::CanDropTab()
+   return true;
+ }
+ 
++void DraggedTabsContainer::HandleTabDrop(
++    TabDragTarget::DragController& controller) {
++  OnTabsDropped();
++}
++
++bool DraggedTabsContainer::LaysOutDragPosition() const {
++  return false;
++}
++
+ void DraggedTabsContainer::HandleTabDragEnteredContainer() {
+   last_move_drag_x_ = std::nullopt;
+   CHECK(collection_node_);
+@@ -688,7 +697,7 @@ void DraggedTabsContainer::HandleTabDrag
+       last_move_drag_x_ = point_in_container.x();
+     }
+     host_view_->InvalidateLayout();
+-  } else if (!target) {
++  } else if (!target || LaysOutDragPosition()) {
+     host_view_->InvalidateLayout();
+   }
+ }
+--- a/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
++++ b/chrome/browser/ui/views/tabs/common/dragged_tabs_container.h
+@@ -66,7 +66,7 @@ class DraggedTabsContainer : public TabD
+   void OnTabDragExited(const gfx::Point& point_in_screen) final;
+   void OnTabDragEnded() final;
+   bool CanDropTab() final;
+-  void HandleTabDrop(TabDragTarget::DragController& controller) final {}
++  void HandleTabDrop(TabDragTarget::DragController& controller) final;
+   base::CallbackListSubscription RegisterWillDestroyCallback(
+       base::OnceClosure callback) final;
+ 
+@@ -140,6 +140,13 @@ class DraggedTabsContainer : public TabD
+   virtual const TabCollectionNode* GetCollectionNodeFromView(
+       const views::View& view) const = 0;
+ 
++  // Helium+: whether the layout of the host view depends on the drag position
++  // (e.g. views that are not nodes make room for the dragged tabs).
++  virtual bool LaysOutDragPosition() const;
++
++  // Helium+: called once the dragged tabs were dropped in this container.
++  virtual void OnTabsDropped() {}
++
+   // Handles a dragged tab that is parented within this target.
+   // `point_in_container` is a point relative to this target's view.
+   void HandleTabDragInContainer(const gfx::Rect& dragged_tab_bounds,
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.cc
+@@ -8,10 +8,12 @@
+ #include <memory>
+ #include <optional>
+ 
++#include "base/auto_reset.h"
+ #include "base/check_deref.h"
+ #include "base/functional/bind.h"
+ #include "base/notreached.h"
+ #include "base/types/to_address.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -230,6 +232,22 @@ void TabDragHandlerImpl::InitializeDrag(
+   }
+   const gfx::Point offset_from_source = located_event->location();
+ 
++  // Helium+: see KeepGroupForDrag().
++  press_event_.reset();
++  if (!keeping_group_ && node.type() == TabCollectionNode::Type::TAB &&
++      event.target()) {
++    const tabs::TabInterface* tab =
++        std::get<tabs::ConstDanglingUntriagedTabInterface>(node.GetNodeData());
++    if (helium_plus::ClosedTabsService::CanKeepGroupForDrag(*tab_strip_model_,
++                                                            *tab)) {
++      press_tab_ = tab->GetHandle();
++      press_selection_model_ = original_selection_model;
++      press_point_in_screen_ = views::View::ConvertPointToScreen(
++          static_cast<views::View*>(event.target()), event.location());
++      press_event_ = cloned_event->Clone();
++    }
++  }
++
+   if (drag_controller_->Init(this, drag_init_data.source_dragged_view,
+                              drag_init_data.dragged_views, offset_from_source,
+                              original_selection_model,
+@@ -338,7 +356,11 @@ TabDragHandlerImpl::GetFullySelectedGrou
+   for (const auto& [group_id, dragged_tab_count] : dragged_group_tab_counts) {
+     const auto* group = tab_strip_model_->group_model()->GetTabGroup(group_id);
+     CHECK(group);
+-    if (group->tab_count() == dragged_tab_count) {
++    // Helium+: the tab of a group with one tab, or the open tabs of a group
++    // keeping closed tabs, are dragged without it: the group header moves it.
++    if (group->tab_count() == dragged_tab_count && dragged_tab_count > 1 &&
++        !helium_plus::ClosedTabsService::GroupHasClosedTabs(*tab_strip_model_,
++                                                            group_id)) {
+       auto* selected_node = GetNodeForTabGroup(group_id);
+       auto& slot_view = GetOrCreateSlotViewForNode(*selected_node);
+       selected_groups.insert({group_id, &slot_view});
+@@ -355,6 +377,17 @@ bool TabDragHandlerImpl::ContinueDrag(vi
+   gfx::Point screen_location(event.location());
+   ConvertPointToScreen(&event_source_view, &screen_location);
+ 
++  // Helium+: as TabDragController::CanStartDrag().
++  constexpr float kMinimumDragDistance = 10;
++  if (press_event_ && !drag_controller_->started_drag() &&
++      (screen_location - press_point_in_screen_).Length() >
++          kMinimumDragDistance) {
++    KeepGroupForDrag();
++    if (!drag_controller_) {
++      return false;
++    }
++  }
++
+   // Dragging may start a blocking loop, which may allow this to be destroyed.
+   auto ref = weak_factory_.GetWeakPtr();
+   auto liveness = drag_controller_->Drag(screen_location);
+@@ -400,6 +433,34 @@ void TabDragHandlerImpl::HandleDraggedTa
+     return;
+   }
+ 
++  // Helium+: all the tabs of a group dragged without it (see
++  // GetFullySelectedGroups()) leave it first, as moving all the tabs of a
++  // group moves the group.
++  const std::optional<tab_groups::TabGroupId> source_group =
++      tabs::TabInterface::GetFromContents(source_contents)->GetGroup();
++  if (source_group && !GetDraggingGroupHeaderId() &&
++      (node.type() != TabCollectionNode::Type::GROUP ||
++       TabGroupDataFromNode(node).id() != *source_group)) {
++    std::vector<int> indices;
++    for (const TabDragData& tab_drag_data : drag_session_data.tab_drag_data_) {
++      const int index =
++          tab_drag_data.contents
++              ? tab_strip_model_->GetIndexOfWebContents(tab_drag_data.contents)
++              : TabStripModel::kNoTab;
++      if (index != TabStripModel::kNoTab &&
++          tab_strip_model_->GetTabAtIndex(index)->GetGroup() == source_group) {
++        indices.push_back(index);
++      }
++    }
++    if (indices.size() == tab_strip_model_->group_model()
++                              ->GetTabGroup(*source_group)
++                              ->ListTabs()
++                              .length()) {
++      std::ranges::sort(indices);
++      tab_strip_model_->RemoveFromGroup(indices);
++    }
++  }
++
+   int target_index;
+   std::optional<tab_groups::TabGroupId> target_group_id;
+   if (node.type() == TabCollectionNode::Type::GROUP) {
+@@ -418,6 +479,22 @@ void TabDragHandlerImpl::HandleDraggedTa
+       target_index = group_indexes.end();
+     } else {
+       target_index = source_tab_index;
++      // Helium+: all the tabs of a group can be dragged without it (see
++      // GetFullySelectedGroups()). They are already in place: moving them
++      // within it fails.
++      const bool in_group = std::ranges::all_of(
++          drag_session_data.tab_drag_data_, [&](const TabDragData& data) {
++            const int index =
++                data.contents
++                    ? tab_strip_model_->GetIndexOfWebContents(data.contents)
++                    : TabStripModel::kNoTab;
++            return index >= static_cast<int>(group_indexes.start()) &&
++                   index < static_cast<int>(group_indexes.end());
++          });
++      if (in_group &&
++          group_indexes.length() == drag_session_data.tab_drag_data_.size()) {
++        return;
++      }
+     }
+   } else if (auto source_tab_group_id =
+                  tabs::TabInterface::GetFromContents(source_contents)
+@@ -939,6 +1016,28 @@ void TabDragHandlerImpl::ResetDragState(
+   scroll_synchronizers_.clear();
+ }
+ 
++void TabDragHandlerImpl::KeepGroupForDrag() {
++  std::unique_ptr<ui::Event> event = std::move(press_event_);
++  tabs::TabInterface* tab = press_tab_.Get();
++  // Adding a tab ends the drag.
++  ResetDragState();
++  if (!tab) {
++    return;
++  }
++  ui::ListSelectionModel selection_model = press_selection_model_;
++  if (std::optional<int> index =
++          helium_plus::ClosedTabsService::KeepGroupForDrag(*tab_strip_model_,
++                                                           *tab)) {
++    selection_model.IncrementFrom(*index);
++  }
++  TabCollectionNode* node = root_node_->GetNodeForHandle(tab->GetHandle());
++  if (!node) {
++    return;
++  }
++  base::AutoReset<bool> keeping_group(&keeping_group_, true);
++  InitializeDrag(*node, selection_model, *event->AsLocatedEvent());
++}
++
+ bool TabDragHandlerImpl::HandleDraggedTabsIntoPosition(
+     const TabCollectionNode& container_node,
+     const TabCollectionNode* target) {
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+@@ -7,6 +7,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/helium_plus/anchored_tabs.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_data.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+@@ -444,6 +445,61 @@ const TabCollectionNode* TabGroupView::G
+   return nullptr;
+ }
+ 
++bool TabGroupView::LaysOutDragPosition() const {
++  // Helium+: see TabGroupViewLayout::CalculateVerticalLayout().
++  return closed_tab_views_ && !IsCollapsed();
++}
++
++void TabGroupView::OnTabsDropped() {
++  // Helium+: the dropped tab keeps its place among the closed tabs.
++  if (!LaysOutDragPosition()) {
++    return;
++  }
++  std::vector<helium_plus::ClosedTabsService::DisplayItem> order;
++  bool has_closed_tabs = false;
++  auto add_tab = [&order](const views::View& view) {
++    const TabView* tab_view = views::AsViewClass<TabView>(&view);
++    if (const tabs::TabInterface* tab =
++            tab_view ? tab_view->GetTabInterface() : nullptr) {
++      order.emplace_back(tab->GetHandle());
++    }
++  };
++  for (const views::ChildLayout& layout : GetLayoutForDrag().child_layouts) {
++    const views::View* child = layout.child_view;
++    if (const auto* closed_tab_view =
++            views::AsViewClass<helium_plus::ClosedTabView>(child)) {
++      if (layout.visible) {
++        order.emplace_back(closed_tab_view->closed_tab_id());
++        has_closed_tabs = true;
++      }
++    } else if (views::IsViewClass<SplitTabView>(child)) {
++      for (const views::View* split_child : child->children()) {
++        add_tab(*split_child);
++      }
++    } else {
++      add_tab(*child);
++    }
++  }
++  if (has_closed_tabs) {
++    helium_plus::ClosedTabsService::Arrange(order);
++  }
++}
++
++bool TabGroupView::KeepsDraggedTabs() const {
++  if (!closed_tab_views_) {
++    return false;
++  }
++  bool has_closed_tabs = false;
++  for (const views::View* child : GetDisplayedChildren()) {
++    if (views::IsViewClass<helium_plus::ClosedTabView>(child)) {
++      has_closed_tabs = true;
++    } else if (!GetDragHandler().IsViewDragging(*child)) {
++      return false;
++    }
++  }
++  return has_closed_tabs;
++}
++
+ std::optional<BrowserRootView::DropIndex> TabGroupView::GetLinkDropIndex(
+     const gfx::Point& loc_in_group) {
+   if (!collection_node_) {
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.h
+@@ -99,6 +99,9 @@ class TabGroupView : public TabCollectio
+   std::vector<views::View*> GetDisplayedChildren() const;
+   // Helium+: updates the closed tabs shown once they changed.
+   void ScheduleClosedTabsUpdate();
++  // Helium+: whether the dragged tabs must stay in the group: all its tabs,
++  // which keep closed tabs (Chromium deletes empty groups).
++  bool KeepsDraggedTabs() const;
+ 
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
+       const gfx::Point& point_in_local_coords);
+@@ -135,6 +138,8 @@ class TabGroupView : public TabCollectio
+   const views::ProposedLayout& GetLayoutForDrag() const override;
+   const TabCollectionNode* GetCollectionNodeFromView(
+       const views::View& view) const override;
++  bool LaysOutDragPosition() const override;
++  void OnTabsDropped() override;
+ 
+   void AttachChildView(std::unique_ptr<views::View> child_view,
+                        const gfx::Rect& previous_bounds_in_screen);
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view_layout.h"
+ 
+ #include <algorithm>
++#include <iterator>
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+@@ -110,8 +111,7 @@ views::ProposedLayout TabGroupViewLayout
+   }
+ 
+   // Helium+: the closed tabs of the group are laid out among its tabs.
+-  const std::vector<views::View*> children =
+-      tab_group_view->GetDisplayedChildren();
++  std::vector<views::View*> children = tab_group_view->GetDisplayedChildren();
+ 
+   const bool is_focused = tab_group_view->IsGroupFocused();
+   // Helium+: a collapsed group still lays out its open tabs under the header.
+@@ -122,6 +122,48 @@ views::ProposedLayout TabGroupViewLayout
+   const bool icon_only = tab_strip_collapse_state !=
+                          tabs::VerticalTabStripCollapseState::kExpanded;
+ 
++  // Helium+: a tab dragged alone in the group takes its place among the closed
++  // tabs around it, the way DraggedTabsContainer::GetTargetForTabDrag places
++  // it among tabs: before the first one whose center, without the dragged tab,
++  // is below the dragged center minus half the dragged height.
++  if (tab_group_view->closed_tab_views_ && !is_group_collapsed && !icon_only) {
++    auto is_dragged = [tab_group_view](const views::View* child) {
++      return tab_group_view->GetVisualDataForDraggedView(*child).has_value();
++    };
++    auto is_closed_tab = [](const views::View* child) {
++      return views::IsViewClass<helium_plus::ClosedTabView>(child);
++    };
++    auto dragged = std::ranges::find_if(children, is_dragged);
++    if (dragged != children.end() && views::IsViewClass<TabView>(*dragged) &&
++        std::ranges::count_if(children, is_dragged) == 1) {
++      views::View* dragged_view = *dragged;
++      size_t begin = std::distance(children.begin(), children.erase(dragged));
++      size_t end = begin;
++      while (begin > 0 && is_closed_tab(children[begin - 1])) {
++        --begin;
++      }
++      while (end < children.size() && is_closed_tab(children[end])) {
++        ++end;
++      }
++      const gfx::Rect dragged_bounds = tab_group_view->GetDraggingViewsBounds();
++      size_t index = begin;
++      int y = height;
++      for (size_t i = 0; i < end; ++i) {
++        const int child_height =
++            children[i]->GetPreferredSize(size_bounds).height();
++        if (i >= begin) {
++          if (dragged_bounds.CenterPoint().y() <
++              y + (child_height + dragged_bounds.height()) / 2) {
++            break;
++          }
++          index = i + 1;
++        }
++        y += child_height + kTabVerticalPadding;
++      }
++      children.insert(children.begin() + index, dragged_view);
++    }
++  }
++
+   // Layout children in order. Children will have their preferred height and
+   // fill available width.
+   for (auto* child : children) {
+@@ -150,7 +192,12 @@ views::ProposedLayout TabGroupViewLayout
+     if (icon_only) {
+       bounds.set_height(0);
+     }
+-    layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
++    // Helium+: a closed tab hidden while its keeper was out of the group (see
++    // ClosedTabViews::HideMissingViews()) shows again once back in it.
++    const bool visible = views::IsViewClass<helium_plus::ClosedTabView>(child)
++                             ? !is_group_collapsed
++                             : child->GetVisible();
++    layouts.child_layouts.emplace_back(child, visible, bounds);
+     if (icon_only || (is_group_collapsed && !TabGroupView::IsOpenTab(*child))) {
+       continue;
+     }
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -294,6 +294,14 @@ DraggedTabsContainer& UnpinnedTabContain
+   const bool is_horizontal =
+       collection_node_ &&
+       collection_node_->orientation() == TabStripOrientation::kHorizontal;
++  // Helium+: the dragged tabs keeping a group stay in it.
++  for (const views::ChildLayout& layout : target_layout.child_layouts) {
++    auto* group_view = views::AsViewClass<TabGroupView>(layout.child_view);
++    if (group_view && group_view->IsHandlingDrag() &&
++        group_view->KeepsDraggedTabs()) {
++      return *group_view;
++    }
++  }
+   for (const views::ChildLayout& layout : target_layout.child_layouts) {
+     if (!layout.visible || IsViewDragging(*layout.child_view)) {
+       continue;
+--- a/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
++++ b/chrome/browser/ui/views/tabs/common/tab_drag_handler.h
+@@ -23,7 +23,9 @@
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/models/list_selection_model.h"
+ #include "ui/events/event.h"
++#include "ui/gfx/geometry/point.h"
+ #include "ui/gfx/geometry/vector2d.h"
+ #include "ui/views/controls/scroll_view.h"
+ #include "ui/views/view_targeter_delegate.h"
+@@ -224,6 +226,11 @@ class TabDragHandlerImpl : public TabDra
+   // Resets member variables that track a drag being managed by this handler.
+   void ResetDragState();
+ 
++  // Helium+: once the drag of the last tab of a group keeping closed tabs
++  // starts, initializes it again after one of them became a tab, so that the
++  // group stays if the tab leaves it (see ClosedTabsService::KeepGroupForDrag).
++  void KeepGroupForDrag();
++
+   // Cleans up state tracked by this handler for a given node.
+   void OnNodeWillDestroy(TabCollectionNode& node);
+ 
+@@ -250,6 +257,14 @@ class TabDragHandlerImpl : public TabDra
+   std::map<raw_ptr<const TabCollectionNode>, raw_ptr<TabSlotView>> slot_views_;
+   std::vector<base::CallbackListSubscription> node_destroyed_callbacks_;
+ 
++  // Helium+: the press that initialized a drag for KeepGroupForDrag(), its
++  // location relative to the source dragged view.
++  std::unique_ptr<ui::Event> press_event_;
++  tabs::TabHandle press_tab_;
++  ui::ListSelectionModel press_selection_model_;
++  gfx::Point press_point_in_screen_;
++  bool keeping_group_ = false;
++
+   base::WeakPtrFactory<TabDragHandlerImpl> weak_factory_{this};
+ };
+ 
