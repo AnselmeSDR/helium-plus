@@ -109,6 +109,16 @@ reçoivent que des appels d'une ou deux lignes.
     données du profil (historique, comptes, données de sites, extensions, moteurs de recherche de
     `Web Data`). Ajouter un réglage = l'ajouter à la liste ; une liste trop large (préfixes vides)
     partage aussi l'état interne du profil.
+12. `top-padding.patch` : marge de 3 px (`kSplitViewContentInset`) sous la barre d'outils, au-dessus
+    de la page (`multi_contents_view.cc`, aussi en vue partagée dans
+    `browser_view_tabbed_layout_impl.cc`) et de la barre verticale (`kHeliumBasePadding`,
+    `UpdateInteriorMargin`). Ne pas agrandir la barre d'outils : macOS centre les feux tricolores
+    sur sa hauteur.
+13. `frame-color.patch` : en onglets verticaux, la barre d'outils (`toolbar_view.cc`), le conteneur
+    du haut et le fond autour de la page (`MultiContentsBackgroundView::SetUseFrameTheme`) prennent la
+    couleur « cadre » de la barre verticale au lieu de la couleur « barre d'outils » (différente avec
+    un thème comme Atom One Dark). L'onglet actif garde la couleur « barre d'outils », donc reste
+    visible.
 
 Textes d'interface : `helium_plus/strings.cc` (français si le navigateur est en français, anglais
 sinon), pas de `.grd` pour éviter les gros patches et les recompilations complètes.
