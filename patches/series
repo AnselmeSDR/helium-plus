@@ -43,3 +43,4 @@ helium-plus/shared-theme.patch
 helium-plus/borderless-pinned-tabs.patch
 helium-plus/group-icons.patch
 helium-plus/closed-tabs-drag.patch
+helium-plus/reopen-closed-tabs.patch

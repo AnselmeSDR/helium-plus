@@ -193,6 +193,18 @@ two-line calls.
     `OnTabsDropped`) gives the closed tabs to the tabs in the displayed order
     (`ClosedTabsService::Arrange`, then a new snapshot so the next update doesn't move them back). A
     closed tab hidden while its keeper was out of the group shows again once back in it.
+20. `reopen-closed-tabs.patch`: Cmd+Shift+T also reopens closed anchored tabs, which stay in their
+    container instead of the tab restore service. `TabState::SetClosed(true)` (only the user closes
+    an anchored tab) records `closed_time`, copied to the `ClosedTab` (`MakeClosedTab`) and back to
+    a carrier tab (`AddTab`); not saved, so only tabs closed since the browser started count.
+    `chrome::RestoreTab` first calls `ClosedTabsService::ReopenLastClosed` with the time of the
+    service's most recent entry: the anchored tab closed last opens again if more recent (entry:
+    `Restore`, closed tab still in the strip: activation). `IDC_RESTORE_TAB` stays enabled while
+    such a tab exists (`HasReopenableTab`, updated on tab strip changes). Chromium records every
+    window closed by quitting as a closed window, so after a restart with session restore,
+    Cmd+Shift+T opened those windows a second time (groups duplicated, closed tabs moved to unsaved
+    copies of the groups): `UnloadController` no longer records them when quitting and the session
+    comes back on next start (startup pref or `--restore-last-session`).
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

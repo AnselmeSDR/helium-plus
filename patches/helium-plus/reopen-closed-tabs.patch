@@ -1,0 +1,287 @@
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -71,6 +71,7 @@
+ #include "chrome/browser/ui/dialogs/browser_dialogs.h"
+ #include "chrome/browser/ui/fullscreen/browser_window_fullscreen_controller.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
+ #include "chrome/browser/ui/lens/lens_overlay_controller.h"
+ #include "chrome/browser/ui/managed_ui.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+@@ -1743,6 +1744,8 @@ void BrowserCommandController::OnTabStri
+     const TabStripModelChange& change,
+     const TabStripSelectionChange& selection) {
+   UpdateCommandsForTabStripStateChanged();
++  // Helium+: closing an anchored tab changes the restore command.
++  UpdateTabRestoreCommandState();
+ }
+ 
+ void BrowserCommandController::TabGroupedStateChanged(
+@@ -2774,10 +2777,13 @@ void BrowserCommandController::UpdateTab
+       TabRestoreServiceFactory::GetForProfile(profile());
+   // The command is enabled if the service hasn't loaded yet to trigger loading.
+   // The command is updated once the load completes.
++  // Helium+: Cmd+Shift+T also reopens closed anchored tabs.
+   command_updater_->UpdateCommandEnabled(
+       IDC_RESTORE_TAB,
+-      tab_restore_service && (!tab_restore_service->IsLoaded() ||
+-                              !tab_restore_service->entries().empty()));
++      (tab_restore_service && (!tab_restore_service->IsLoaded() ||
++                               !tab_restore_service->entries().empty())) ||
++          helium_plus::ClosedTabsService::HasReopenableTab(
++              *browser_->GetTabStripModel()));
+ }
+ 
+ void BrowserCommandController::UpdateCheckedState(actions::ActionId action_id,
+--- a/chrome/browser/ui/browser_tab_restorer.cc
++++ b/chrome/browser/ui/browser_tab_restorer.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/ui/browser_live_tab_context.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
+ #include "components/sessions/core/tab_restore_service.h"
+ #include "components/sessions/core/tab_restore_service_observer.h"
+ 
+@@ -104,6 +105,16 @@ void RestoreTab(BrowserWindowInterface*
+ 
+   sessions::TabRestoreService* service =
+       TabRestoreServiceFactory::GetForProfile(browser->GetProfile());
++  // Helium+: closed anchored tabs stay in their container, out of the tab
++  // restore service. The last one opens again if closed after its last entry.
++  base::Time last_entry_time;
++  if (service && !service->entries().empty()) {
++    last_entry_time = service->entries().front()->timestamp;
++  }
++  if (helium_plus::ClosedTabsService::ReopenLastClosed(
++          *browser->GetTabStripModel(), last_entry_time)) {
++    return;
++  }
+   if (!service) {
+     return;
+   }
+--- a/chrome/browser/ui/helium_plus/closed_tabs.cc
++++ b/chrome/browser/ui/helium_plus/closed_tabs.cc
+@@ -118,13 +118,15 @@ bool Distribute(std::vector<Item> items)
+ }
+ 
+ ClosedTab MakeClosedTab(tabs::TabInterface& tab, const TabState& state) {
+-  if (state.anchor_url().is_valid()) {
+-    return ClosedTab(state.anchor_url(), state.anchor_title(),
+-                     state.custom_title());
+-  }
+   content::WebContents* contents = tab.GetContents();
+-  return ClosedTab(contents->GetVisibleURL(), contents->GetTitle(),
+-                   state.custom_title());
++  ClosedTab closed_tab =
++      state.anchor_url().is_valid()
++          ? ClosedTab(state.anchor_url(), state.anchor_title(),
++                      state.custom_title())
++          : ClosedTab(contents->GetVisibleURL(), contents->GetTitle(),
++                      state.custom_title());
++  closed_tab.closed_time = state.closed_time();
++  return closed_tab;
+ }
+ 
+ BrowserWindowInterface* GetBrowser(TabStripModel& model) {
+@@ -184,7 +186,11 @@ TabState* AddTab(TabStripModel& model,
+       /*is_active_browser=*/std::nullopt,
+       select ? chrome::RestoredTabLoadPolicy::kLoadIfVisible
+              : chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
+-  return contents ? TabState::FromWebContents(contents) : nullptr;
++  TabState* state = contents ? TabState::FromWebContents(contents) : nullptr;
++  if (state && !select) {
++    state->set_closed_time(closed_tab.closed_time);
++  }
++  return state;
+ }
+ 
+ // Moves an insertion `index` out of the split tab around it, after it when
+@@ -242,6 +248,66 @@ void ClosedTabsService::Open(TabStripMod
+ }
+ 
+ // static
++bool ClosedTabsService::ReopenLastClosed(TabStripModel& model,
++                                         base::Time closed_after) {
++  base::Time last = closed_after;
++  std::optional<int> last_index;
++  std::optional<int> last_id;
++  for (int index = 0; index < model.count(); ++index) {
++    const TabState* state = TabState::From(model.GetTabAtIndex(index));
++    if (!state) {
++      continue;
++    }
++    if (state->IsClosed() && state->closed_time() > last) {
++      last = state->closed_time();
++      last_index = index;
++      last_id.reset();
++    }
++    for (const ClosedTabs* closed_tabs :
++         {&state->closed_before(), &state->closed_after()}) {
++      for (const ClosedTab& closed_tab : *closed_tabs) {
++        if (closed_tab.closed_time > last) {
++          last = closed_tab.closed_time;
++          last_id = closed_tab.id;
++          last_index.reset();
++        }
++      }
++    }
++  }
++  if (last_id) {
++    return Restore(model, *last_id, /*select=*/true).has_value();
++  }
++  if (last_index) {
++    // Activating a closed tab opens it again.
++    model.ActivateTabAt(*last_index);
++    return true;
++  }
++  return false;
++}
++
++// static
++bool ClosedTabsService::HasReopenableTab(TabStripModel& model) {
++  for (int index = 0; index < model.count(); ++index) {
++    const TabState* state = TabState::From(model.GetTabAtIndex(index));
++    if (!state) {
++      continue;
++    }
++    if (state->IsClosed() && !state->closed_time().is_null()) {
++      return true;
++    }
++    for (const ClosedTabs* closed_tabs :
++         {&state->closed_before(), &state->closed_after()}) {
++      if (std::ranges::any_of(*closed_tabs, [](const ClosedTab& closed_tab) {
++            return !closed_tab.closed_time.is_null();
++          })) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++// static
+ std::optional<int> ClosedTabsService::Restore(TabStripModel& model,
+                                               int id,
+                                               bool select) {
+--- a/chrome/browser/ui/helium_plus/closed_tabs.h
++++ b/chrome/browser/ui/helium_plus/closed_tabs.h
+@@ -14,6 +14,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/no_destructor.h"
+ #include "base/scoped_observation.h"
++#include "base/time/time.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/helium_plus/tab_state.h"
+@@ -38,6 +39,13 @@ class ClosedTabsService : public Browser
+   // Opens the closed tab `id` of `model` in its place and activates it.
+   static void Open(TabStripModel& model, int id);
+ 
++  // For Cmd+Shift+T: opens again the tab of `model` the user closed last, if
++  // closed after `closed_after` (see ClosedTab::closed_time). Returns whether
++  // a tab was opened.
++  static bool ReopenLastClosed(TabStripModel& model, base::Time closed_after);
++  // Whether ReopenLastClosed() has a tab to open.
++  static bool HasReopenableTab(TabStripModel& model);
++
+   // Whether the tabs of `group` keep closed tabs.
+   static bool GroupHasClosedTabs(TabStripModel& model,
+                                  const tab_groups::TabGroupId& group);
+--- a/chrome/browser/ui/helium_plus/tab_state.cc
++++ b/chrome/browser/ui/helium_plus/tab_state.cc
+@@ -320,6 +320,7 @@ void TabState::SetClosed(bool closed) {
+     return;
+   }
+   closed_ = closed;
++  closed_time_ = closed ? base::Time::Now() : base::Time();
+   Persist(kClosedKey, closed_ ? "1" : std::string());
+   if (content::WebContents* contents = tab().GetContents()) {
+     contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
+--- a/chrome/browser/ui/helium_plus/tab_state.h
++++ b/chrome/browser/ui/helium_plus/tab_state.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "base/callback_list.h"
++#include "base/time/time.h"
+ #include "chrome/browser/ui/tabs/contents_observing_tab_feature.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ #include "url/gurl.h"
+@@ -43,6 +44,9 @@ struct ClosedTab {
+   GURL url;
+   std::u16string title;
+   std::u16string custom_title;
++  // When the user closed the tab in this browser process, null otherwise. Not
++  // saved: Cmd+Shift+T only reopens tabs closed since the browser started.
++  base::Time closed_time;
+ };
+ using ClosedTabs = std::vector<ClosedTab>;
+ 
+@@ -88,6 +92,9 @@ class TabState : public tabs::ContentsOb
+   // hibernates is not closed.
+   bool IsClosed() const { return closed_; }
+   void SetClosed(bool closed);
++  // When the user closed the tab (see ClosedTab::closed_time).
++  base::Time closed_time() const { return closed_time_; }
++  void set_closed_time(base::Time closed_time) { closed_time_ = closed_time; }
+ 
+   // Closed tabs shown just before and just after this tab in its container.
+   const ClosedTabs& closed_before() const { return closed_before_; }
+@@ -118,6 +125,7 @@ class TabState : public tabs::ContentsOb
+   std::u16string anchor_title_;
+   bool diverged_ = false;
+   bool closed_ = false;
++  base::Time closed_time_;
+   ClosedTabs closed_before_;
+   ClosedTabs closed_after_;
+   int closed_tabs_revision_ = 0;
+--- a/chrome/browser/ui/unload_controller.cc
++++ b/chrome/browser/ui/unload_controller.cc
+@@ -16,6 +16,8 @@
+ #include "chrome/browser/download/download_core_service_factory.h"
+ #include "chrome/browser/lifetime/application_lifetime_desktop.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
++#include "chrome/browser/prefs/session_startup_pref.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/session_service_base.h"
+ #include "chrome/browser/sessions/session_service_lookup.h"
+ #include "chrome/browser/sessions/tab_restore_service_factory.h"
+@@ -39,6 +41,7 @@
+ #include "chrome/browser/web_applications/policy/web_app_policy_manager.h"
+ #include "chrome/browser/web_applications/web_app_provider.h"
+ #include "chrome/common/chrome_features.h"
++#include "chrome/common/chrome_switches.h"
+ #include "components/keep_alive_registry/keep_alive_registry.h"
+ #include "components/performance_manager/public/execution_context_priority/execution_context_priority.h"
+ #include "components/sessions/core/session_id.h"
+@@ -92,6 +95,15 @@ std::pair<bool, bool> IsLastWindow(const
+   return {last_window, last_window_for_profile};
+ }
+ 
++// Helium+: whether the next start restores the session of `profile`, as the
++// pref asks or as this browser was started.
++bool WillRestoreSession(const Profile& profile) {
++  return SessionStartupPref::GetStartupPref(&profile)
++             .ShouldRestoreLastSession() ||
++         base::CommandLine::ForCurrentProcess()->HasSwitch(
++             switches::kRestoreLastSession);
++}
++
+ }  // namespace
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -205,6 +217,13 @@ void UnloadController::OnWindowClosing()
+       (browser_type == BrowserWindowInterface::Type::TYPE_APP_POPUP);
+ #endif
+ 
++  // Helium+: a window closed by quitting comes back with the session restore,
++  // so Cmd+Shift+T would open it a second time.
++  if (browser_shutdown::IsTryingToQuit() &&
++      WillRestoreSession(*browser_->GetProfile())) {
++    notify_restore_service = false;
++  }
++
+   if (tab_restore_service && notify_restore_service) {
+     tab_restore_service->BrowserClosing(BrowserLiveTabContext::From(browser_));
+   }
