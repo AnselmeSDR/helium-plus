@@ -1,204 +1,204 @@
 # Helium+
 
-Fork perso de [Helium](https://github.com/imputnet/helium-macos) pour macOS : Helium enrichi
-(onglets, espaces, mémoire, confort), inspiré d'Arc.
+Personal fork of [Helium](https://github.com/imputnet/helium-macos) for macOS: Helium with extras
+(tabs, spaces, memory, comfort), inspired by Arc.
 
-## Dépôts
+## Repositories
 
-- GitLab (principal, nom affiché « Helium+ ») : https://gitlab.com/AnselmeSDR/helium-plus
-- GitHub (fork de `imputnet/helium-macos`, sert aussi à la CI) : https://github.com/AnselmeSDR/helium-plus
-- `origin` : fetch GitLab, push GitLab + GitHub (un `git push` envoie aux deux)
-- `upstream` : `imputnet/helium-macos`
-- Identité locale : `Anselme SDR <anselme8@icloud.com>`
+- GitLab (main, displayed name "Helium+"): https://gitlab.com/AnselmeSDR/helium-plus
+- GitHub (fork of `imputnet/helium-macos`, also used for CI): https://github.com/AnselmeSDR/helium-plus
+- `origin`: fetches from GitLab, pushes to GitLab + GitHub (one `git push` sends to both)
+- `upstream`: `imputnet/helium-macos`
+- Local identity: `Anselme SDR <anselme8@icloud.com>`
 
 ## Structure
 
-- Ce dépôt = `helium-macos` (build macOS). Le Helium commun est le sous-module `helium-chromium`
-  (`imputnet/helium`), **non forké** : on ne le modifie pas.
-- Nos fonctionnalités = patches Chromium dans `patches/helium-plus/`, ajoutés en fin de
-  `patches/series` (appliqués après tous les patches Helium et macOS).
-- Garder chaque patch petit et ciblé, en s'appuyant sur l'existant de Chromium (onglets épinglés,
-  groupes, Memory Saver) : chaque ligne modifiée est un conflit potentiel à chaque mise à jour.
-- Version Chromium : `helium-chromium/chromium_version.txt`.
+- This repository = `helium-macos` (macOS build). The shared Helium code is the `helium-chromium`
+  submodule (`imputnet/helium`), **not forked**: we don't modify it.
+- Our features = Chromium patches in `patches/helium-plus/`, added at the end of `patches/series`
+  (applied after all Helium and macOS patches).
+- Keep each patch small and focused, building on what Chromium already has (pinned tabs, groups,
+  Memory Saver): every modified line is a potential conflict on each update.
+- Chromium version: `helium-chromium/chromium_version.txt`.
 
-### Nos patches (`patches/helium-plus/`, dans l'ordre)
+### Our patches (`patches/helium-plus/`, in order)
 
-La logique vit dans nos propres fichiers (`chrome/browser/ui/helium_plus/`,
-`chrome/browser/ui/views/helium_plus/`, namespace `helium_plus`) ; les fichiers Chromium ne
-reçoivent que des appels d'une ou deux lignes.
+The logic lives in our own files (`chrome/browser/ui/helium_plus/`,
+`chrome/browser/ui/views/helium_plus/`, namespace `helium_plus`); Chromium files only get one- or
+two-line calls.
 
-1. `tab-state.patch` : `helium_plus::TabState`, état par onglet créé par `TabFeatures::Init`
-   (titre personnalisé, URL et titre d'ancrage, état « fermé »). Sauvé comme « tab extra data » de session
-   (clés `helium_plus.*`) : `SessionService::BuildCommandsForTab` + `AddTabExtraData` à chaque
-   changement, `BrowserLiveTabContext::GetExtraDataForTab` pour la réouverture d'onglets ;
-   restauré via `CreateRestoredTab` (`StashRestoredData`, repris par le constructeur de
-   `TabState`). `TabUIHelper::GetTitle` renvoie le titre personnalisé.
-2. `tab-context-menu.patch` : commandes `CommandRenameTab`, `CommandReplaceAnchor`,
-   `CommandCloseUngroupedTabs` (fin de `components/tabs/public/tab_context_menu_command.h`),
-   déléguées à `helium_plus/tab_commands.cc` ; boîte de renommage dans `views/helium_plus/`.
-3. `anchored-tabs.patch` : onglet ancré = épinglé ou groupé. Fermer (× via
-   `BrowserTabStripModelDelegate::CloseTab`, Cmd+W via `chrome::CloseTab`) passe par
-   `MaybeResetAnchoredTab` en deux temps, comme Arc : s'il a quitté son ancre
-   (`TabState::IsDiverged`, nouvelle page ouverte hors redirections, navigations internes et
-   rechargements), le bouton est un « − » (`TabCloseButton::SetShowsMinus`, via
-   `TabData::anchor_diverged`) qui le ramène à son ancre ; sinon le × le met en veille et la page
-   d'accueil du profil s'affiche à sa place (onglet déjà dessus, sinon nouvel onglet) ; les liens
-   ouverts depuis un onglet groupé arrivent après le groupe (`TabStripModel::AddTab`) ; à la restauration de session, l'onglet rouvre sur son URL
-   d'ancrage, son historique conservé (`ResetNavigationsToAnchor`). Les groupes enregistrés
-   (`LocalTabGroupListener::MatchLocalTabToSavedTab`) renavigueraient ensuite vers la dernière URL
-   qu'ils ont gardée : `IsAtAnchor` les en empêche. Un onglet en veille sur son ancre est déjà
-   Fermé ≠ en veille : seule la × ferme (`TabState::SetClosed`, enregistré dans la session,
-   effacé quand l'onglet est activé) ; un onglet fermé n'a plus de × (`IsClosedAnchoredTab`, via
-   `TabData::anchor_closed`, dans `tab_view_*_layout.cc`). La veille automatique ne ferme pas.
-4. `auto-hibernation.patch` : `helium_plus::HibernationService` (démarré par `TabState`) met en
-   veille les onglets d'un groupe replié (5 min), d'un profil en arrière-plan (30 min) et, sous
-   pression mémoire, un onglet par minute ; délais de Memory Saver allongés
-   (`memory_saver_mode_policy.cc`).
-5. `right-aligned-tab-groups.patch` : barre verticale à droite, le trait et le retrait des groupes
-   passent à droite (`TabGroupViewLayout::CalculateVerticalLayout`) ; barre réduite : seul le trait
-   bouge, les icônes restent centrées.
-6. `collapsed-groups.patch` : en vertical, comme Arc, un groupe replié garde visibles ses onglets
-   ouverts (actif ou non fermés, en veille compris : `TabGroupView::IsOpenTab`) ; sélectionner un onglet ne déplie plus son
-   groupe (`RootTabCollectionNode`) et replier un groupe n'en fait plus sortir l'onglet actif
-   (`TabStripCollectionController::ToggleTabGroupCollapsedState`). Le trait du groupe longe ses
-   onglets ouverts ; pas de chevron dans l'en-tête (`collapse_icon_` nul). Glisser-déposer : un
-   groupe vertical replié reste une cible (`UnpinnedTabContainerView::GetTabDragTarget`, liens
-   compris) et ne se déplie pas quand on y dépose un onglet (`TabGroupView::AttachChildView`). Survoler l'en-tête
-   d'un groupe replié ouvre `helium_plus::GroupTabsPopover` (`views/helium_plus/`, à la place de
-   la carte de survol) : tous les onglets du groupe, fermés compris, un clic active l'onglet ;
-   fermé par `views::MouseWatcher` quand la souris quitte l'en-tête et la bulle. Le contenu d'une
-   bulle doit avoir un fond opaque (texte en rendu sous-pixel, sinon DCHECK dans `Label`).
-7. `customize-toolbar.patch` : l'option « Nouvel onglet » de Personnaliser › Barre d'outils
-   (`prefs::kShowDynamicNewTabButton`, réservée par Helium à la disposition dynamique) masque aussi
-   « + Nouvel onglet » de la barre verticale (`VerticalTabStripBottomContainer`). Le bouton
-   « Reset to Default » prend un autre libellé : sur Mac (titlecase) sa traduction est partagée
-   avec le zoom (« Rétablir le niveau de zoom par défaut »), les traductions Chromium étant
-   indexées par le texte anglais.
-8. `rounded-extension-popups.patch` : la bulle d'une extension (`ExtensionPopup`) n'a des coins
-   arrondis que si l'option « Show a rounded frame around web contents »
-   (`prefs::kHeliumRoundedFrame`) est activée (`set_use_round_corners`, à `false` d'origine :
-   bulle toujours carrée). Lenteur d'ouverture : la bulle n'apparaît qu'une fois la page chargée, et le
-   build local (component build) démarre ses processus lentement : juger sur le build CI.
-9. `profile-switcher.patch` : un profil = un espace Arc (cookies et comptes séparés).
-   `helium_plus::ProfileSwitcherView` (bas de la barre verticale, `vertical_tab_strip_region_view.cc`) :
-   une icône par profil, dans l'ordre `profile.profiles_order` de Local State, et balayage à deux
-   doigts dans la barre. Icônes tout en bas (espace vide extensible au-dessus, `AddToTabStrip`),
-   rétrécies si la barre est étroite. Icône vectorielle à la place de l'avatar si l'entrée du
-   profil dans Local State (`profile.info_cache.<dossier>`) a `helium_plus_icon` : `game`,
-   `computer`, `home`, `work`, `code` (icônes de `components/vector_icons`). Chaque profil garde sa
-   fenêtre : `profile_switcher.cc` affiche celle du profil cible aux mêmes dimensions, même largeur
-   et état replié de la barre verticale, et masque (sans fermer) l'actuelle (la largeur est posée
-   sur `VerticalTabStripStateController` ; `VerticalTabStripRegionView::OnCollapseStateChanged`
-   la recopie dans sa propre `target_collapse_state_`, sinon elle garde celle de la session) ; clic sur l'icône du
-   Dock : `ShowHiddenBrowserWindow` (`app_controller_mac.mm`). Réglage « Au démarrage » par défaut
-   sur « Reprendre » (`session_startup_pref.cc`) : une fenêtre de profil ouverte par la bascule
-   restaure ses onglets (`--restore-last-session` ne vaut que pour le lancement). Les préférences
-   « suivies » (`session.restore_on_startup`, extensions…) écrites à la main dans `Preferences`
-   sont effacées par Chromium (signature dans `Secure Preferences`) : passer par le navigateur
-   (DevTools `Extensions.loadUnpacked`, réglages).
-10. `tab-import.patch` : `helium_plus::TabImport` (démarré par `TabState`), avec
-    `--helium-plus-import=<dossier>` : crée dans la première fenêtre de chaque profil les onglets de
-    `<dossier>/<dossier du profil>.json` (épinglés, groupes repliés, onglets libres ; format dans
-    `tab_import.h`), non chargés, ancrés et fermés comme les onglets épinglés d'Arc, puis renomme le
-    fichier en `.json.done`. Sert à l'import des espaces Arc (script hors dépôt : plans par espace,
-    copie des cookies/mots de passe rechiffrés avec la clé du profil cible ; Arc stocke une partie de
-    ses cookies chiffrés en TEXT et non en BLOB).
-11. `shared-settings.patch` : `helium_plus::SharedSettings` (démarré par `TabState`) : comme Arc,
-    mêmes réglages dans tous les profils. Un réglage modifié dans un profil est appliqué aux autres
-    profils chargés et gardé dans Local State (`helium_plus.shared_settings`, nom → valeur, `null` =
-    défaut) pour les profils chargés plus tard. Liste dans `IsSharedSetting()` (préfixes `helium.`,
-    `vertical_tabs.`, `browser.theme.`, `intl.`… et noms explicites) : réglages seulement, pas les
-    données du profil (historique, comptes, données de sites, extensions, moteurs de recherche de
-    `Web Data`). Ajouter un réglage = l'ajouter à la liste ; une liste trop large (préfixes vides)
-    partage aussi l'état interne du profil.
-12. `top-padding.patch` : marge de 3 px (`kSplitViewContentInset`) sous la barre d'outils, au-dessus
-    de la page (`multi_contents_view.cc`, aussi en vue partagée dans
-    `browser_view_tabbed_layout_impl.cc`) et de la barre verticale (`kHeliumBasePadding`,
-    `UpdateInteriorMargin`). Ne pas agrandir la barre d'outils : macOS centre les feux tricolores
-    sur sa hauteur.
-13. `frame-color.patch` : en onglets verticaux, la barre d'outils (`toolbar_view.cc`), le conteneur
-    du haut et le fond autour de la page (`MultiContentsBackgroundView::SetUseFrameTheme`) prennent la
-    couleur « cadre » de la barre verticale au lieu de la couleur « barre d'outils » (différente avec
-    un thème comme Atom One Dark). L'onglet actif garde la couleur « barre d'outils », donc reste
-    visible.
+1. `tab-state.patch`: `helium_plus::TabState`, per-tab state created by `TabFeatures::Init`
+   (custom title, anchor URL and title, "closed" state). Saved as session "tab extra data"
+   (`helium_plus.*` keys): `SessionService::BuildCommandsForTab` + `AddTabExtraData` on every
+   change, `BrowserLiveTabContext::GetExtraDataForTab` for reopening tabs; restored through
+   `CreateRestoredTab` (`StashRestoredData`, picked up by the `TabState` constructor).
+   `TabUIHelper::GetTitle` returns the custom title.
+2. `tab-context-menu.patch`: commands `CommandRenameTab`, `CommandReplaceAnchor`,
+   `CommandCloseUngroupedTabs` (end of `components/tabs/public/tab_context_menu_command.h`),
+   delegated to `helium_plus/tab_commands.cc`; rename dialog in `views/helium_plus/`.
+3. `anchored-tabs.patch`: anchored tab = pinned or grouped. Closing (× through
+   `BrowserTabStripModelDelegate::CloseTab`, Cmd+W through `chrome::CloseTab`) goes through
+   `MaybeResetAnchoredTab` in two steps, like Arc: if the tab left its anchor
+   (`TabState::IsDiverged`, a new page opened, excluding redirects, in-page navigations and
+   reloads), the button is a "−" (`TabCloseButton::SetShowsMinus`, through
+   `TabData::anchor_diverged`) that brings it back to its anchor; otherwise × hibernates it and the
+   profile's home page shows in its place (a tab already on it, else a new tab); links opened from
+   a grouped tab land after the group (`TabStripModel::AddTab`); on session restore, the tab
+   reopens on its anchor URL, its history kept (`ResetNavigationsToAnchor`). Saved groups
+   (`LocalTabGroupListener::MatchLocalTabToSavedTab`) would then navigate back to the last URL
+   they kept: `IsAtAnchor` prevents it. Closed ≠ hibernated: only × closes
+   (`TabState::SetClosed`, saved in the session, cleared when the tab is activated); a closed tab
+   has no × anymore (`IsClosedAnchoredTab`, through `TabData::anchor_closed`, in
+   `tab_view_*_layout.cc`). Automatic hibernation doesn't close.
+4. `auto-hibernation.patch`: `helium_plus::HibernationService` (started by `TabState`) hibernates
+   the tabs of a collapsed group (5 min), of a background profile (30 min) and, under memory
+   pressure, one tab per minute; longer Memory Saver delays (`memory_saver_mode_policy.cc`).
+5. `right-aligned-tab-groups.patch`: with the vertical tab strip on the right, the group line and
+   indent move to the right (`TabGroupViewLayout::CalculateVerticalLayout`); collapsed strip: only
+   the line moves, the icons stay centered.
+6. `collapsed-groups.patch`: in vertical mode, like Arc, a collapsed group keeps its open tabs
+   visible (active or not closed, hibernated included: `TabGroupView::IsOpenTab`); selecting a tab
+   no longer expands its group (`RootTabCollectionNode`) and collapsing a group no longer moves the
+   active tab out of it (`TabStripCollectionController::ToggleTabGroupCollapsedState`). The group
+   line runs along its open tabs; no chevron in the header (null `collapse_icon_`). Drag and drop:
+   a vertical collapsed group stays a target (`UnpinnedTabContainerView::GetTabDragTarget`, links
+   included) and doesn't expand when a tab is dropped into it (`TabGroupView::AttachChildView`).
+   Hovering the header of a collapsed group opens `helium_plus::GroupTabsPopover`
+   (`views/helium_plus/`, instead of the hover card): all the group's tabs, closed ones included,
+   a click activates the tab; closed by `views::MouseWatcher` when the mouse leaves the header and
+   the bubble. Bubble contents need an opaque background (text rendered with subpixel
+   antialiasing, otherwise a DCHECK in `Label`).
+7. `customize-toolbar.patch`: the "New tab" option of Customize › Toolbar
+   (`prefs::kShowDynamicNewTabButton`, reserved by Helium for the dynamic layout) also hides
+   "+ New tab" in the vertical tab strip (`VerticalTabStripBottomContainer`). The "Reset to
+   Default" button gets another label: on Mac (titlecase) its French translation is shared with
+   the zoom one ("Rétablir le niveau de zoom par défaut"), since Chromium translations are keyed by
+   the English text.
+8. `rounded-extension-popups.patch`: an extension bubble (`ExtensionPopup`) has rounded corners
+   only when "Show a rounded frame around web contents" (`prefs::kHeliumRoundedFrame`) is enabled
+   (`set_use_round_corners`, originally `false`: always square). Slow opening: the bubble only
+   shows once the page is loaded, and the local build (component build) starts its processes
+   slowly: judge on the CI build.
+9. `profile-switcher.patch`: one profile = one Arc space (separate cookies and accounts).
+   `helium_plus::ProfileSwitcherView` (bottom of the vertical tab strip,
+   `vertical_tab_strip_region_view.cc`): one icon per profile, in the Local State
+   `profile.profiles_order` order, and two-finger swipe in the strip. Icons at the very bottom
+   (flexible empty space above, `AddToTabStrip`), shrunk when the strip is narrow. Vector icon
+   instead of the avatar when the profile's Local State entry (`profile.info_cache.<dir>`) has
+   `helium_plus_icon`: `game`, `computer`, `home`, `work`, `code` (icons from
+   `components/vector_icons`). Each profile keeps its window: `profile_switcher.cc` shows the
+   target profile's window with the same size, the same width and collapsed state of the vertical
+   tab strip, and hides (without closing) the current one (the width is set on
+   `VerticalTabStripStateController`; `VerticalTabStripRegionView::OnCollapseStateChanged` copies
+   it into its own `target_collapse_state_`, otherwise it keeps the session one); click on the
+   Dock icon: `ShowHiddenBrowserWindow` (`app_controller_mac.mm`). "On startup" setting defaults
+   to "Continue where you left off" (`session_startup_pref.cc`): a profile window opened by the
+   switcher restores its tabs (`--restore-last-session` only applies at launch). "Tracked"
+   preferences (`session.restore_on_startup`, extensions…) written by hand into `Preferences` are
+   wiped by Chromium (signature in `Secure Preferences`): go through the browser (DevTools
+   `Extensions.loadUnpacked`, settings).
+10. `tab-import.patch`: `helium_plus::TabImport` (started by `TabState`), with
+    `--helium-plus-import=<dir>`: creates in the first window of each profile the tabs from
+    `<dir>/<profile dir>.json` (pinned, collapsed groups, loose tabs; format in `tab_import.h`),
+    unloaded, anchored and closed like Arc's pinned tabs, then renames the file to `.json.done`.
+    Used to import Arc spaces (script outside the repository: plans per space, cookies/passwords
+    copied and re-encrypted with the target profile's key; Arc stores part of its encrypted cookies
+    as TEXT, not BLOB).
+11. `shared-settings.patch`: `helium_plus::SharedSettings` (started by `TabState`): like Arc, the
+    same settings in every profile. A setting changed in one profile is applied to the other loaded
+    profiles and kept in Local State (`helium_plus.shared_settings`, name → value, `null` = default)
+    for profiles loaded later. List in `IsSharedSetting()` (prefixes `helium.`, `vertical_tabs.`,
+    `browser.theme.`, `intl.`… and explicit names): settings only, not the profile's data
+    (history, accounts, site data, extensions, `Web Data` search engines). Adding a setting = adding
+    it to the list; a list that is too broad (empty prefixes) also shares the profile's internal
+    state.
+12. `top-padding.patch`: 3 px gap (`kSplitViewContentInset`) below the toolbar, above the web
+    contents (`multi_contents_view.cc`, also in split view in `browser_view_tabbed_layout_impl.cc`)
+    and above the vertical tab strip (`kHeliumBasePadding`, `UpdateInteriorMargin`). Don't make the
+    toolbar taller: macOS centers the traffic lights on its height.
+13. `frame-color.patch`: with vertical tabs, the toolbar (`toolbar_view.cc`), the top container and
+    the background around the web contents (`MultiContentsBackgroundView::SetUseFrameTheme`) use the
+    "frame" color of the vertical tab strip instead of the "toolbar" color (different with a theme
+    like Atom One Dark). The active tab keeps the "toolbar" color, so it stays visible.
 
-Textes d'interface : `helium_plus/strings.cc` (français si le navigateur est en français, anglais
-sinon), pas de `.grd` pour éviter les gros patches et les recompilations complètes.
+UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
+`.grd` to avoid large patches and full rebuilds.
 
 ## Build
 
-Voir `docs/building.md`. Prérequis machine (déjà faits) : `brew install python@3.13 wget zstd
-coreutils readline quilt`, `requests`/`pillow` dans python@3.13, `xcodebuild -runFirstLaunch`
-puis `xcodebuild -downloadComponent MetalToolchain`.
+See `docs/building.md`. Machine prerequisites (already done): `brew install python@3.13 wget zstd
+coreutils readline quilt`, `requests`/`pillow` in python@3.13, `xcodebuild -runFirstLaunch` then
+`xcodebuild -downloadComponent MetalToolchain`.
 
-Le `python3` par défaut est en 3.15 : forcer la 3.13 avant toute commande de build.
-`dev.sh` se source depuis **zsh** (pas bash ni fish) : `set_quilt_vars.sh` déduit le dossier
-`patches` de `$0`, faux sous bash → quilt « No series file found ».
+The default `python3` is 3.15: force 3.13 before any build command.
+`dev.sh` must be sourced from **zsh** (not bash or fish): `set_quilt_vars.sh` derives the `patches`
+directory from `$0`, which is wrong under bash → quilt "No series file found".
 
 ```sh
 export PATH="$(brew --prefix python@3.13)/libexec/bin:$PATH"
 source dev.sh
-he setup   # télécharge Chromium et applique les patches (~gros volume disque)
+he setup   # downloads Chromium and applies the patches (~large disk usage)
 he build
-he run     # dossier de données dédié
+he run     # dedicated data directory
 ```
 
-Patches gérés avec `quilt` (`brew install quilt`), depuis `build/src`, en état « merged »
-(`he merge` : série complète dans `patches/series.merged`) :
+Patches are managed with `quilt` (`brew install quilt`), from `build/src`, in "merged" state
+(`he merge`: full series in `patches/series.merged`):
 
 ```sh
-source devutils/set_quilt_vars.sh && cd build/src   # puis quilt --quiltrc - <commande>
-quilt new helium-plus/x.patch && quilt add <fichiers>   # avant de modifier
-quilt refresh                                          # enregistre le patch du dessus
+source devutils/set_quilt_vars.sh && cd build/src   # then quilt --quiltrc - <command>
+quilt new helium-plus/x.patch && quilt add <files>    # before editing
+quilt refresh                                         # saves the top patch
 ```
 
-Pour corriger un patch qui n'est pas au-dessus : `quilt pop` jusqu'à lui, `quilt refresh`,
-`quilt push -a` (`refresh -f` mélangerait les changements des patches suivants). `he unmerge`
-avant de committer : il range nos patches dans `patches/series`.
+To fix a patch that isn't on top: `quilt pop` down to it, `quilt refresh`, `quilt push -a`
+(`refresh -f` would mix in the changes of the following patches). `he unmerge` before committing:
+it puts our patches back into `patches/series`.
 
-Build : ccache obligatoire (`brew install ccache`) : sans lui les en-têtes précompilés plantent
-sous Chromium 156 (`missing 'export module' declaration`). `tools/build-local.sh full` lance le
-build avec temps restant dans le titre Ghostty ; compiler un seul fichier :
-`autoninja -C out/Default ../../chemin/fichier.cc^`.
+Build: ccache is required (`brew install ccache`): without it, precompiled headers fail under
+Chromium 156 (`missing 'export module' declaration`). `tools/build-local.sh full` runs the build
+with the remaining time in the Ghostty title; to compile a single file:
+`autoninja -C out/Default ../../path/file.cc^`.
 
-Mise à jour officielle : Sparkle n'est activé que si `PROD_MACOS_SPARKLE_ED_PUB_KEY` est défini
-(`devutils/shared.sh`) ; ne jamais le définir dans notre CI : Helium+ ne doit pas se mettre à jour
-tout seul vers le Helium officiel.
+Official updates: Sparkle is only enabled when `PROD_MACOS_SPARKLE_ED_PUB_KEY` is defined
+(`devutils/shared.sh`); never define it in our CI: Helium+ must not update itself to the official
+Helium.
 
-## Mise à jour depuis Helium
+## Updating from Helium
 
-Routine GitHub Actions, un samedi sur deux à 3 h UTC (semaine ISO paire ; build d'environ 14 h), lançable à la main :
-1. `helium-plus-update.yml` → `.github/helium-plus/update.sh` : s'il y a une nouvelle version de
-   Helium, branche `update/<version>`, fusion de `upstream/main`, sources Chromium, `quilt push -a`.
-   Conflits git ou patches qui ne s'appliquent plus : Claude Code (`claude -p`, consignes dans
-   `.github/helium-plus/resolve-conflicts.md`, secret `CLAUDE_CODE_OAUTH_TOKEN`). Puis PR vers
-   `main` et lancement du build ; en cas d'échec, une issue.
-2. `helium-plus-build.yml` : build arm64 via `building.yml` (celui de Helium), non signé
-   (`github_prepare_artifacts.sh` saute certificat et deltas Sparkle sans `MACOS_CERTIFICATE`),
-   publié en pré-release, commentaire sur la PR (notification GitHub).
-3. Validation en local, après test de l'app : fusionner la branche dans `main` et pousser
-   (`git fetch github update/<version>`, remote `github` = GitHub en lecture), ce qui ferme la PR.
-   Pour recompiler en local ensuite : `he reset` puis `he setup` si Chromium a changé de version.
+GitHub Actions routine, every other Saturday at 3:00 UTC (even ISO week; the build takes about
+14 h), can be run by hand:
+1. `helium-plus-update.yml` → `.github/helium-plus/update.sh`: if there is a new Helium version,
+   branch `update/<version>`, merge of `upstream/main`, Chromium sources, `quilt push -a`. Git
+   conflicts or patches that no longer apply: Claude Code (`claude -p`, instructions in
+   `.github/helium-plus/resolve-conflicts.md`, secret `CLAUDE_CODE_OAUTH_TOKEN`). Then a PR to
+   `main` and the build starts; on failure, an issue.
+2. `helium-plus-build.yml`: arm64 build through `building.yml` (Helium's), unsigned
+   (`github_prepare_artifacts.sh` skips the certificate and Sparkle deltas without
+   `MACOS_CERTIFICATE`), published as a pre-release, comment on the PR (GitHub notification).
+3. Local validation, after testing the app: merge the branch into `main` and push
+   (`git fetch github update/<version>`, remote `github` = GitHub read-only), which closes the PR.
+   To rebuild locally afterwards: `he reset` then `he setup` if Chromium changed version.
 
-À la main :
+By hand:
 
 ```sh
 git fetch upstream && git merge upstream/main
 git submodule update --init --recursive
 ```
 
-Puis réappliquer et corriger nos patches (`quilt push -a` dans `build/src`), recompiler.
+Then reapply and fix our patches (`quilt push -a` in `build/src`), rebuild.
 
-## Feuille de route
+## Roadmap
 
-- Anchored tabs : les onglets épinglés et groupés gardent une URL d'origine et y reviennent,
-  « Remplacer l'URL ancrée », restauration au démarrage
-- Renommer un onglet (titre persistant)
-- Vider les onglets non groupés
-- Mise en veille automatique : inactivité, RAM saturée, groupe replié, profil en arrière-plan
-- Traductions propres (i18n Helium) si les textes de `strings.cc` ne suffisent plus
-- Réglages (délais de mise en veille, ancrage au démarrage) dans les paramètres
+- Anchored tabs: pinned and grouped tabs keep an original URL and go back to it, "Replace anchored
+  URL", restore on startup
+- Rename a tab (persistent title)
+- Clear ungrouped tabs
+- Automatic hibernation: inactivity, full RAM, collapsed group, background profile
+- Proper translations (Helium i18n) if the `strings.cc` strings are no longer enough
+- Settings (hibernation delays, anchoring on startup) in the settings page
 
-Référence : PR abandonnée [imputnet/helium#1578](https://github.com/imputnet/helium/pull/1578)
-(anchored tabs, sur Chromium 148 ; la partie onglets verticaux est à réécrire : Chromium 156 a
-remplacé `views/tabs/vertical/*` par `views/tabs/common/`).
+Reference: abandoned PR [imputnet/helium#1578](https://github.com/imputnet/helium/pull/1578)
+(anchored tabs, on Chromium 148; the vertical tabs part must be rewritten: Chromium 156 replaced
+`views/tabs/vertical/*` with `views/tabs/common/`).
