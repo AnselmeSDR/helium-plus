@@ -1,0 +1,44 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1362,6 +1362,9 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+   // Updating the top, left and right insets for contents container view when
+   // in split view. This is dependent on a number of other browser states.
+   if (horizontal_layout.is_split_view) {
++    // Helium+: same space below the toolbar as a single tab (see
++    // MultiContentsView::CalculateProposedLayout()).
++    const int toolbar_gap = MultiContentsView::kSplitViewContentInset;
+     const int top_inset =
+         layout_data_->window_state == WindowState::kFullscreen ||
+                 infobar_visible
+@@ -1370,7 +1373,7 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+                   ? ScaleExtent(MultiContentsView::kSplitViewContentInset,
+                                 std::clamp(1.0f - zen.top_chrome_ratio, 0.0f,
+                                            1.0f))
+-                  : 0;
++                  : toolbar_gap;
+     const bool include_leading_inset =
+         separator_info.shadow_box ||
+         !(horizontal_layout.has_side_panel() && side_panel_leading);
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -583,7 +583,7 @@ views::ProposedLayout MultiContentsView:
+     available_space.Inset(split_view_insets_);
+   } else if (should_use_rounded_frame) {
+     gfx::Insets single_insets(kSplitViewContentInset);
+-    single_insets.set_top(attached_chrome.TopInset());
++    // Helium+: the inset is kept below the toolbar too.
+     single_insets.set_left(contents_separators_.leading_side_chrome_attached
+                                ? 0
+                                : kSplitViewContentInset);
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -893,7 +893,8 @@ std::unique_ptr<views::View> VerticalTab
+ void VerticalTabStripRegionView::UpdateInteriorMargin() {
+   const int padding = GetLayoutConstant(
+       LayoutConstant::kVerticalTabStripUncollapsedVerticalPadding);
+-  int top_padding = 0;
++  // Helium+: space below the toolbar, as above the web contents.
++  int top_padding = GetLayoutConstant(LayoutConstant::kHeliumBasePadding);
+   BrowserView* const browser = browser_view();
+   if (browser && browser->IsZenModeEnabledForLayout()) {
+     const float top_chrome_ratio = browser->GetTopChromeRevealRatio();
