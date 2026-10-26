@@ -1,0 +1,1513 @@
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/context_hub/prefs.h"
+ #include "chrome/browser/contextual_cueing/prefs.h"
+ #include "chrome/browser/crash_upload_list/helium_crash_reporting.h"
++#include "chrome/browser/ui/helium_plus/group_icons.h"
+ #include "chrome/browser/ui/helium_plus/shared_settings.h"
+ #include "chrome/browser/download/download_prefs.h"
+ #include "chrome/browser/engagement/important_sites_util.h"
+@@ -1873,6 +1874,7 @@ void RegisterProfilePrefs(user_prefs::Pr
+   ChromeContentBrowserClient::RegisterProfilePrefs(registry);
+   chrome_labs_prefs::RegisterProfilePrefs(registry);
+   ChromeLocationBarModelDelegate::RegisterProfilePrefs(registry);
++  helium_plus::GroupIcons::RegisterProfilePrefs(registry);
+   content_settings::CookieSettings::RegisterProfilePrefs(registry);
+   ChromeVersionService::RegisterProfilePrefs(registry);
+   chrome_browser_net::NetErrorTabHelper::RegisterProfilePrefs(registry);
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3561,6 +3561,8 @@ static_library("ui") {
+       "helium_plus/anchored_tabs.h",
+       "helium_plus/closed_tabs.cc",
+       "helium_plus/closed_tabs.h",
++      "helium_plus/group_icons.cc",
++      "helium_plus/group_icons.h",
+       "helium_plus/hibernation_service.cc",
+       "helium_plus/hibernation_service.h",
+       "helium_plus/profile_switcher.cc",
+@@ -3583,6 +3585,8 @@ static_library("ui") {
+       "views/helium_plus/closed_tab_view.h",
+       "views/helium_plus/folder_icon_view.cc",
+       "views/helium_plus/folder_icon_view.h",
++      "views/helium_plus/group_icon_picker.cc",
++      "views/helium_plus/group_icon_picker.h",
+       "views/helium_plus/group_tabs_popover.cc",
+       "views/helium_plus/group_tabs_popover.h",
+       "views/helium_plus/profile_switcher_view.cc",
+@@ -3595,6 +3599,9 @@ static_library("ui") {
+ 
+     sources += get_target_outputs(":webui_name_variants")
+ 
++    # Helium+: group icons read from SVG files.
++    deps += [ "//services/data_decoder/public/cpp" ]
++
+     public_deps += [ "//chrome/browser/ui/views/tabs/common:impl" ]
+ 
+     deps += [
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/group_icons.cc
+@@ -0,0 +1,668 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/group_icons.h"
++
++#include <algorithm>
++#include <cmath>
++#include <memory>
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/task/thread_pool.h"
++#include "cc/paint/paint_canvas.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/ui/helium_plus/strings.h"
++#include "chrome/browser/ui/select_file_policy/chrome_select_file_policy.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "components/saved_tab_groups/public/saved_tab_group.h"
++#include "components/vector_icons/vector_icons.h"
++#include "services/data_decoder/public/cpp/data_decoder.h"
++#include "services/data_decoder/public/cpp/safe_xml_parser.h"
++#include "third_party/skia/include/core/SkMatrix.h"
++#include "third_party/skia/include/core/SkPaint.h"
++#include "third_party/skia/include/core/SkPath.h"
++#include "third_party/skia/include/core/SkRRect.h"
++#include "third_party/skia/include/utils/SkParsePath.h"
++#include "ui/base/models/image_model.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/image/canvas_image_source.h"
++#include "ui/gfx/vector_icon_types.h"
++#include "ui/shell_dialogs/selected_file_info.h"
++
++namespace helium_plus {
++
++namespace {
++
++const char kGroupIconsKey[] = "helium_plus.group_icons";
++
++// Saved group id → {"icon": library icon name} or {"svg": drawing}, a drawing
++// being {"viewbox": [x, y, width, height], "paths": [path…]}, a path
++// {"d": SVG path data, "fill": bool, "evenodd": bool, "stroke": width (0:
++// none), "cap": SkPaint::Cap, "join": SkPaint::Join}.
++constexpr char kGroupIconsPref[] = "helium_plus.group_icons";
++constexpr char kIconKey[] = "icon";
++constexpr char kSvgKey[] = "svg";
++constexpr char kViewBoxKey[] = "viewbox";
++constexpr char kPathsKey[] = "paths";
++constexpr char kDataKey[] = "d";
++constexpr char kFillKey[] = "fill";
++constexpr char kEvenOddKey[] = "evenodd";
++constexpr char kStrokeKey[] = "stroke";
++constexpr char kCapKey[] = "cap";
++constexpr char kJoinKey[] = "join";
++
++constexpr int kMaxSvgFileSize = 512 * 1024;
++constexpr size_t kMaxSvgPaths = 1000;
++
++// Style of an SVG element, inherited by its children.
++struct SvgStyle {
++  bool fill = true;
++  bool even_odd = false;
++  bool stroke = false;
++  float stroke_width = 1;
++  SkPaint::Cap cap = SkPaint::kButt_Cap;
++  SkPaint::Join join = SkPaint::kMiter_Join;
++  SkMatrix transform;
++};
++
++std::vector<float> ParseNumbers(std::string_view value) {
++  std::vector<float> numbers;
++  for (std::string_view token :
++       base::SplitStringPiece(value, ", \t\r\n", base::TRIM_WHITESPACE,
++                              base::SPLIT_WANT_NONEMPTY)) {
++    double number;
++    if (!base::StringToDouble(token, &number)) {
++      return {};
++    }
++    numbers.push_back(static_cast<float>(number));
++  }
++  return numbers;
++}
++
++float ParseLength(std::string_view value, float fallback) {
++  value = base::TrimWhitespaceASCII(value, base::TRIM_ALL);
++  if (value.ends_with("px")) {
++    value.remove_suffix(2);
++  }
++  double number;
++  return base::StringToDouble(value, &number) ? static_cast<float>(number)
++                                              : fallback;
++}
++
++SkMatrix ParseTransform(std::string_view value) {
++  SkMatrix matrix;
++  size_t position = 0;
++  while (true) {
++    const size_t open = value.find('(', position);
++    const size_t close = value.find(')', open);
++    if (open == std::string_view::npos || close == std::string_view::npos) {
++      return matrix;
++    }
++    const std::string_view name = base::TrimString(
++        value.substr(position, open - position), ", \t\r\n", base::TRIM_ALL);
++    const std::vector<float> args =
++        ParseNumbers(value.substr(open + 1, close - open - 1));
++    SkMatrix step;
++    if (name == "matrix" && args.size() == 6) {
++      step.setAll(args[0], args[2], args[4], args[1], args[3], args[5], 0, 0,
++                  1);
++    } else if (name == "translate" && !args.empty()) {
++      step.setTranslate(args[0], args.size() > 1 ? args[1] : 0);
++    } else if (name == "scale" && !args.empty()) {
++      step.setScale(args[0], args.size() > 1 ? args[1] : args[0]);
++    } else if (name == "rotate" && args.size() == 3) {
++      step.setRotate(args[0], args[1], args[2]);
++    } else if (name == "rotate" && !args.empty()) {
++      step.setRotate(args[0]);
++    }
++    matrix.preConcat(step);
++    position = close + 1;
++  }
++}
++
++// Returns the value of the `name` property of `element`, from its style
++// attribute or its own attribute.
++std::string GetProperty(const base::Value& element, std::string_view name) {
++  const std::string style =
++      data_decoder::GetXmlElementAttribute(element, "style");
++  for (std::string_view declaration : base::SplitStringPiece(
++           style, ";", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    const size_t colon = declaration.find(':');
++    if (colon != std::string_view::npos &&
++        base::TrimWhitespaceASCII(declaration.substr(0, colon),
++                                  base::TRIM_ALL) == name) {
++      return std::string(base::TrimWhitespaceASCII(
++          declaration.substr(colon + 1), base::TRIM_ALL));
++    }
++  }
++  return data_decoder::GetXmlElementAttribute(element, std::string(name));
++}
++
++void ApplyStyle(const base::Value& element, SvgStyle& style) {
++  if (const std::string fill = GetProperty(element, "fill"); !fill.empty()) {
++    style.fill = fill != "none";
++  }
++  if (const std::string rule = GetProperty(element, "fill-rule");
++      !rule.empty()) {
++    style.even_odd = rule == "evenodd";
++  }
++  if (const std::string stroke = GetProperty(element, "stroke");
++      !stroke.empty()) {
++    style.stroke = stroke != "none";
++  }
++  style.stroke_width =
++      ParseLength(GetProperty(element, "stroke-width"), style.stroke_width);
++  const std::string cap = GetProperty(element, "stroke-linecap");
++  if (cap == "butt") {
++    style.cap = SkPaint::kButt_Cap;
++  } else if (cap == "round") {
++    style.cap = SkPaint::kRound_Cap;
++  } else if (cap == "square") {
++    style.cap = SkPaint::kSquare_Cap;
++  }
++  const std::string join = GetProperty(element, "stroke-linejoin");
++  if (join == "miter") {
++    style.join = SkPaint::kMiter_Join;
++  } else if (join == "round") {
++    style.join = SkPaint::kRound_Join;
++  } else if (join == "bevel") {
++    style.join = SkPaint::kBevel_Join;
++  }
++  if (const std::string transform = GetProperty(element, "transform");
++      !transform.empty()) {
++    style.transform.preConcat(ParseTransform(transform));
++  }
++}
++
++// Returns the shape of `element`, if it is a supported one.
++std::optional<SkPath> GetShape(const base::Value& element,
++                               std::string_view tag) {
++  auto number = [&element](const char* name) {
++    return ParseLength(data_decoder::GetXmlElementAttribute(element, name), 0);
++  };
++  if (tag == "path") {
++    return SkParsePath::FromSVGString(
++        data_decoder::GetXmlElementAttribute(element, "d").c_str());
++  }
++  if (tag == "rect") {
++    const SkRect rect = SkRect::MakeXYWH(number("x"), number("y"),
++                                         number("width"), number("height"));
++    float rx = number("rx");
++    float ry = number("ry");
++    rx = rx > 0 ? rx : ry;
++    ry = ry > 0 ? ry : rx;
++    return rx > 0 ? SkPath::RRect(rect, rx, ry) : SkPath::Rect(rect);
++  }
++  if (tag == "circle") {
++    return SkPath::Circle(number("cx"), number("cy"), number("r"));
++  }
++  if (tag == "ellipse") {
++    const float cx = number("cx");
++    const float cy = number("cy");
++    const float rx = number("rx");
++    const float ry = number("ry");
++    return SkPath::Oval(SkRect::MakeLTRB(cx - rx, cy - ry, cx + rx, cy + ry));
++  }
++  if (tag == "line") {
++    return SkPath::Line({number("x1"), number("y1")},
++                        {number("x2"), number("y2")});
++  }
++  if (tag == "polyline" || tag == "polygon") {
++    const std::vector<float> numbers =
++        ParseNumbers(data_decoder::GetXmlElementAttribute(element, "points"));
++    std::vector<SkPoint> points;
++    for (size_t i = 0; i + 1 < numbers.size(); i += 2) {
++      points.push_back({numbers[i], numbers[i + 1]});
++    }
++    return SkPath::Polygon(points, /*isClosed=*/tag == "polygon");
++  }
++  return std::nullopt;
++}
++
++// Adds the drawing of `element` and its children to `paths`.
++void AddPaths(const base::Value& element,
++              SvgStyle style,
++              base::ListValue& paths) {
++  std::string tag;
++  if (!data_decoder::GetXmlElementTagName(element, &tag) ||
++      paths.size() >= kMaxSvgPaths ||
++      GetProperty(element, "display") == "none") {
++    return;
++  }
++  ApplyStyle(element, style);
++  if (tag == "svg" || tag == "g" || tag == "a") {
++    if (const base::ListValue* children =
++            data_decoder::GetXmlElementChildren(element)) {
++      for (const base::Value& child : *children) {
++        AddPaths(child, style, paths);
++      }
++    }
++    return;
++  }
++  std::optional<SkPath> shape = GetShape(element, tag);
++  if (!shape || (!style.fill && !style.stroke)) {
++    return;
++  }
++  const SkPath path = shape->makeTransform(style.transform);
++  paths.Append(base::DictValue()
++                   .Set(kDataKey, SkParsePath::ToSVGString(path).c_str())
++                   .Set(kFillKey, style.fill)
++                   .Set(kEvenOddKey, style.even_odd)
++                   .Set(kStrokeKey, style.stroke ? style.transform.mapRadius(
++                                                       style.stroke_width)
++                                                 : 0.0)
++                   .Set(kCapKey, static_cast<int>(style.cap))
++                   .Set(kJoinKey, static_cast<int>(style.join)));
++}
++
++// Returns the drawing of the SVG document `root`, or nothing if it draws
++// nothing Helium+ supports.
++std::optional<base::DictValue> ParseSvg(const base::Value& root) {
++  if (!data_decoder::IsXmlElementNamed(root, "svg")) {
++    return std::nullopt;
++  }
++  std::vector<float> view_box =
++      ParseNumbers(data_decoder::GetXmlElementAttribute(root, "viewBox"));
++  if (view_box.size() != 4 || view_box[2] <= 0 || view_box[3] <= 0) {
++    view_box = {
++        0, 0,
++        ParseLength(data_decoder::GetXmlElementAttribute(root, "width"), 24),
++        ParseLength(data_decoder::GetXmlElementAttribute(root, "height"), 24)};
++  }
++  base::ListValue paths;
++  AddPaths(root, SvgStyle(), paths);
++  if (paths.empty() || view_box[2] <= 0 || view_box[3] <= 0) {
++    return std::nullopt;
++  }
++  base::ListValue view_box_value;
++  for (float number : view_box) {
++    view_box_value.Append(number);
++  }
++  return base::DictValue()
++      .Set(kViewBoxKey, std::move(view_box_value))
++      .Set(kPathsKey, std::move(paths));
++}
++
++// Draws a drawing from ParseSvg() in a single color, fitted into the image.
++class SvgIconSource : public gfx::CanvasImageSource {
++ public:
++  SvgIconSource(const base::DictValue& svg, SkColor color, int size)
++      : gfx::CanvasImageSource(gfx::Size(size, size)),
++        svg_(svg.Clone()),
++        color_(color) {}
++
++  // gfx::CanvasImageSource:
++  void Draw(gfx::Canvas* canvas) override {
++    const base::ListValue* view_box = svg_.FindList(kViewBoxKey);
++    const base::ListValue* paths = svg_.FindList(kPathsKey);
++    if (!view_box || view_box->size() != 4 || !paths) {
++      return;
++    }
++    const float x =
++        static_cast<float>((*view_box)[0].GetIfDouble().value_or(0));
++    const float y =
++        static_cast<float>((*view_box)[1].GetIfDouble().value_or(0));
++    const float width =
++        static_cast<float>((*view_box)[2].GetIfDouble().value_or(0));
++    const float height =
++        static_cast<float>((*view_box)[3].GetIfDouble().value_or(0));
++    if (width <= 0 || height <= 0) {
++      return;
++    }
++    const float scale =
++        std::min(size().width() / width, size().height() / height);
++    cc::PaintCanvas* paint_canvas = canvas->sk_canvas();
++    paint_canvas->save();
++    paint_canvas->translate((size().width() - width * scale) / 2,
++                            (size().height() - height * scale) / 2);
++    paint_canvas->scale(scale, scale);
++    paint_canvas->translate(-x, -y);
++    for (const base::Value& value : *paths) {
++      const base::DictValue* path_dict = value.GetIfDict();
++      const std::string* data =
++          path_dict ? path_dict->FindString(kDataKey) : nullptr;
++      std::optional<SkPath> path =
++          data ? SkParsePath::FromSVGString(data->c_str()) : std::nullopt;
++      if (!path) {
++        continue;
++      }
++      cc::PaintFlags flags;
++      flags.setAntiAlias(true);
++      flags.setColor(color_);
++      if (path_dict->FindBool(kFillKey).value_or(false)) {
++        flags.setStyle(cc::PaintFlags::kFill_Style);
++        paint_canvas->drawPath(
++            path->makeFillType(path_dict->FindBool(kEvenOddKey).value_or(false)
++                                   ? SkPathFillType::kEvenOdd
++                                   : SkPathFillType::kWinding),
++            flags);
++      }
++      const float stroke =
++          static_cast<float>(path_dict->FindDouble(kStrokeKey).value_or(0));
++      if (stroke > 0) {
++        flags.setStyle(cc::PaintFlags::kStroke_Style);
++        flags.setStrokeWidth(stroke);
++        flags.setStrokeCap(static_cast<cc::PaintFlags::Cap>(
++            std::clamp(path_dict->FindInt(kCapKey).value_or(0), 0,
++                       static_cast<int>(cc::PaintFlags::kLast_Cap))));
++        flags.setStrokeJoin(static_cast<cc::PaintFlags::Join>(
++            std::clamp(path_dict->FindInt(kJoinKey).value_or(0), 0,
++                       static_cast<int>(cc::PaintFlags::kLast_Join))));
++        paint_canvas->drawPath(*path, flags);
++      }
++    }
++    paint_canvas->restore();
++  }
++
++ private:
++  const base::DictValue svg_;
++  const SkColor color_;
++};
++
++std::optional<std::string> ReadSvgFile(const base::FilePath& path) {
++  std::string svg;
++  if (!base::ReadFileToStringWithMaxSize(path, &svg, kMaxSvgFileSize)) {
++    return std::nullopt;
++  }
++  return svg;
++}
++
++}  // namespace
++
++// static
++base::span<const GroupIcons::LibraryIcon> GroupIcons::GetLibrary() {
++  static const LibraryIcon kIcons[] = {
++      {"home", raw_ref(vector_icons::kHomeIcon), u"Maison", u"Home"},
++      {"work", raw_ref(vector_icons::kWorkIcon), u"Travail", u"Work"},
++      {"domain", raw_ref(vector_icons::kDomainIcon), u"Entreprise", u"Company"},
++      {"code", raw_ref(vector_icons::kCodeIcon), u"Code", u"Code"},
++      {"database", raw_ref(vector_icons::kDatabaseIcon), u"Données", u"Data"},
++      {"desktop", raw_ref(vector_icons::kDesktopWindowsIcon), u"Ordinateur",
++       u"Computer"},
++      {"devices", raw_ref(vector_icons::kDevicesIcon), u"Appareils",
++       u"Devices"},
++      {"settings", raw_ref(vector_icons::kSettingsIcon), u"Réglages",
++       u"Settings"},
++      {"science", raw_ref(vector_icons::kScienceIcon), u"Science", u"Science"},
++      {"mail", raw_ref(vector_icons::kMailIcon), u"Courriel", u"Mail"},
++      {"chat", raw_ref(vector_icons::kChatIcon), u"Discussions", u"Chat"},
++      {"call", raw_ref(vector_icons::kCallIcon), u"Appels", u"Calls"},
++      {"calendar", raw_ref(vector_icons::kCalendarTodayIcon), u"Agenda",
++       u"Calendar"},
++      {"checklist", raw_ref(vector_icons::kChecklistIcon), u"Tâches", u"Tasks"},
++      {"document", raw_ref(vector_icons::kDescriptionIcon), u"Documents",
++       u"Documents"},
++      {"note", raw_ref(vector_icons::kStickyNote2Icon), u"Notes", u"Notes"},
++      {"table", raw_ref(vector_icons::kTableChartIcon), u"Tableaux",
++       u"Spreadsheets"},
++      {"idea", raw_ref(vector_icons::kLightbulbIcon), u"Idées", u"Ideas"},
++      {"shopping", raw_ref(vector_icons::kShoppingBagIcon), u"Achats",
++       u"Shopping"},
++      {"store", raw_ref(vector_icons::kStorefrontIcon), u"Boutique", u"Store"},
++      {"payments", raw_ref(vector_icons::kPaymentsIcon), u"Paiements",
++       u"Payments"},
++      {"receipt", raw_ref(vector_icons::kReceiptLongIcon), u"Factures",
++       u"Invoices"},
++      {"delivery", raw_ref(vector_icons::kLocalShippingIcon), u"Livraisons",
++       u"Deliveries"},
++      {"tag", raw_ref(vector_icons::kLoyaltyIcon), u"Étiquettes", u"Tags"},
++      {"flight", raw_ref(vector_icons::kFlightIcon), u"Vols", u"Flights"},
++      {"trip", raw_ref(vector_icons::kTripIcon), u"Voyage", u"Travel"},
++      {"car", raw_ref(vector_icons::kDirectionsCarIcon), u"Voiture", u"Car"},
++      {"place", raw_ref(vector_icons::kLocationOnIcon), u"Lieux", u"Places"},
++      {"photo", raw_ref(vector_icons::kPhotoIcon), u"Photos", u"Photos"},
++      {"video", raw_ref(vector_icons::kVideocamIcon), u"Vidéo", u"Video"},
++      {"movies", raw_ref(vector_icons::kVideoLibraryIcon), u"Films", u"Movies"},
++      {"music", raw_ref(vector_icons::kHeadphonesIcon), u"Musique", u"Music"},
++      {"piano", raw_ref(vector_icons::kPianoIcon), u"Piano", u"Piano"},
++      {"game", raw_ref(vector_icons::kVideogameAssetIcon), u"Jeux", u"Games"},
++      {"party", raw_ref(vector_icons::kCelebrationIcon), u"Fête", u"Party"},
++      {"pets", raw_ref(vector_icons::kPetsIcon), u"Animaux", u"Pets"},
++      {"family", raw_ref(vector_icons::kFamilyLinkIcon), u"Famille", u"Family"},
++      {"identity", raw_ref(vector_icons::kIdCardIcon), u"Identité",
++       u"Identity"},
++      {"star", raw_ref(vector_icons::kStarFilledIcon), u"Favoris",
++       u"Favorites"},
++      {"web", raw_ref(vector_icons::kGlobeIcon), u"Web", u"Web"},
++      {"lock", raw_ref(vector_icons::kLockIcon), u"Privé", u"Private"},
++      {"security", raw_ref(vector_icons::kShieldIcon), u"Sécurité",
++       u"Security"},
++      {"history", raw_ref(vector_icons::kHistoryIcon), u"Historique",
++       u"History"},
++      {"alerts", raw_ref(vector_icons::kNotificationsIcon), u"Alertes",
++       u"Alerts"},
++  };
++  return kIcons;
++}
++
++// static
++void GroupIcons::RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterDictionaryPref(kGroupIconsPref);
++}
++
++// static
++GroupIcons* GroupIcons::Get(Profile* profile) {
++  tab_groups::TabGroupSyncService* service =
++      tab_groups::TabGroupSyncServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return nullptr;
++  }
++  auto* group_icons =
++      static_cast<GroupIcons*>(service->GetUserData(kGroupIconsKey));
++  if (!group_icons) {
++    auto owned = std::make_unique<GroupIcons>(profile, service);
++    group_icons = owned.get();
++    service->SetUserData(kGroupIconsKey, std::move(owned));
++  }
++  return group_icons;
++}
++
++GroupIcons::GroupIcons(Profile* profile,
++                       tab_groups::TabGroupSyncService* service)
++    : profile_(profile), service_(service) {
++  observation_.Observe(service);
++}
++
++GroupIcons::~GroupIcons() {
++  if (select_file_dialog_) {
++    select_file_dialog_->ListenerDestroyed();
++  }
++}
++
++ui::ImageModel GroupIcons::GetIcon(const tab_groups::TabGroupId& group,
++                                   SkColor color,
++                                   int size) const {
++  const base::DictValue* entry = GetEntry(group);
++  if (!entry) {
++    return ui::ImageModel();
++  }
++  if (const std::string* name = entry->FindString(kIconKey)) {
++    for (const LibraryIcon& library_icon : GetLibrary()) {
++      if (library_icon.name == *name) {
++        return ui::ImageModel::FromVectorIcon(*library_icon.icon, color, size);
++      }
++    }
++  }
++  if (const base::DictValue* svg = entry->FindDict(kSvgKey)) {
++    return ui::ImageModel::FromImageSkia(
++        gfx::CanvasImageSource::MakeImageSkia<SvgIconSource>(*svg, color,
++                                                             size));
++  }
++  return ui::ImageModel();
++}
++
++std::string GroupIcons::GetIconName(const tab_groups::TabGroupId& group) const {
++  const base::DictValue* entry = GetEntry(group);
++  const std::string* name = entry ? entry->FindString(kIconKey) : nullptr;
++  return name ? *name : std::string();
++}
++
++bool GroupIcons::HasSvgIcon(const tab_groups::TabGroupId& group) const {
++  const base::DictValue* entry = GetEntry(group);
++  return entry && entry->FindDict(kSvgKey);
++}
++
++void GroupIcons::SetIconName(const tab_groups::TabGroupId& group,
++                             const std::string& name) {
++  const std::optional<base::Uuid> saved_id = GetSavedId(group);
++  if (!saved_id) {
++    return;
++  }
++  SetEntry(*saved_id, name.empty() ? std::nullopt
++                                   : std::make_optional(base::DictValue().Set(
++                                         kIconKey, name)));
++}
++
++void GroupIcons::ChooseSvgFile(const tab_groups::TabGroupId& group,
++                               gfx::NativeWindow owning_window) {
++  const std::optional<base::Uuid> saved_id = GetSavedId(group);
++  if (!saved_id || select_file_dialog_) {
++    return;
++  }
++  choosing_for_ = saved_id;
++  select_file_dialog_ = ui::SelectFileDialog::Create(
++      this, std::make_unique<ChromeSelectFilePolicy>(nullptr));
++  ui::SelectFileDialog::FileTypeInfo file_types;
++  file_types.extensions = {{FILE_PATH_LITERAL("svg")}};
++  select_file_dialog_->SelectFile(ui::SelectFileDialog::SELECT_OPEN_FILE,
++                                  GetString(StringId::kGroupIconSvgFileTitle),
++                                  base::FilePath(), &file_types,
++                                  /*file_type_index=*/1,
++                                  FILE_PATH_LITERAL("svg"), owning_window);
++}
++
++void GroupIcons::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void GroupIcons::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++std::optional<base::Uuid> GroupIcons::GetSavedId(
++    const tab_groups::TabGroupId& group) const {
++  if (!service_) {
++    return std::nullopt;
++  }
++  const std::optional<tab_groups::SavedTabGroup> saved_group =
++      service_->GetGroup(group);
++  return saved_group ? std::make_optional(saved_group->saved_guid())
++                     : std::nullopt;
++}
++
++const base::DictValue* GroupIcons::GetEntry(
++    const tab_groups::TabGroupId& group) const {
++  const std::optional<base::Uuid> saved_id = GetSavedId(group);
++  return saved_id ? profile_->GetPrefs()
++                        ->GetDict(kGroupIconsPref)
++                        .FindDict(saved_id->AsLowercaseString())
++                  : nullptr;
++}
++
++void GroupIcons::SetEntry(const base::Uuid& saved_id,
++                          std::optional<base::DictValue> entry) {
++  {
++    ScopedDictPrefUpdate update(profile_->GetPrefs(), kGroupIconsPref);
++    if (entry) {
++      update->Set(saved_id.AsLowercaseString(), std::move(*entry));
++    } else {
++      update->Remove(saved_id.AsLowercaseString());
++    }
++  }
++  NotifyChanged();
++}
++
++void GroupIcons::OnSvgFileRead(const base::Uuid& saved_id,
++                               std::optional<std::string> svg) {
++  if (!svg) {
++    return;
++  }
++  if (!data_decoder_) {
++    data_decoder_ = std::make_unique<data_decoder::DataDecoder>();
++  }
++  data_decoder_->ParseXml(
++      *svg, data_decoder::mojom::XmlParser::WhitespaceBehavior::kIgnore,
++      base::BindOnce(&GroupIcons::OnSvgParsed, weak_factory_.GetWeakPtr(),
++                     saved_id));
++}
++
++void GroupIcons::OnSvgParsed(const base::Uuid& saved_id,
++                             base::expected<base::Value, std::string> result) {
++  if (!result.has_value()) {
++    return;
++  }
++  std::optional<base::DictValue> svg = ParseSvg(*result);
++  if (!svg) {
++    return;
++  }
++  SetEntry(saved_id, base::DictValue().Set(kSvgKey, std::move(*svg)));
++}
++
++void GroupIcons::NotifyChanged() {
++  for (Observer& observer : observers_) {
++    observer.OnGroupIconsChanged();
++  }
++}
++
++void GroupIcons::OnInitialized() {
++  // Forget the icons of deleted saved groups.
++  std::vector<std::string> deleted;
++  for (const auto [saved_id, entry] :
++       profile_->GetPrefs()->GetDict(kGroupIconsPref)) {
++    const base::Uuid guid = base::Uuid::ParseLowercase(saved_id);
++    if (!guid.is_valid() || !service_->GetGroup(guid)) {
++      deleted.push_back(saved_id);
++    }
++  }
++  if (!deleted.empty()) {
++    ScopedDictPrefUpdate update(profile_->GetPrefs(), kGroupIconsPref);
++    for (const std::string& saved_id : deleted) {
++      update->Remove(saved_id);
++    }
++  }
++  NotifyChanged();
++}
++
++void GroupIcons::OnTabGroupLocalIdChanged(
++    const base::Uuid& sync_id,
++    const std::optional<tab_groups::LocalTabGroupID>& local_id) {
++  NotifyChanged();
++}
++
++void GroupIcons::OnWillBeDestroyed() {
++  observation_.Reset();
++  service_ = nullptr;
++}
++
++void GroupIcons::FileSelected(const ui::SelectedFileInfo& file, int index) {
++  select_file_dialog_ = nullptr;
++  const std::optional<base::Uuid> saved_id = std::exchange(choosing_for_, {});
++  if (!saved_id) {
++    return;
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadSvgFile, file.path()),
++      base::BindOnce(&GroupIcons::OnSvgFileRead, weak_factory_.GetWeakPtr(),
++                     *saved_id));
++}
++
++void GroupIcons::FileSelectionCanceled() {
++  select_file_dialog_ = nullptr;
++  choosing_for_.reset();
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/group_icons.h
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_GROUP_ICONS_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_GROUP_ICONS_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/containers/span.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/raw_ref.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/scoped_observation.h"
++#include "base/supports_user_data.h"
++#include "base/types/expected.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "components/saved_tab_groups/public/tab_group_sync_service.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/gfx/native_ui_types.h"
++#include "ui/shell_dialogs/select_file_dialog.h"
++
++class PrefRegistrySimple;
++class Profile;
++
++namespace data_decoder {
++class DataDecoder;
++}  // namespace data_decoder
++
++namespace gfx {
++struct VectorIcon;
++}  // namespace gfx
++
++namespace ui {
++class ImageModel;
++}  // namespace ui
++
++namespace helium_plus {
++
++// Like the icons of Arc folders, a tab group can have an icon instead of the
++// folder: one of a list of vector icons, or a monochrome SVG file (its paths
++// and basic shapes, drawn in the group color). Kept in the profile prefs by
++// saved group (TabGroupSyncService), as restored groups get new local ids.
++class GroupIcons : public base::SupportsUserData::Data,
++                   public tab_groups::TabGroupSyncService::Observer,
++                   public ui::SelectFileDialog::Listener {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnGroupIconsChanged() = 0;
++  };
++
++  struct LibraryIcon {
++    std::string_view name;
++    raw_ref<const gfx::VectorIcon> icon;
++    std::u16string_view french_label;
++    std::u16string_view english_label;
++  };
++
++  // The icons to choose from.
++  static base::span<const LibraryIcon> GetLibrary();
++
++  static void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++  // Null if the profile has no saved groups.
++  static GroupIcons* Get(Profile* profile);
++
++  GroupIcons(Profile* profile, tab_groups::TabGroupSyncService* service);
++  GroupIcons(const GroupIcons&) = delete;
++  GroupIcons& operator=(const GroupIcons&) = delete;
++  ~GroupIcons() override;
++
++  // Returns the icon of `group` in `color`, or an empty model if it has none.
++  ui::ImageModel GetIcon(const tab_groups::TabGroupId& group,
++                         SkColor color,
++                         int size) const;
++  // The name of the library icon of `group`, empty if it has none.
++  std::string GetIconName(const tab_groups::TabGroupId& group) const;
++  bool HasSvgIcon(const tab_groups::TabGroupId& group) const;
++
++  // An empty `name` removes the icon of `group`.
++  void SetIconName(const tab_groups::TabGroupId& group,
++                   const std::string& name);
++  // Asks for an SVG file, then uses it as the icon of `group`.
++  void ChooseSvgFile(const tab_groups::TabGroupId& group,
++                     gfx::NativeWindow owning_window);
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++ private:
++  std::optional<base::Uuid> GetSavedId(
++      const tab_groups::TabGroupId& group) const;
++  const base::DictValue* GetEntry(const tab_groups::TabGroupId& group) const;
++  void SetEntry(const base::Uuid& saved_id,
++                std::optional<base::DictValue> entry);
++  void OnSvgFileRead(const base::Uuid& saved_id,
++                     std::optional<std::string> svg);
++  void OnSvgParsed(const base::Uuid& saved_id,
++                   base::expected<base::Value, std::string> result);
++  void NotifyChanged();
++
++  // tab_groups::TabGroupSyncService::Observer:
++  void OnInitialized() override;
++  void OnTabGroupLocalIdChanged(
++      const base::Uuid& sync_id,
++      const std::optional<tab_groups::LocalTabGroupID>& local_id) override;
++  void OnWillBeDestroyed() override;
++
++  // ui::SelectFileDialog::Listener:
++  void FileSelected(const ui::SelectedFileInfo& file, int index) override;
++  void FileSelectionCanceled() override;
++
++  const raw_ptr<Profile> profile_;
++  raw_ptr<tab_groups::TabGroupSyncService> service_;
++  base::ScopedObservation<tab_groups::TabGroupSyncService,
++                          tab_groups::TabGroupSyncService::Observer>
++      observation_{this};
++  base::ObserverList<Observer> observers_;
++  scoped_refptr<ui::SelectFileDialog> select_file_dialog_;
++  // The saved group an SVG file is being chosen for.
++  std::optional<base::Uuid> choosing_for_;
++  std::unique_ptr<data_decoder::DataDecoder> data_decoder_;
++  base::WeakPtrFactory<GroupIcons> weak_factory_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_GROUP_ICONS_H_
+--- a/chrome/browser/ui/helium_plus/strings.cc
++++ b/chrome/browser/ui/helium_plus/strings.cc
+@@ -33,7 +33,20 @@ std::u16string GetString(StringId id) {
+     case StringId::kCloseUngroupedTabs:
+       return french ? u"Fermer les onglets non groupés"
+                     : u"Close Ungrouped Tabs";
++    case StringId::kGroupIcon:
++      return french ? u"Icône du groupe" : u"Group icon";
++    case StringId::kGroupIconFolder:
++      return french ? u"Dossier" : u"Folder";
++    case StringId::kGroupIconSvgFile:
++      return french ? u"Fichier SVG…" : u"SVG File…";
++    case StringId::kGroupIconSvgFileTitle:
++      return french ? u"Choisir une icône SVG" : u"Choose an SVG Icon";
+   }
+ }
+ 
++std::u16string GetString(std::u16string_view french,
++                         std::u16string_view english) {
++  return std::u16string(IsFrench() ? french : english);
++}
++
+ }  // namespace helium_plus
+--- a/chrome/browser/ui/helium_plus/strings.h
++++ b/chrome/browser/ui/helium_plus/strings.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_HELIUM_PLUS_STRINGS_H_
+ 
+ #include <string>
++#include <string_view>
+ 
+ namespace helium_plus {
+ 
+@@ -17,9 +18,16 @@ enum class StringId {
+   kTabNameLabel,
+   kReplaceAnchor,
+   kCloseUngroupedTabs,
++  kGroupIcon,
++  kGroupIconFolder,
++  kGroupIconSvgFile,
++  kGroupIconSvgFileTitle,
+ };
+ 
+ std::u16string GetString(StringId id);
++// Returns `french` or `english`, for strings defined elsewhere.
++std::u16string GetString(std::u16string_view french,
++                         std::u16string_view english);
+ 
+ }  // namespace helium_plus
+ 
+--- a/chrome/browser/ui/views/helium_plus/folder_icon_view.cc
++++ b/chrome/browser/ui/views/helium_plus/folder_icon_view.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ 
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "components/vector_icons/vector_icons.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/base/models/image_model.h"
+@@ -16,6 +17,7 @@
+ #include "ui/views/controls/image_view.h"
+ #include "ui/views/controls/label.h"
+ #include "ui/views/layout/fill_layout.h"
++#include "ui/views/layout/flex_layout_view.h"
+ #include "ui/views/painter.h"
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/widget/widget.h"
+@@ -44,11 +46,52 @@ FolderIconView::FolderIconView() {
+ 
+ FolderIconView::~FolderIconView() = default;
+ 
++void FolderIconView::SetGroup(const tab_groups::TabGroupId& group) {
++  if (group_ == group) {
++    return;
++  }
++  group_ = group;
++  UpdateImage();
++}
++
+ void FolderIconView::SetFolder(SkColor color, bool collapsed) {
+-  folder_->SetImage(
+-      ui::ImageModel::FromVectorIcon(collapsed ? vector_icons::kFolderFilledIcon
++  color_ = color;
++  collapsed_ = collapsed;
++  UpdateImage();
++}
++
++void FolderIconView::AddedToWidget() {
++  observation_.Reset();
++  BrowserView* browser_view = BrowserView::GetBrowserViewForNativeWindow(
++      GetWidget()->GetNativeWindow());
++  if (GroupIcons* icons = browser_view
++                              ? GroupIcons::Get(browser_view->GetProfile())
++                              : nullptr) {
++    observation_.Observe(icons);
++  }
++  UpdateImage();
++}
++
++void FolderIconView::RemovedFromWidget() {
++  observation_.Reset();
++}
++
++void FolderIconView::UpdateImage() {
++  ui::ImageModel image;
++  if (observation_.IsObserving() && group_) {
++    image = observation_.GetSource()->GetIcon(*group_, color_, kIconSize);
++  }
++  if (image.IsEmpty()) {
++    image = ui::ImageModel::FromVectorIcon(collapsed_
++                                               ? vector_icons::kFolderFilledIcon
+                                                : vector_icons::kFolderOpenIcon,
+-                                     color, kIconSize));
++                                           color_, kIconSize);
++  }
++  folder_->SetImage(image);
++}
++
++void FolderIconView::OnGroupIconsChanged() {
++  UpdateImage();
+ }
+ 
+ void StyleFolderHeader(views::View& icon, views::Label& name) {
+@@ -60,6 +103,18 @@ void StyleFolderHeader(views::View& icon
+   name.SetSkipSubpixelRenderingOpacityCheck(true);
+ }
+ 
++void SetFolderHeaderIconOnly(views::FlexLayoutView& header,
++                             views::View& icon,
++                             views::Label& name,
++                             bool icon_only) {
++  icon.SetProperty(
++      views::kMarginsKey,
++      gfx::Insets::TLBR(0, 0, 0, icon_only ? 0 : kIconNamePadding));
++  name.SetVisible(!icon_only);
++  header.SetMainAxisAlignment(icon_only ? views::LayoutAlignment::kCenter
++                                        : views::LayoutAlignment::kStart);
++}
++
+ SkColor GetFolderTextColor(const views::View& view) {
+   return TabStyle::Get()->GetTabForegroundColor(
+       /*apparently_active=*/false, IsFrameActive(view),
+--- a/chrome/browser/ui/views/helium_plus/folder_icon_view.h
++++ b/chrome/browser/ui/views/helium_plus/folder_icon_view.h
+@@ -6,14 +6,19 @@
+ #define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_FOLDER_ICON_VIEW_H_
+ 
+ #include <memory>
++#include <optional>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/helium_plus/group_icons.h"
++#include "components/tab_groups/tab_group_id.h"
+ #include "third_party/skia/include/core/SkColor.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/views/view.h"
+ 
+ namespace views {
+ class Background;
++class FlexLayoutView;
+ class ImageView;
+ class Label;
+ }  // namespace views
+@@ -21,9 +26,10 @@ class Label;
+ namespace helium_plus {
+ 
+ // Like in Arc and Dia, a group of the vertical tab strip looks like a folder:
+-// this icon then its name, without a colored chip. The icon is a folder in the
+-// group color, open while the group is expanded.
+-class FolderIconView : public views::View {
++// this icon then its name, without a colored chip. The icon is the group icon
++// (GroupIcons), otherwise a folder, in the group color; the folder is open
++// while the group is expanded.
++class FolderIconView : public views::View, public GroupIcons::Observer {
+   METADATA_HEADER(FolderIconView, views::View)
+ 
+  public:
+@@ -32,14 +38,34 @@ class FolderIconView : public views::Vie
+   FolderIconView& operator=(const FolderIconView&) = delete;
+   ~FolderIconView() override;
+ 
++  void SetGroup(const tab_groups::TabGroupId& group);
+   void SetFolder(SkColor color, bool collapsed);
+ 
++  // views::View:
++  void AddedToWidget() override;
++  void RemovedFromWidget() override;
++
+  private:
++  void UpdateImage();
++
++  // GroupIcons::Observer:
++  void OnGroupIconsChanged() override;
++
+   raw_ptr<views::ImageView> folder_ = nullptr;
++  std::optional<tab_groups::TabGroupId> group_;
++  SkColor color_ = SK_ColorTRANSPARENT;
++  bool collapsed_ = false;
++  base::ScopedObservation<GroupIcons, GroupIcons::Observer> observation_{this};
+ };
+ 
+ // Styles the header of a folder: `icon` then `name`.
+ void StyleFolderHeader(views::View& icon, views::Label& name);
++// In a collapsed tab strip, the header of a folder only shows its icon,
++// centered.
++void SetFolderHeaderIconOnly(views::FlexLayoutView& header,
++                             views::View& icon,
++                             views::Label& name,
++                             bool icon_only);
+ 
+ // Colors of a folder header of the tab strip of `view`: its name, and its
+ // background with a discreet border, transparent unless `highlighted` (hovered
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/group_icon_picker.cc
+@@ -0,0 +1,170 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium_plus/group_icon_picker.h"
++
++#include "base/functional/bind.h"
++#include "chrome/browser/ui/helium_plus/strings.h"
++#include "chrome/browser/ui/views/chrome_layout_provider.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
++#include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/layout/flex_layout.h"
++#include "ui/views/layout/table_layout.h"
++#include "ui/views/view_class_properties.h"
++#include "ui/views/widget/widget.h"
++
++namespace helium_plus {
++
++namespace {
++
++constexpr int kIconSize = 20;
++constexpr int kIconPadding = 5;
++// As many as colors in the color picker above, spread over the same width.
++constexpr size_t kIconsPerRow = 9;
++constexpr int kSelectionCornerRadius = 8;
++constexpr int kSvgButtonTopMargin = 8;
++
++// The padding of the color picker elements, which the picker margins include.
++int GetInternalPadding() {
++  return ChromeLayoutProvider::Get()->GetDistanceMetric(
++             views::DISTANCE_RELATED_BUTTON_HORIZONTAL) /
++         2;
++}
++
++}  // namespace
++
++GroupIconPicker::GroupIconPicker(GroupIcons& icons,
++                                 const tab_groups::TabGroupId& group)
++    : icons_(icons), group_(group) {
++  SetLayoutManager(std::make_unique<views::FlexLayout>())
++      ->SetOrientation(views::LayoutOrientation::kVertical);
++  GetViewAccessibility().SetRole(ax::mojom::Role::kRadioGroup);
++  GetViewAccessibility().SetName(GetString(StringId::kGroupIcon));
++
++  // Equal columns over the whole width, icons centered.
++  views::View* grid = AddChildView(std::make_unique<views::View>());
++  views::TableLayout* table =
++      grid->SetLayoutManager(std::make_unique<views::TableLayout>());
++  for (size_t i = 0; i < kIconsPerRow; ++i) {
++    table->AddColumn(views::LayoutAlignment::kCenter,
++                     views::LayoutAlignment::kCenter, /*horizontal_resize=*/1,
++                     views::TableLayout::ColumnSize::kUsePreferred, 0, 0);
++  }
++  const size_t icon_count = GroupIcons::GetLibrary().size() + 1;
++  table->AddRows((icon_count + kIconsPerRow - 1) / kIconsPerRow,
++                 views::TableLayout::kFixedSize);
++  AddIconButton(std::string(), vector_icons::kFolderFilledIcon,
++                GetString(StringId::kGroupIconFolder), *grid);
++  for (const GroupIcons::LibraryIcon& icon : GroupIcons::GetLibrary()) {
++    AddIconButton(std::string(icon.name), *icon.icon,
++                  GetString(icon.french_label, icon.english_label), *grid);
++  }
++
++  svg_button_ = AddChildView(std::make_unique<views::MdTextButton>(
++      base::BindRepeating(&GroupIconPicker::ChooseSvgFile,
++                          base::Unretained(this)),
++      GetString(StringId::kGroupIconSvgFile)));
++  svg_button_->SetProperty(
++      views::kMarginsKey,
++      gfx::Insets::TLBR(kSvgButtonTopMargin, GetInternalPadding(), 0, 0));
++  svg_button_->SetProperty(views::kCrossAxisAlignmentKey,
++                           views::LayoutAlignment::kStart);
++
++  observation_.Observe(&icons);
++}
++
++GroupIconPicker::~GroupIconPicker() = default;
++
++void GroupIconPicker::AddIconButton(const std::string& name,
++                                    const gfx::VectorIcon& icon,
++                                    const std::u16string& label,
++                                    views::View& grid) {
++  std::unique_ptr<views::ImageButton> button =
++      views::CreateVectorImageButtonWithNativeTheme(
++          base::BindRepeating(
++              [](GroupIconPicker* picker, const std::string& name) {
++                picker->icons_->SetIconName(picker->group_, name);
++              },
++              base::Unretained(this), name),
++          icon, kIconSize);
++  button->SetBorder(views::CreateEmptyBorder(kIconPadding));
++  button->SetTooltipText(label);
++  button->GetViewAccessibility().SetRole(ax::mojom::Role::kRadioButton);
++  button->GetViewAccessibility().SetName(label);
++  buttons_.emplace_back(name, grid.AddChildView(std::move(button)));
++}
++
++void GroupIconPicker::ChooseSvgFile() {
++  views::Widget* widget = GetWidget();
++  if (!widget) {
++    return;
++  }
++  // The bubble closes: the dialog belongs to the browser window.
++  views::Widget* owner = widget->parent() ? widget->parent() : widget;
++  icons_->ChooseSvgFile(group_, owner->GetNativeWindow());
++  widget->Close();
++}
++
++void GroupIconPicker::UpdateSelection() {
++  const std::string selected_name = icons_->GetIconName(group_);
++  const bool svg = icons_->HasSvgIcon(group_);
++  for (auto& [name, button] : buttons_) {
++    const bool selected = !svg && name == selected_name;
++    button->SetBackground(
++        selected ? views::CreateRoundedRectBackground(
++                       ui::kColorSysTonalContainer, kSelectionCornerRadius)
++                 : nullptr);
++    button->GetViewAccessibility().SetCheckedState(
++        selected ? ax::mojom::CheckedState::kTrue
++                 : ax::mojom::CheckedState::kFalse);
++  }
++  // The chosen SVG icon is shown in its button.
++  const ui::ColorProvider* color_provider = GetColorProvider();
++  svg_button_->SetImageModel(
++      views::Button::STATE_NORMAL,
++      svg && color_provider
++          ? icons_->GetIcon(group_, color_provider->GetColor(ui::kColorIcon),
++                            kIconSize)
++          : ui::ImageModel());
++}
++
++void GroupIconPicker::OnGroupIconsChanged() {
++  UpdateSelection();
++}
++
++void GroupIconPicker::OnThemeChanged() {
++  views::View::OnThemeChanged();
++  UpdateSelection();
++}
++
++BEGIN_METADATA(GroupIconPicker)
++END_METADATA
++
++std::unique_ptr<views::View> CreateGroupIconPicker(
++    Profile* profile,
++    const tab_groups::TabGroupId& group,
++    const gfx::Insets& margins) {
++  GroupIcons* icons = GroupIcons::Get(profile);
++  if (!icons) {
++    return std::make_unique<views::View>();
++  }
++  auto picker = std::make_unique<GroupIconPicker>(*icons, group);
++  picker->SetProperty(views::kMarginsKey, margins);
++  picker->SetProperty(views::kInternalPaddingKey,
++                      gfx::Insets::VH(0, GetInternalPadding()));
++  return picker;
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/group_icon_picker.h
+@@ -0,0 +1,76 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_GROUP_ICON_PICKER_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_GROUP_ICON_PICKER_H_
++
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/raw_ref.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/helium_plus/group_icons.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++class Profile;
++
++namespace gfx {
++class Insets;
++}  // namespace gfx
++
++namespace views {
++class ImageButton;
++class MdTextButton;
++}  // namespace views
++
++namespace helium_plus {
++
++// Chooses the icon of a tab group, in its editor bubble: the folder (no icon),
++// an icon of GroupIcons::GetLibrary(), or an SVG file.
++class GroupIconPicker : public views::View, public GroupIcons::Observer {
++  METADATA_HEADER(GroupIconPicker, views::View)
++
++ public:
++  GroupIconPicker(GroupIcons& icons, const tab_groups::TabGroupId& group);
++  GroupIconPicker(const GroupIconPicker&) = delete;
++  GroupIconPicker& operator=(const GroupIconPicker&) = delete;
++  ~GroupIconPicker() override;
++
++ private:
++  void AddIconButton(const std::string& name,
++                     const gfx::VectorIcon& icon,
++                     const std::u16string& label,
++                     views::View& grid);
++  void ChooseSvgFile();
++  void UpdateSelection();
++
++  // GroupIcons::Observer:
++  void OnGroupIconsChanged() override;
++
++  // views::View:
++  void OnThemeChanged() override;
++
++  const raw_ref<GroupIcons> icons_;
++  const tab_groups::TabGroupId group_;
++  // By icon name, empty for the folder.
++  std::vector<std::pair<std::string, raw_ptr<views::ImageButton>>> buttons_;
++  raw_ptr<views::MdTextButton> svg_button_ = nullptr;
++  base::ScopedObservation<GroupIcons, GroupIcons::Observer> observation_{this};
++};
++
++// Returns the icon picker of `group`, with the `margins` of the color picker
++// above it; an empty view if the profile has no saved groups.
++std::unique_ptr<views::View> CreateGroupIconPicker(
++    Profile* profile,
++    const tab_groups::TabGroupId& group,
++    const gfx::Insets& margins);
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_GROUP_ICON_PICKER_H_
+--- a/chrome/browser/ui/views/helium_plus/group_tabs_popover.cc
++++ b/chrome/browser/ui/views/helium_plus/group_tabs_popover.cc
+@@ -121,7 +121,8 @@ void GroupTabsPopover::Hide() {
+ void GroupTabsPopover::Show() {
+   TabGroupHeaderView* header = group_view_->group_header();
+   const TabCollectionNode* node = group_view_->collection_node();
+-  if (widget_ || !node || !group_view_->IsCollapsed() ||
++  if (widget_ || !node ||
++      !(group_view_->IsCollapsed() || header->icon_only()) ||
+       !header->IsMouseHovered() || !header->GetWidget()) {
+     return;
+   }
+--- a/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
+@@ -210,6 +210,13 @@ TabGroupHeaderView::TabGroupHeaderView(
+ 
+   if (folder_icon_) {
+     helium_plus::StyleFolderHeader(*folder_icon_, *group_header_label_);
++    if (state_controller) {
++      OnTabStripCollapseStateChanged(state_controller->GetCollapseState());
++      collapse_state_subscription_ =
++          state_controller->RegisterOnCollapseChanged(base::BindRepeating(
++              &TabGroupHeaderView::OnTabStripCollapseStateChanged,
++              base::Unretained(this)));
++    }
+   }
+   sync_icon_->SetProperty(views::kMarginsKey,
+                           gfx::Insets::TLBR(0, 0, 0, kSyncIconLabelPadding));
+@@ -344,6 +351,9 @@ void TabGroupHeaderView::OnMouseReleased
+       event.IsLeftMouseButton() && !delegate_->IsGroupFocused();
+   if (open_editor_bubble) {
+     ShowEditorBubble();
++  } else if (toggle_collapse && icon_only_) {
++    // Helium+: the group icon lists the tabs of the group instead.
++    delegate_->UpdateHoverCard(TabSlotController::HoverCardUpdateType::kHover);
+   } else if (toggle_collapse) {
+     delegate_->ToggleCollapsedState(ToggleTabGroupCollapsedStateOrigin::kMouse);
+     views::ElementTrackerViews::GetInstance()->NotifyViewActivated(
+@@ -526,6 +536,9 @@ void TabGroupHeaderView::OnDataChanged(
+     const tabs::TabGroupData& tab_group_data) {
+   tab_group_visual_data_ = tab_group_data.visual_data;
+   is_shared_ = tab_group_data.is_sharing_group;
++  if (folder_icon_ && delegate_->IsValid()) {
++    folder_icon_->SetGroup(group());
++  }
+ 
+   if (delegate_->IsValid() && delegate_->GetTabGroup().is_ephemeral()) {
+     OnTabCountChanged();
+@@ -680,6 +693,14 @@ void TabGroupHeaderView::UpdateColors()
+                                    GetBackgroundColor(), GetCornerRadius()));
+ }
+ 
++void TabGroupHeaderView::OnTabStripCollapseStateChanged(
++    tabs::VerticalTabStripCollapseState state) {
++  icon_only_ = state != tabs::VerticalTabStripCollapseState::kExpanded;
++  helium_plus::SetFolderHeaderIconOnly(*this, *folder_icon_,
++                                       *group_header_label_, icon_only_);
++  UpdateEditorBubbleButtonVisibility();
++}
++
+ void TabGroupHeaderView::UpdateEditorBubbleButtonVisibility() {
+   // The editor bubble button only exists in the vertical orientation.
+   if (!editor_bubble_button_) {
+@@ -720,9 +741,9 @@ void TabGroupHeaderView::SetEditorBubble
+   if (!editor_bubble_button_) {
+     return;
+   }
+-  editor_bubble_button_->SetVisible(delegate_->IsGroupFocused() ||
+-                                    editor_bubble_tracker_.is_open() ||
+-                                    is_hovered);
++  editor_bubble_button_->SetVisible(
++      !icon_only_ && (delegate_->IsGroupFocused() ||
++                      editor_bubble_tracker_.is_open() || is_hovered));
+ }
+ 
+ void TabGroupHeaderView::ShowEditorBubble() {
+--- a/chrome/browser/ui/views/tabs/common/tab_group_header_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_header_view.h
+@@ -120,6 +120,8 @@ class TabGroupHeaderView : public views:
+   void OnTabCountChanged();
+ 
+   tab_groups::TabGroupId group() const;
++  // Helium+: in a collapsed vertical tab strip, only the group icon shows.
++  bool icon_only() const { return icon_only_; }
+ 
+   views::LabelButton* editor_bubble_button() { return editor_bubble_button_; }
+   views::ImageView* collapse_icon_for_testing() { return collapse_icon_; }
+@@ -146,10 +148,13 @@ class TabGroupHeaderView : public views:
+   SkColor GetBackgroundColor() const;
+   SkColor GetForegroundColor() const;
+   void UpdateColors();
++  void OnTabStripCollapseStateChanged(
++      tabs::VerticalTabStripCollapseState state);
+ 
+   tab_groups::TabGroupVisualData tab_group_visual_data_;
+   bool needs_attention_ = false;
+   bool is_shared_ = false;
++  bool icon_only_ = false;
+ 
+   // Helium+: the folder icon of a vertical group.
+   const raw_ptr<helium_plus::FolderIconView> folder_icon_ = nullptr;
+@@ -175,6 +180,7 @@ class TabGroupHeaderView : public views:
+   base::CallbackListSubscription editor_bubble_opened_subscription_;
+   base::CallbackListSubscription editor_bubble_closed_subscription_;
+   base::CallbackListSubscription tab_group_data_changed_subscription_;
++  base::CallbackListSubscription collapse_state_subscription_;
+   base::WeakPtrFactory<TabGroupHeaderView> weak_ptr_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+@@ -548,8 +548,9 @@ void TabGroupView::UpdateHoverCard(int u
+       update_type);
+   TabHoverCardController* hover_card_controller =
+       collection_node_->GetController()->GetHoverCardController();
+-  // Helium+: a collapsed vertical group lists its tabs in a popover instead.
+-  if (tabs_popover_ && IsCollapsed()) {
++  // Helium+: a collapsed vertical group, or a group showing only its icon,
++  // lists its tabs in a popover instead.
++  if (tabs_popover_ && (IsCollapsed() || group_header_->icon_only())) {
+     if (type == TabSlotController::HoverCardUpdateType::kHover) {
+       tabs_popover_->OnHeaderHovered();
+     }
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
+@@ -117,6 +117,10 @@ views::ProposedLayout TabGroupViewLayout
+   // Helium+: a collapsed group still lays out its open tabs under the header.
+   const bool is_group_collapsed = tab_group_view->IsCollapsed();
+   bool has_open_tabs = false;
++  // Helium+: a collapsed tab strip only shows the group icon. Its tabs get no
++  // height, their visibility is left as is.
++  const bool icon_only = tab_strip_collapse_state !=
++                         tabs::VerticalTabStripCollapseState::kExpanded;
+ 
+   // Layout children in order. Children will have their preferred height and
+   // fill available width.
+@@ -143,8 +147,11 @@ views::ProposedLayout TabGroupViewLayout
+     if (size_bounds.width().is_bounded()) {
+       bounds.set_width(size_bounds.width().value() - bounds.x());
+     }
++    if (icon_only) {
++      bounds.set_height(0);
++    }
+     layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
+-    if (is_group_collapsed && !TabGroupView::IsOpenTab(*child)) {
++    if (icon_only || (is_group_collapsed && !TabGroupView::IsOpenTab(*child))) {
+       continue;
+     }
+     has_open_tabs = true;
+@@ -162,7 +169,7 @@ views::ProposedLayout TabGroupViewLayout
+   }
+   // Helium+: the line also runs along the open tabs of a collapsed group.
+   const bool show_group_line =
+-      !tab_group_view->IsGroupFocused() &&
++      !tab_group_view->IsGroupFocused() && !icon_only &&
+       (!tab_group_view->is_collapsed() || has_open_tabs);
+   if (tab_group_view->group_line_) {
+     layouts.child_layouts.emplace_back(tab_group_view->group_line_.get(),
+@@ -186,7 +193,7 @@ views::ProposedLayout TabGroupViewLayout
+   }
+ 
+   layouts.host_size = gfx::Size(
+-      width, is_group_collapsed && !has_open_tabs
++      width, (is_group_collapsed || icon_only) && !has_open_tabs
+                  ? header_bounds.height() + (2 * kGroupHeaderVerticalMargin)
+                  : std::max(height, dragged_view_bottom));
+ 
+--- a/chrome/browser/ui/views/tabs/groups/tab_group_editor_bubble_view.cc
++++ b/chrome/browser/ui/views/tabs/groups/tab_group_editor_bubble_view.cc
+@@ -59,6 +59,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/global_media_controls/media_item_ui_helper.h"
++#include "chrome/browser/ui/views/helium_plus/group_icon_picker.h"
+ #include "chrome/browser/ui/views/tabs/groups/avatar_container_view.h"
+ #include "chrome/browser/ui/views/tabs/groups/color_picker_view.h"
+ #include "chrome/browser/ui/views/tabs/groups/manage_sharing_row.h"
+@@ -631,6 +632,10 @@ void TabGroupEditorBubbleView::RebuildMe
+     AddChildView(BuildEphemeralGroupButtons());
+     return;
+   }
++  // Helium+: the group icon, under its color.
++  AddChildView(helium_plus::CreateGroupIconPicker(
++      browser_->GetProfile(), group_,
++      *color_selector_->GetProperty(views::kMarginsKey)));
+   AddChildView(BuildSeparator());
+ 
+   if (!CanSaveGroups()) {
