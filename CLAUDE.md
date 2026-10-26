@@ -43,7 +43,7 @@ two-line calls.
    reloads), the button is a "−" (`TabCloseButton::SetShowsMinus`, through
    `TabData::anchor_diverged`) that brings it back to its anchor; otherwise × hibernates it and the
    profile's home page shows in its place (a tab already on it, else a new tab); links opened from
-   a grouped tab land after the group (`TabStripModel::AddTab`); on session restore, the tab
+   a grouped tab (Cmd+click) join its group, next to it (Chromium default); on session restore, the tab
    reopens on its anchor URL, its history kept (`ResetNavigationsToAnchor`). Saved groups
    (`LocalTabGroupListener::MatchLocalTabToSavedTab`) would then navigate back to the last URL
    they kept: `IsAtAnchor` prevents it. Closed ≠ hibernated: only × closes
