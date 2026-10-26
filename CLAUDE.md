@@ -122,6 +122,22 @@ two-line calls.
     the background around the web contents (`MultiContentsBackgroundView::SetUseFrameTheme`) use the
     "frame" color of the vertical tab strip instead of the "toolbar" color (different with a theme
     like Atom One Dark). The active tab keeps the "toolbar" color, so it stays visible.
+14. `closed-tabs.patch`: like Arc, a closed anchored tab uses no memory.
+    `helium_plus::ClosedTabsService` (started by `TabState`) turns the closed inactive tabs of a
+    container (pinned tabs or a group) into `ClosedTab` entries (URL, title, custom title) kept by a
+    neighbor tab (`TabState::closed_before()`/`closed_after()`, tab extra data
+    `helium_plus.closed_before`/`closed_after`, split into 32 KB chunks `key.1`, `key.2`… as a
+    `SessionCommand` is limited to 64 KB), then deletes their WebContents. A container whose tabs
+    are all closed keeps one as a real tab (Chromium deletes empty groups); when a keeper leaves its
+    container, its entries go to its former neighbors (`Reconcile`) or to a new carrier tab. The
+    vertical strip shows entries in place (`ClosedTabViews` in `TabGroupView` and
+    `PinnedTabContainerView`, refreshed through `TabData::closed_tabs_revision`), the group popover
+    too; a click reopens the tab in place (`ClosedTabsService::Open`, navigation built without page
+    state: a `NavigationEntry` serialized from scratch gets the renderer killed,
+    `RFH_INVALID_DOCUMENT_SEQUENCE_NUMBER`). Saved tab groups: once initialized,
+    `TabGroupSyncService` matches each restored group with its saved tabs, reopening the missing
+    ones (loaded) and closing the extra local ones, so a group is only compacted after
+    `OnInitialized` (`AreSavedGroupsConnected`).
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

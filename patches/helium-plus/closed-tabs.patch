@@ -1,0 +1,2094 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3559,6 +3559,8 @@ static_library("ui") {
+       "views/frame/vertical_tab_strip_region_view.h",
+       "helium_plus/anchored_tabs.cc",
+       "helium_plus/anchored_tabs.h",
++      "helium_plus/closed_tabs.cc",
++      "helium_plus/closed_tabs.h",
+       "helium_plus/hibernation_service.cc",
+       "helium_plus/hibernation_service.h",
+       "helium_plus/profile_switcher.cc",
+@@ -3575,6 +3577,8 @@ static_library("ui") {
+       "helium_plus/tab_state.h",
+       "views/helium/frame_corner_radius.cc",
+       "views/helium/frame_corner_radius.h",
++      "views/helium_plus/closed_tab_view.cc",
++      "views/helium_plus/closed_tab_view.h",
+       "views/helium_plus/group_tabs_popover.cc",
+       "views/helium_plus/group_tabs_popover.h",
+       "views/helium_plus/profile_switcher_view.cc",
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/closed_tabs.cc
+@@ -0,0 +1,690 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++#include <variant>
++
++#include "base/containers/adapters.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/scoped_observation.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/supports_user_data.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "components/saved_tab_groups/public/tab_group_sync_service.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
++#include "components/tabs/public/tab_group.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/page_transition_types.h"
++
++namespace helium_plus {
++
++namespace {
++
++// While the tab strip cannot be changed (e.g. during a drag), the update is
++// retried after this delay.
++constexpr base::TimeDelta kRetryDelay = base::Milliseconds(500);
++
++const char kSavedGroupsObserverKey[] = "helium_plus.closed_tabs";
++
++// Tells when the TabGroupSyncService of a profile is initialized, kept as its
++// user data.
++class SavedGroupsObserver : public base::SupportsUserData::Data,
++                            public tab_groups::TabGroupSyncService::Observer {
++ public:
++  SavedGroupsObserver(tab_groups::TabGroupSyncService* service,
++                      base::RepeatingClosure on_initialized)
++      : on_initialized_(std::move(on_initialized)) {
++    observation_.Observe(service);
++  }
++
++  bool initialized() const { return initialized_; }
++
++  // tab_groups::TabGroupSyncService::Observer:
++  void OnInitialized() override {
++    initialized_ = true;
++    on_initialized_.Run();
++  }
++  void OnWillBeDestroyed() override { observation_.Reset(); }
++
++ private:
++  bool initialized_ = false;
++  const base::RepeatingClosure on_initialized_;
++  base::ScopedObservation<tab_groups::TabGroupSyncService,
++                          tab_groups::TabGroupSyncService::Observer>
++      observation_{this};
++};
++
++// A tab keeping closed tabs, or a closed tab, of a container in display order.
++using Item = std::variant<TabState*, ClosedTab>;
++
++bool HasClosedTabs(const TabState& state) {
++  return !state.closed_before().empty() || !state.closed_after().empty();
++}
++
++bool SameClosedTabs(const ClosedTabs& a, const ClosedTabs& b) {
++  return std::ranges::equal(a, b, {}, &ClosedTab::id, &ClosedTab::id);
++}
++
++void AppendClosedTabs(const ClosedTabs& closed_tabs, std::vector<Item>& items) {
++  for (const ClosedTab& closed_tab : closed_tabs) {
++    items.emplace_back(closed_tab);
++  }
++}
++
++// Spreads the closed tabs of `items` over the tabs of `items`: the closed tabs
++// before the first tab go before it, the others after the tab preceding them.
++// Returns false, changing nothing, when `items` has no tab.
++bool Distribute(std::vector<Item> items) {
++  ClosedTabs leading;
++  std::vector<std::pair<TabState*, ClosedTabs>> keepers;
++  for (Item& item : items) {
++    if (TabState** state = std::get_if<TabState*>(&item)) {
++      keepers.emplace_back(*state, ClosedTabs());
++    } else if (keepers.empty()) {
++      leading.push_back(std::move(std::get<ClosedTab>(item)));
++    } else {
++      keepers.back().second.push_back(std::move(std::get<ClosedTab>(item)));
++    }
++  }
++  if (keepers.empty()) {
++    return false;
++  }
++  for (size_t i = 0; i < keepers.size(); ++i) {
++    auto& [state, after] = keepers[i];
++    ClosedTabs before = i == 0 ? std::move(leading) : ClosedTabs();
++    if (!SameClosedTabs(state->closed_before(), before) ||
++        !SameClosedTabs(state->closed_after(), after)) {
++      state->SetClosedTabs(std::move(before), std::move(after));
++    }
++  }
++  return true;
++}
++
++ClosedTab MakeClosedTab(tabs::TabInterface& tab, const TabState& state) {
++  if (state.anchor_url().is_valid()) {
++    return ClosedTab(state.anchor_url(), state.anchor_title(),
++                     state.custom_title());
++  }
++  content::WebContents* contents = tab.GetContents();
++  return ClosedTab(contents->GetVisibleURL(), contents->GetTitle(),
++                   state.custom_title());
++}
++
++BrowserWindowInterface* GetBrowser(TabStripModel& model) {
++  BrowserWindowInterface* result = nullptr;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        if (browser->GetTabStripModel() != &model) {
++          return true;
++        }
++        result = browser;
++        return false;
++      });
++  return result;
++}
++
++// Adds a tab for `closed_tab` at `index`: an active one, or a closed one that
++// does not load.
++TabState* AddTab(TabStripModel& model,
++                 const ClosedTab& closed_tab,
++                 int index,
++                 std::optional<tab_groups::TabGroupId> group,
++                 bool pin,
++                 bool select) {
++  BrowserWindowInterface* browser = GetBrowser(model);
++  if (!browser) {
++    return nullptr;
++  }
++  // No page state: the restore loads the URL from scratch. A page state made
++  // from a new NavigationEntry gets the renderer killed on commit.
++  sessions::SerializedNavigationEntry navigation;
++  navigation.set_index(0);
++  navigation.set_virtual_url(closed_tab.url);
++  navigation.set_original_request_url(closed_tab.url);
++  navigation.set_title(closed_tab.title);
++  navigation.set_transition_type(ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++  navigation.set_timestamp(base::Time::Now());
++
++  std::map<std::string, std::string> extra_data;
++  extra_data[kAnchorUrlKey] = closed_tab.url.spec();
++  if (!closed_tab.title.empty()) {
++    extra_data[kAnchorTitleKey] = base::UTF16ToUTF8(closed_tab.title);
++  }
++  if (!closed_tab.custom_title.empty()) {
++    extra_data[kCustomTitleKey] = base::UTF16ToUTF8(closed_tab.custom_title);
++  }
++  if (!select) {
++    extra_data[kClosedKey] = "1";
++  }
++
++  content::WebContents* contents = chrome::AddRestoredTab(
++      browser, base::span_from_ref(navigation), index,
++      /*selected_navigation=*/0, /*extension_app_id=*/std::string(), group,
++      select, pin, select ? base::TimeTicks::Now() : base::TimeTicks(),
++      select ? base::Time::Now() : base::Time(),
++      /*storage_namespace=*/nullptr, sessions::SerializedUserAgentOverride(),
++      extra_data, /*from_session_restore=*/!select,
++      /*is_active_browser=*/std::nullopt,
++      select ? chrome::RestoredTabLoadPolicy::kLoadIfVisible
++             : chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
++  return contents ? TabState::FromWebContents(contents) : nullptr;
++}
++
++// Moves an insertion `index` out of the split tab around it, after it when
++// `forward`, else before it.
++int SkipSplit(TabStripModel& model, int index, bool forward) {
++  if (index <= 0 || index >= model.count()) {
++    return index;
++  }
++  const std::optional<split_tabs::SplitTabId> split =
++      model.GetTabAtIndex(index)->GetSplit();
++  if (!split || model.GetTabAtIndex(index - 1)->GetSplit() != split) {
++    return index;
++  }
++  if (forward) {
++    while (index < model.count() &&
++           model.GetTabAtIndex(index)->GetSplit() == split) {
++      ++index;
++    }
++  } else {
++    while (index > 0 && model.GetTabAtIndex(index - 1)->GetSplit() == split) {
++      --index;
++    }
++  }
++  return index;
++}
++
++}  // namespace
++
++ClosedTabsService::Slot::Slot() = default;
++ClosedTabsService::Slot::Slot(Slot&&) = default;
++ClosedTabsService::Slot& ClosedTabsService::Slot::operator=(Slot&&) = default;
++ClosedTabsService::Slot::~Slot() = default;
++
++ClosedTabsService::ModelState::ModelState() = default;
++ClosedTabsService::ModelState::~ModelState() = default;
++
++ClosedTabsService::Orphans::Orphans() = default;
++ClosedTabsService::Orphans::Orphans(Orphans&&) = default;
++ClosedTabsService::Orphans::~Orphans() = default;
++
++// static
++void ClosedTabsService::EnsureStarted() {
++  Get();
++}
++
++// static
++ClosedTabsService* ClosedTabsService::Get() {
++  static base::NoDestructor<ClosedTabsService> service;
++  return service.get();
++}
++
++// static
++void ClosedTabsService::Open(TabStripModel& model, int id) {
++  ClosedTabsService* service = Get();
++  auto state_it = service->states_.find(&model);
++  if (state_it == service->states_.end() || !service->Flush(model)) {
++    return;
++  }
++
++  for (int index = 0; index < model.count(); ++index) {
++    tabs::TabInterface* keeper = model.GetTabAtIndex(index);
++    TabState* keeper_state = TabState::From(keeper);
++    if (!keeper_state) {
++      continue;
++    }
++    ClosedTabs before = keeper_state->closed_before();
++    ClosedTabs after = keeper_state->closed_after();
++    auto before_it = std::ranges::find(before, id, &ClosedTab::id);
++    auto after_it = std::ranges::find(after, id, &ClosedTab::id);
++    if (before_it == before.end() && after_it == after.end()) {
++      continue;
++    }
++    // Connecting a group to its saved tabs would close the tab added to it.
++    if (keeper->GetGroup() && !service->AreSavedGroupsConnected(model)) {
++      return;
++    }
++
++    // The new tab takes the closed tabs between it and the keeper.
++    ClosedTabs new_before;
++    ClosedTabs new_after;
++    std::optional<ClosedTab> closed_tab;
++    int insert_index;
++    if (before_it != before.end()) {
++      closed_tab = *before_it;
++      new_before.assign(before.begin(), before_it);
++      new_after.assign(before_it + 1, before.end());
++      before.clear();
++      insert_index = SkipSplit(model, index, /*forward=*/false);
++    } else {
++      closed_tab = *after_it;
++      new_after.assign(after_it + 1, after.end());
++      after.erase(after_it, after.end());
++      insert_index = SkipSplit(model, index + 1, /*forward=*/true);
++    }
++    TabState* new_state = AddTab(model, *closed_tab, insert_index,
++                                 keeper->GetGroup(), keeper->IsPinned(),
++                                 /*select=*/true);
++    if (!new_state) {
++      return;
++    }
++    keeper_state->SetClosedTabs(std::move(before), std::move(after));
++    new_state->SetClosedTabs(std::move(new_before), std::move(new_after));
++    service->TakeSnapshot(model, state_it->second);
++    return;
++  }
++}
++
++ClosedTabsService::ClosedTabsService() {
++  GlobalBrowserCollection* browsers = GlobalBrowserCollection::GetInstance();
++  browser_collection_observation_.Observe(browsers);
++  browsers->ForEach([this](BrowserWindowInterface* browser) {
++    Observe(browser->GetTabStripModel());
++    return true;
++  });
++}
++
++ClosedTabsService::~ClosedTabsService() = default;
++
++void ClosedTabsService::OnBrowserCreated(BrowserWindowInterface* browser) {
++  Observe(browser->GetTabStripModel());
++}
++
++void ClosedTabsService::OnTabStripModelChanged(
++    TabStripModel* model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  auto it = states_.find(model);
++  if (it == states_.end() || model->closing_all()) {
++    return;
++  }
++  if (change.type() == TabStripModelChange::kRemoved) {
++    for (const auto& removed : change.GetRemove()->contents) {
++      HoldClosedTabs(it->second, removed.tab,
++                     removed.remove_reason == TabRemovedReason::kDeleted);
++    }
++  } else if (change.type() == TabStripModelChange::kMoved) {
++    it->second.moved.insert(change.GetMove()->tab->GetHandle());
++  }
++  ScheduleUpdate(model);
++}
++
++void ClosedTabsService::OnTabChangedAt(tabs::TabInterface* tab,
++                                       TabChangeType change_type) {
++  // A tab just closed by the user.
++  const TabState* state = TabState::From(tab);
++  if (state && state->IsClosed() && !tab->IsActivated()) {
++    ScheduleUpdate(tab->GetBrowserWindowInterface()->GetTabStripModel());
++  }
++}
++
++void ClosedTabsService::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                                int index) {
++  ScheduleUpdate(tab->GetBrowserWindowInterface()->GetTabStripModel());
++}
++
++void ClosedTabsService::TabGroupedStateChanged(
++    TabStripModel* model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  ScheduleUpdate(model);
++}
++
++void ClosedTabsService::OnTabStripModelDestroyed(TabStripModel* model) {
++  states_.erase(model);
++}
++
++void ClosedTabsService::Observe(TabStripModel* model) {
++  if (states_.contains(model)) {
++    return;
++  }
++  model->AddObserver(this);
++  ScheduleUpdate(model);
++}
++
++void ClosedTabsService::HoldClosedTabs(ModelState& state,
++                                       tabs::TabInterface* tab,
++                                       bool deleted) {
++  auto slot = std::ranges::find(state.slots, tab->GetHandle(), &Slot::tab);
++  if (slot == state.slots.end()) {
++    return;
++  }
++  slot->removed = true;
++  slot->deleted = deleted;
++  TabState* tab_state = TabState::From(tab);
++  if (!tab_state || !HasClosedTabs(*tab_state)) {
++    return;
++  }
++  slot->held_before = tab_state->closed_before();
++  slot->held_after = tab_state->closed_after();
++  // A tab moving to another window leaves its closed tabs here.
++  if (!deleted) {
++    tab_state->SetClosedTabs(ClosedTabs(), ClosedTabs());
++  }
++}
++
++void ClosedTabsService::ScheduleUpdate(TabStripModel* model) {
++  ModelState& state = states_[model];
++  if (state.update_pending) {
++    return;
++  }
++  state.update_pending = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&ClosedTabsService::Update,
++                                base::Unretained(this), model));
++}
++
++void ClosedTabsService::Update(TabStripModel* model) {
++  auto it = states_.find(model);
++  if (it == states_.end() || !it->second.update_pending) {
++    return;
++  }
++  if (model->closing_all()) {
++    it->second.update_pending = false;
++    return;
++  }
++  if (!model->delegate()->IsTabStripEditable()) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&ClosedTabsService::Update, base::Unretained(this),
++                       model),
++        kRetryDelay);
++    return;
++  }
++  it->second.update_pending = false;
++  Reconcile(*model, it->second);
++  Compact(*model);
++  TakeSnapshot(*model, it->second);
++}
++
++bool ClosedTabsService::Flush(TabStripModel& model) {
++  ModelState& state = states_[&model];
++  if (model.closing_all() || !model.delegate()->IsTabStripEditable()) {
++    return false;
++  }
++  if (state.update_pending) {
++    state.update_pending = false;
++    Reconcile(model, state);
++    TakeSnapshot(model, state);
++  }
++  return true;
++}
++
++void ClosedTabsService::Reconcile(TabStripModel& model, ModelState& state) {
++  // The tab of `slot` if it is still in `container`.
++  auto tab_in = [&model](const Slot& slot,
++                         const Container& container) -> tabs::TabInterface* {
++    tabs::TabInterface* tab = slot.removed ? nullptr : slot.tab.Get();
++    if (!tab || model.GetIndexOfTab(tab) == TabStripModel::kNoTab ||
++        Container{tab->IsPinned(), tab->GetGroup()} != container) {
++      return nullptr;
++    }
++    return tab;
++  };
++
++  std::vector<Orphans> all_orphans;
++  for (size_t begin = 0; begin < state.slots.size();) {
++    const Container container = state.slots[begin].container;
++    size_t end = begin + 1;
++    while (end < state.slots.size() &&
++           state.slots[end].container == container) {
++      ++end;
++    }
++    const auto slots = base::span(state.slots).subspan(begin, end - begin);
++    const size_t container_begin = begin;
++    begin = end;
++    if (!container.IsValid()) {
++      continue;
++    }
++
++    // Tabs keep their closed tabs unless they left the container or moved in
++    // it. When all of them moved (e.g. the whole group), they keep them.
++    std::set<tabs::TabHandle> keepers;
++    for (const Slot& slot : slots) {
++      if (tab_in(slot, container) && !state.moved.contains(slot.tab)) {
++        keepers.insert(slot.tab);
++      }
++    }
++    if (keepers.empty()) {
++      for (const Slot& slot : slots) {
++        if (tab_in(slot, container)) {
++          keepers.insert(slot.tab);
++        }
++      }
++    }
++
++    std::vector<Item> items;
++    std::vector<TabState*> released;
++    bool has_closed_tabs = false;
++    bool all_deleted = true;
++    for (const Slot& slot : slots) {
++      all_deleted &= slot.deleted;
++      if (slot.removed) {
++        AppendClosedTabs(slot.held_before, items);
++        AppendClosedTabs(slot.held_after, items);
++        has_closed_tabs |=
++            !slot.held_before.empty() || !slot.held_after.empty();
++        continue;
++      }
++      tabs::TabInterface* tab = slot.tab.Get();
++      TabState* tab_state = tab ? TabState::From(tab) : nullptr;
++      if (!tab_state) {
++        continue;
++      }
++      AppendClosedTabs(tab_state->closed_before(), items);
++      if (keepers.contains(slot.tab)) {
++        items.emplace_back(tab_state);
++      } else if (HasClosedTabs(*tab_state)) {
++        released.push_back(tab_state);
++      }
++      AppendClosedTabs(tab_state->closed_after(), items);
++      has_closed_tabs |= HasClosedTabs(*tab_state);
++    }
++    if (!has_closed_tabs ||
++        (released.empty() && !std::ranges::any_of(slots, &Slot::removed))) {
++      continue;
++    }
++
++    for (TabState* tab_state : released) {
++      tab_state->SetClosedTabs(ClosedTabs(), ClosedTabs());
++    }
++    if (Distribute(items) || all_deleted) {
++      continue;
++    }
++
++    // The container lost all its tabs while some only left it: keep its
++    // closed tabs in a new carrier tab where it was.
++    Orphans orphans;
++    orphans.container = container;
++    for (size_t i = container_begin; i > 0; --i) {
++      tabs::TabInterface* tab =
++          state.slots[i - 1].removed ? nullptr : state.slots[i - 1].tab.Get();
++      const int index = tab ? model.GetIndexOfTab(tab) : TabStripModel::kNoTab;
++      if (index != TabStripModel::kNoTab) {
++        orphans.index = index + 1;
++        break;
++      }
++    }
++    for (Item& item : items) {
++      orphans.closed_tabs.push_back(std::move(std::get<ClosedTab>(item)));
++    }
++    all_orphans.push_back(std::move(orphans));
++  }
++
++  // Adding tabs notifies observers: done once the slots are no longer used.
++  for (Orphans& orphans : all_orphans) {
++    KeepOrphans(model, state, std::move(orphans));
++  }
++}
++
++void ClosedTabsService::KeepOrphans(TabStripModel& model,
++                                    const ModelState& state,
++                                    Orphans orphans) {
++  if (orphans.closed_tabs.empty()) {
++    return;
++  }
++  std::optional<tab_groups::TabGroupId> group;
++  int index = std::min(orphans.index, model.count());
++  if (orphans.container.group) {
++    group = tab_groups::TabGroupId::GenerateNew();
++    index = std::max(index, model.IndexOfFirstNonPinnedTab());
++  }
++  TabState* carrier = AddTab(model, orphans.closed_tabs.front(), index, group,
++                             orphans.container.pinned, /*select=*/false);
++  if (!carrier) {
++    return;
++  }
++  carrier->SetClosedTabs(
++      ClosedTabs(),
++      ClosedTabs(orphans.closed_tabs.begin() + 1, orphans.closed_tabs.end()));
++  if (!group || !model.group_model() ||
++      !model.group_model()->ContainsTabGroup(*group)) {
++    return;
++  }
++  auto visuals = state.group_visuals.find(*orphans.container.group);
++  if (visuals != state.group_visuals.end()) {
++    model.ChangeTabGroupVisuals(*group, visuals->second);
++  }
++}
++
++bool ClosedTabsService::AreSavedGroupsConnected(TabStripModel& model) {
++  Profile* profile = model.profile();
++  tab_groups::TabGroupSyncService* service =
++      tab_groups::TabGroupSyncServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return true;
++  }
++  auto* observer = static_cast<SavedGroupsObserver*>(
++      service->GetUserData(kSavedGroupsObserverKey));
++  if (observer) {
++    return observer->initialized();
++  }
++  auto on_initialized = base::BindRepeating(
++      [](ClosedTabsService* closed_tabs, Profile* profile) {
++        for (auto& [state_model, state] : closed_tabs->states_) {
++          if (state_model->profile() == profile) {
++            closed_tabs->ScheduleUpdate(state_model);
++          }
++        }
++      },
++      base::Unretained(this), profile);
++  auto owned_observer =
++      std::make_unique<SavedGroupsObserver>(service, std::move(on_initialized));
++  const bool initialized = owned_observer->initialized();
++  service->SetUserData(kSavedGroupsObserverKey, std::move(owned_observer));
++  return initialized;
++}
++
++void ClosedTabsService::Compact(TabStripModel& model) {
++  const bool groups_connected = AreSavedGroupsConnected(model);
++  std::vector<int> to_delete;
++  for (int begin = 0; begin < model.count();) {
++    tabs::TabInterface* first = model.GetTabAtIndex(begin);
++    const Container container{first->IsPinned(), first->GetGroup()};
++    int end = begin + 1;
++    while (end < model.count() &&
++           Container{model.GetTabAtIndex(end)->IsPinned(),
++                     model.GetTabAtIndex(end)->GetGroup()} == container) {
++      ++end;
++    }
++    const int container_begin = begin;
++    begin = end;
++    if (!container.IsValid() || (container.group && !groups_connected)) {
++      continue;
++    }
++
++    std::vector<int> closed;
++    bool has_keeper = false;
++    for (int index = container_begin; index < end; ++index) {
++      tabs::TabInterface* tab = model.GetTabAtIndex(index);
++      const TabState* state = TabState::From(tab);
++      if (!state) {
++        continue;
++      }
++      if (state->IsClosed() && !tab->IsActivated() && !tab->IsSplit()) {
++        closed.push_back(index);
++      } else {
++        has_keeper = true;
++      }
++    }
++    if (closed.empty()) {
++      continue;
++    }
++    // Keep a closed tab, preferably one keeping closed tabs already.
++    if (!has_keeper) {
++      auto carrier = std::ranges::find_if(closed, [&model](int index) {
++        return HasClosedTabs(*TabState::From(model.GetTabAtIndex(index)));
++      });
++      closed.erase(carrier != closed.end() ? carrier : closed.begin());
++      if (closed.empty()) {
++        continue;
++      }
++    }
++
++    std::vector<Item> items;
++    for (int index = container_begin; index < end; ++index) {
++      tabs::TabInterface* tab = model.GetTabAtIndex(index);
++      TabState* state = TabState::From(tab);
++      if (!state) {
++        continue;
++      }
++      AppendClosedTabs(state->closed_before(), items);
++      if (std::ranges::contains(closed, index)) {
++        items.emplace_back(MakeClosedTab(*tab, *state));
++      } else {
++        items.emplace_back(state);
++      }
++      AppendClosedTabs(state->closed_after(), items);
++    }
++    for (int index : closed) {
++      TabState* state = TabState::From(model.GetTabAtIndex(index));
++      if (HasClosedTabs(*state)) {
++        state->SetClosedTabs(ClosedTabs(), ClosedTabs());
++      }
++      to_delete.push_back(index);
++    }
++    Distribute(std::move(items));
++  }
++
++  for (int index : base::Reversed(to_delete)) {
++    model.DetachAndDeleteWebContentsAt(index);
++  }
++}
++
++void ClosedTabsService::TakeSnapshot(TabStripModel& model, ModelState& state) {
++  state.slots.clear();
++  state.moved.clear();
++  state.group_visuals.clear();
++  for (int index = 0; index < model.count(); ++index) {
++    tabs::TabInterface* tab = model.GetTabAtIndex(index);
++    Slot slot;
++    slot.tab = tab->GetHandle();
++    slot.container = Container{tab->IsPinned(), tab->GetGroup()};
++    state.slots.push_back(std::move(slot));
++  }
++  if (TabGroupModel* groups = model.group_model()) {
++    for (const tab_groups::TabGroupId& id : groups->ListTabGroups()) {
++      state.group_visuals[id] = *groups->GetTabGroup(id)->visual_data();
++    }
++  }
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/closed_tabs.h
+@@ -0,0 +1,146 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_CLOSED_TABS_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_CLOSED_TABS_H_
++
++#include <map>
++#include <optional>
++#include <set>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "components/tabs/public/tab_interface.h"
++
++namespace helium_plus {
++
++// Like Arc, a closed anchored tab (pinned or grouped) stays in its container
++// without using memory: once inactive, it becomes a ClosedTab kept by a
++// neighbor tab of the container (see TabState::closed_before()) and its
++// WebContents is deleted. The vertical tab strip shows closed tabs in their
++// place; clicking one opens it again there. A container whose tabs are all
++// closed keeps one of them as a real tab, as Chromium deletes empty groups.
++class ClosedTabsService : public BrowserCollectionObserver,
++                          public TabStripModelObserver {
++ public:
++  static void EnsureStarted();
++
++  // Opens the closed tab `id` of `model` in its place and activates it.
++  static void Open(TabStripModel& model, int id);
++
++  ClosedTabsService(const ClosedTabsService&) = delete;
++  ClosedTabsService& operator=(const ClosedTabsService&) = delete;
++
++ private:
++  friend class base::NoDestructor<ClosedTabsService>;
++
++  // The pinned tabs or a group.
++  struct Container {
++    bool pinned = false;
++    std::optional<tab_groups::TabGroupId> group;
++
++    bool IsValid() const { return pinned || group.has_value(); }
++    bool operator==(const Container&) const = default;
++  };
++
++  // A tab as of the last update.
++  struct Slot {
++    Slot();
++    Slot(Slot&&);
++    Slot& operator=(Slot&&);
++    ~Slot();
++
++    tabs::TabHandle tab;
++    Container container;
++    // Once the tab left the tab strip, its closed tabs are held here.
++    bool removed = false;
++    bool deleted = false;
++    ClosedTabs held_before;
++    ClosedTabs held_after;
++  };
++
++  struct ModelState {
++    ModelState();
++    ~ModelState();
++
++    std::vector<Slot> slots;
++    std::map<tab_groups::TabGroupId, tab_groups::TabGroupVisualData>
++        group_visuals;
++    // Tabs moved since the last update.
++    std::set<tabs::TabHandle> moved;
++    bool update_pending = false;
++  };
++
++  // Closed tabs left without a container, to keep in a new carrier tab.
++  struct Orphans {
++    Orphans();
++    Orphans(Orphans&&);
++    ~Orphans();
++
++    Container container;
++    int index = 0;
++    ClosedTabs closed_tabs;
++  };
++
++  static ClosedTabsService* Get();
++
++  ClosedTabsService();
++  ~ClosedTabsService() override;
++
++  // BrowserCollectionObserver:
++  void OnBrowserCreated(BrowserWindowInterface* browser) override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabChangedAt(tabs::TabInterface* tab,
++                      TabChangeType change_type) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void TabGroupedStateChanged(TabStripModel* model,
++                              std::optional<tab_groups::TabGroupId> old_group,
++                              std::optional<tab_groups::TabGroupId> new_group,
++                              tabs::TabInterface* tab,
++                              int index) override;
++  void OnTabStripModelDestroyed(TabStripModel* model) override;
++
++  void Observe(TabStripModel* model);
++  void HoldClosedTabs(ModelState& state, tabs::TabInterface* tab, bool deleted);
++  void ScheduleUpdate(TabStripModel* model);
++  void Update(TabStripModel* model);
++  // Runs a pending update, without compacting. Returns false when the tab
++  // strip cannot be changed for now.
++  bool Flush(TabStripModel& model);
++  // Gives the closed tabs of the tabs that left their container to their
++  // former neighbors.
++  void Reconcile(TabStripModel& model, ModelState& state);
++  void KeepOrphans(TabStripModel& model,
++                   const ModelState& state,
++                   Orphans orphans);
++  // Whether the saved tab groups are connected to the groups of `model`: once
++  // initialized, the TabGroupSyncService matches a restored group with its
++  // saved tabs and reopens the ones missing from it. Updates `model` then.
++  bool AreSavedGroupsConnected(TabStripModel& model);
++  // Turns the closed inactive tabs into ClosedTabs, those of a group once the
++  // saved tab groups are connected.
++  void Compact(TabStripModel& model);
++  void TakeSnapshot(TabStripModel& model, ModelState& state);
++
++  base::ScopedObservation<GlobalBrowserCollection, BrowserCollectionObserver>
++      browser_collection_observation_{this};
++  std::map<raw_ptr<TabStripModel>, ModelState> states_;
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_CLOSED_TABS_H_
+--- a/chrome/browser/ui/helium_plus/tab_state.cc
++++ b/chrome/browser/ui/helium_plus/tab_state.cc
+@@ -4,14 +4,25 @@
+ 
+ #include "chrome/browser/ui/helium_plus/tab_state.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <optional>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/memory/weak_ptr.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/supports_user_data.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/values.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
+ #include "chrome/browser/ui/helium_plus/hibernation_service.h"
+ #include "chrome/browser/ui/helium_plus/shared_settings.h"
+ #include "chrome/browser/ui/helium_plus/tab_import.h"
+@@ -43,14 +54,131 @@ GURL GetCurrentUrl(content::WebContents*
+   return url.is_valid() ? url : contents->GetVisibleURL();
+ }
+ 
++int NextClosedTabId() {
++  static int next_id = 0;
++  return ++next_id;
++}
++
++// Session extra data values are limited to 64 KB: closed tabs are saved in
++// chunks of about this size, under their key, then `key`.1, `key`.2...
++constexpr size_t kClosedTabsChunkSize = 32 * 1024;
++
++std::string GetChunkKey(const char* key, size_t index) {
++  return index == 0 ? std::string(key)
++                    : base::StrCat({key, ".", base::NumberToString(index)});
++}
++
++bool IsChunkKey(const std::string& key, const char* base_key) {
++  return key.starts_with(base::StrCat({base_key, "."}));
++}
++
++std::vector<std::string> SerializeClosedTabs(const ClosedTabs& closed_tabs) {
++  std::vector<std::string> chunks;
++  base::ListValue list;
++  size_t size = 0;
++  auto flush = [&] {
++    if (!list.empty()) {
++      chunks.push_back(base::WriteJson(list).value_or(std::string()));
++      list = base::ListValue();
++      size = 0;
++    }
++  };
++  for (const ClosedTab& closed_tab : closed_tabs) {
++    // At most 3 UTF-8 bytes per title character, plus the JSON syntax.
++    const size_t entry_size =
++        closed_tab.url.spec().size() +
++        3 * (closed_tab.title.size() + closed_tab.custom_title.size()) + 32;
++    if (size + entry_size > kClosedTabsChunkSize) {
++      flush();
++    }
++    base::DictValue dict;
++    dict.Set("url", closed_tab.url.spec());
++    if (!closed_tab.title.empty()) {
++      dict.Set("title", closed_tab.title);
++    }
++    if (!closed_tab.custom_title.empty()) {
++      dict.Set("name", closed_tab.custom_title);
++    }
++    list.Append(std::move(dict));
++    size += entry_size;
++  }
++  flush();
++  return chunks;
++}
++
++void ParseClosedTabs(const std::string& json, ClosedTabs& closed_tabs) {
++  std::optional<base::ListValue> list =
++      base::JSONReader::ReadList(json, base::JSON_PARSE_RFC);
++  if (!list) {
++    return;
++  }
++  for (const base::Value& item : *list) {
++    const base::DictValue* dict = item.GetIfDict();
++    const std::string* url = dict ? dict->FindString("url") : nullptr;
++    if (!url || !GURL(*url).is_valid()) {
++      continue;
++    }
++    const std::string* title = dict->FindString("title");
++    const std::string* name = dict->FindString("name");
++    closed_tabs.emplace_back(
++        GURL(*url), title ? base::UTF8ToUTF16(*title) : std::u16string(),
++        name ? base::UTF8ToUTF16(*name) : std::u16string());
++  }
++}
++
++// Reads the chunks of closed tabs saved under `key`.
++ClosedTabs RestoreClosedTabs(
++    const std::map<std::string, std::string>& extra_data,
++    const char* key,
++    size_t& saved_chunks) {
++  ClosedTabs closed_tabs;
++  for (size_t index = 0;; ++index) {
++    auto it = extra_data.find(GetChunkKey(key, index));
++    if (it == extra_data.end()) {
++      break;
++    }
++    ParseClosedTabs(it->second, closed_tabs);
++    saved_chunks = index + 1;
++  }
++  return closed_tabs;
++}
++
++void AddClosedTabs(const char* key,
++                   const ClosedTabs& closed_tabs,
++                   std::map<std::string, std::string>* extra_data) {
++  const std::vector<std::string> chunks = SerializeClosedTabs(closed_tabs);
++  for (size_t index = 0; index < chunks.size(); ++index) {
++    (*extra_data)[GetChunkKey(key, index)] = chunks[index];
++  }
++}
++
++void NotifyTabChanged(base::WeakPtr<content::WebContents> contents) {
++  if (contents) {
++    contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
++  }
++}
++
+ }  // namespace
+ 
++ClosedTab::ClosedTab(GURL url,
++                     std::u16string title,
++                     std::u16string custom_title)
++    : id(NextClosedTabId()),
++      url(std::move(url)),
++      title(std::move(title)),
++      custom_title(std::move(custom_title)) {}
++
++ClosedTab::ClosedTab(const ClosedTab&) = default;
++ClosedTab& ClosedTab::operator=(const ClosedTab&) = default;
++ClosedTab::~ClosedTab() = default;
++
+ DEFINE_USER_DATA(TabState);
+ 
+ TabState::TabState(tabs::TabInterface& tab)
+     : ContentsObservingTabFeature(tab),
+       scoped_unowned_user_data_(tab.GetUnownedUserDataHost(), *this) {
+   HibernationService::EnsureStarted();
++  ClosedTabsService::EnsureStarted();
+   SharedSettings::EnsureStarted();
+   TabImport::EnsureStarted();
+ 
+@@ -102,11 +230,13 @@ void TabState::StashRestoredData(
+     content::WebContents* contents,
+     const std::map<std::string, std::string>& extra_data) {
+   auto data = std::make_unique<RestoredData>();
+-  for (const char* key :
+-       {kCustomTitleKey, kAnchorUrlKey, kAnchorTitleKey, kClosedKey}) {
+-    auto it = extra_data.find(key);
+-    if (it != extra_data.end() && !it->second.empty()) {
+-      data->extra_data.insert(*it);
++  for (const auto& [key, value] : extra_data) {
++    if (!value.empty() && (key == kCustomTitleKey || key == kAnchorUrlKey ||
++                           key == kAnchorTitleKey || key == kClosedKey ||
++                           key == kClosedBeforeKey || key == kClosedAfterKey ||
++                           IsChunkKey(key, kClosedBeforeKey) ||
++                           IsChunkKey(key, kClosedAfterKey))) {
++      data->extra_data.emplace(key, value);
+     }
+   }
+   if (data->extra_data.empty()) {
+@@ -135,6 +265,8 @@ void TabState::PopulateExtraData(
+   if (state->closed_) {
+     (*extra_data)[kClosedKey] = "1";
+   }
++  AddClosedTabs(kClosedBeforeKey, state->closed_before_, extra_data);
++  AddClosedTabs(kClosedAfterKey, state->closed_after_, extra_data);
+ }
+ 
+ void TabState::SetCustomTitle(std::u16string title) {
+@@ -194,6 +326,19 @@ void TabState::SetClosed(bool closed) {
+   }
+ }
+ 
++void TabState::SetClosedTabs(ClosedTabs before, ClosedTabs after) {
++  closed_before_ = std::move(before);
++  closed_after_ = std::move(after);
++  ++closed_tabs_revision_;
++  PersistClosedTabs(kClosedBeforeKey, closed_before_, saved_before_chunks_);
++  PersistClosedTabs(kClosedAfterKey, closed_after_, saved_after_chunks_);
++  // Posted, as the tab strip may be notifying its observers.
++  if (content::WebContents* contents = tab().GetContents()) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&NotifyTabChanged, contents->GetWeakPtr()));
++  }
++}
++
+ void TabState::OnAnchoringChanged() {
+   if (!IsAnchored()) {
+     SetClosed(false);
+@@ -263,9 +408,29 @@ void TabState::RestoreFrom(
+   if (auto it = extra_data.find(kClosedKey); it != extra_data.end()) {
+     closed_ = it->second == "1";
+   }
++  closed_before_ =
++      RestoreClosedTabs(extra_data, kClosedBeforeKey, saved_before_chunks_);
++  closed_after_ =
++      RestoreClosedTabs(extra_data, kClosedAfterKey, saved_after_chunks_);
++  if (!closed_before_.empty() || !closed_after_.empty()) {
++    ++closed_tabs_revision_;
++  }
++}
++
++void TabState::PersistClosedTabs(const char* key,
++                                 const ClosedTabs& closed_tabs,
++                                 size_t& saved_chunks) {
++  const std::vector<std::string> chunks = SerializeClosedTabs(closed_tabs);
++  // Chunks no longer used are cleared.
++  for (size_t index = 0; index < std::max(chunks.size(), saved_chunks);
++       ++index) {
++    Persist(GetChunkKey(key, index),
++            index < chunks.size() ? chunks[index] : std::string());
++  }
++  saved_chunks = chunks.size();
+ }
+ 
+-void TabState::Persist(const char* key, const std::string& value) {
++void TabState::Persist(const std::string& key, const std::string& value) {
+   content::WebContents* contents = tab().GetContents();
+   if (!contents) {
+     return;
+@@ -278,7 +443,7 @@ void TabState::Persist(const char* key,
+   if (!service || !window_id.is_valid() || !tab_id.is_valid()) {
+     return;
+   }
+-  service->AddTabExtraData(window_id, tab_id, key, value);
++  service->AddTabExtraData(window_id, tab_id, key.c_str(), value);
+ }
+ 
+ void TabState::NotifyTitleChanged() {
+--- a/chrome/browser/ui/helium_plus/tab_state.h
++++ b/chrome/browser/ui/helium_plus/tab_state.h
+@@ -7,6 +7,7 @@
+ 
+ #include <map>
+ #include <string>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "chrome/browser/ui/tabs/contents_observing_tab_feature.h"
+@@ -26,6 +27,24 @@ inline constexpr char kCustomTitleKey[]
+ inline constexpr char kAnchorUrlKey[] = "helium_plus.anchor_url";
+ inline constexpr char kAnchorTitleKey[] = "helium_plus.anchor_title";
+ inline constexpr char kClosedKey[] = "helium_plus.closed";
++inline constexpr char kClosedBeforeKey[] = "helium_plus.closed_before";
++inline constexpr char kClosedAfterKey[] = "helium_plus.closed_after";
++
++// An anchored tab the user closed, kept in its container (the pinned tabs or a
++// group) without a WebContents (see helium_plus/closed_tabs.h).
++struct ClosedTab {
++  ClosedTab(GURL url, std::u16string title, std::u16string custom_title);
++  ClosedTab(const ClosedTab&);
++  ClosedTab& operator=(const ClosedTab&);
++  ~ClosedTab();
++
++  // Unique in the browser process, not saved.
++  int id;
++  GURL url;
++  std::u16string title;
++  std::u16string custom_title;
++};
++using ClosedTabs = std::vector<ClosedTab>;
+ 
+ // Per-tab Helium+ state, owned by TabFeatures: a custom title and, for anchored
+ // tabs (pinned or grouped), the URL the tab comes back to. Saved with the
+@@ -70,6 +89,13 @@ class TabState : public tabs::ContentsOb
+   bool IsClosed() const { return closed_; }
+   void SetClosed(bool closed);
+ 
++  // Closed tabs shown just before and just after this tab in its container.
++  const ClosedTabs& closed_before() const { return closed_before_; }
++  const ClosedTabs& closed_after() const { return closed_after_; }
++  void SetClosedTabs(ClosedTabs before, ClosedTabs after);
++  // Changes whenever the closed tabs change.
++  int closed_tabs_revision() const { return closed_tabs_revision_; }
++
+   // content::WebContentsObserver:
+   void DidFinishNavigation(content::NavigationHandle* handle) override;
+   void TitleWasSet(content::NavigationEntry* entry) override;
+@@ -80,7 +106,11 @@ class TabState : public tabs::ContentsOb
+   void UpdateDiverged(content::NavigationHandle* handle);
+   void SetDiverged(bool diverged);
+   void RestoreFrom(const std::map<std::string, std::string>& extra_data);
+-  void Persist(const char* key, const std::string& value);
++  void Persist(const std::string& key, const std::string& value);
++  // Saves `closed_tabs` under `key`, in `saved_chunks` chunks.
++  void PersistClosedTabs(const char* key,
++                         const ClosedTabs& closed_tabs,
++                         size_t& saved_chunks);
+   void NotifyTitleChanged();
+ 
+   std::u16string custom_title_;
+@@ -88,6 +118,11 @@ class TabState : public tabs::ContentsOb
+   std::u16string anchor_title_;
+   bool diverged_ = false;
+   bool closed_ = false;
++  ClosedTabs closed_before_;
++  ClosedTabs closed_after_;
++  int closed_tabs_revision_ = 0;
++  size_t saved_before_chunks_ = 0;
++  size_t saved_after_chunks_ = 0;
+   base::CallbackListSubscription pinned_subscription_;
+   base::CallbackListSubscription group_subscription_;
+   base::CallbackListSubscription activated_subscription_;
+--- a/chrome/browser/ui/tabs/tab_data.cc
++++ b/chrome/browser/ui/tabs/tab_data.cc
+@@ -63,6 +63,8 @@ TabData TabData::FromTabInterface(tabs::
+   tab_data.anchor_diverged =
+       helium_plus_state && helium_plus_state->IsDiverged();
+   tab_data.anchor_closed = helium_plus_state && helium_plus_state->IsClosed();
++  tab_data.closed_tabs_revision =
++      helium_plus_state ? helium_plus_state->closed_tabs_revision() : 0;
+   tab_data.should_dim_favicon =
+       tab_data.should_show_discard_status ||
+       IsRestoredTabPendingLoad(tab_interface->GetContents());
+@@ -113,7 +115,8 @@ bool TabData::operator==(const TabData&
+          blocked == other.blocked && thumbnail == other.thumbnail &&
+          tab_resource_usage == other.tab_resource_usage &&
+          anchor_diverged == other.anchor_diverged &&
+-         anchor_closed == other.anchor_closed;
++         anchor_closed == other.anchor_closed &&
++         closed_tabs_revision == other.closed_tabs_revision;
+ }
+ 
+ TabDataObserver::TabDataObserver(TabInterface* tab_interface)
+--- a/chrome/browser/ui/tabs/tab_data.h
++++ b/chrome/browser/ui/tabs/tab_data.h
+@@ -75,6 +75,8 @@ struct TabData {
+   bool anchor_diverged = false;
+   // Helium+: the user closed the anchored tab.
+   bool anchor_closed = false;
++  // Helium+: changes with the closed tabs kept around the tab.
++  int closed_tabs_revision = 0;
+ 
+   scoped_refptr<ThumbnailImage> thumbnail;
+   scoped_refptr<const TabResourceUsage> tab_resource_usage;
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/closed_tab_view.cc
+@@ -0,0 +1,333 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium_plus/closed_tab_view.h"
++
++#include <algorithm>
++#include <memory>
++#include <set>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/favicon/favicon_service_factory.h"
++#include "chrome/browser/favicon/favicon_utils.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "chrome/browser/ui/views/tabs/tab/tab_title.h"
++#include "components/favicon/core/favicon_service.h"
++#include "components/keyed_service/core/service_access_type.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/border.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/layout/proposed_layout.h"
++#include "ui/views/view_utils.h"
++#include "ui/views/widget/widget.h"
++
++namespace helium_plus {
++
++namespace {
++
++constexpr int kIconSize = 16;
++// Matches TabViewVerticalLayout.
++constexpr int kIconTitleSpacing = 7;
++constexpr int kTitleTrailingPadding = 4;
++
++// Returns the tabs of a container child: a tab or a split tab.
++std::vector<const tabs::TabInterface*> GetTabs(const views::View& child) {
++  std::vector<const tabs::TabInterface*> tabs;
++  auto add_tab = [&tabs](const views::View& view) {
++    const TabView* tab_view = views::AsViewClass<TabView>(&view);
++    if (const tabs::TabInterface* tab =
++            tab_view ? tab_view->GetTabInterface() : nullptr) {
++      tabs.push_back(tab);
++    }
++  };
++  if (views::IsViewClass<SplitTabView>(&child)) {
++    for (const views::View* split_child : child.children()) {
++      add_tab(*split_child);
++    }
++  } else {
++    add_tab(child);
++  }
++  return tabs;
++}
++
++}  // namespace
++
++ClosedTabView::ClosedTabView(bool pinned)
++    : views::Button(
++          base::BindRepeating(&ClosedTabView::Open, base::Unretained(this))),
++      pinned_(pinned) {
++  icon_ = AddChildView(std::make_unique<views::ImageView>());
++  icon_->SetImageSize(gfx::Size(kIconSize, kIconSize));
++  icon_->SetCanProcessEventsWithinSubtree(false);
++  title_ = AddChildView(std::make_unique<TabTitle>());
++  title_->SetVisible(!pinned_);
++  SetFocusBehavior(FocusBehavior::NEVER);
++  GetViewAccessibility().SetRole(ax::mojom::Role::kTab);
++}
++
++ClosedTabView::~ClosedTabView() = default;
++
++void ClosedTabView::SetClosedTab(const ClosedTab& closed_tab,
++                                 const tabs::TabInterface& keeper) {
++  closed_tab_id_ = closed_tab.id;
++  keeper_ = keeper.GetHandle();
++
++  std::u16string title = closed_tab.custom_title;
++  if (title.empty()) {
++    title = closed_tab.title;
++  }
++  if (title.empty()) {
++    title = base::UTF8ToUTF16(closed_tab.url.spec());
++  }
++  if (title != title_text_) {
++    title_text_ = std::move(title);
++    title_->SetText(title_text_);
++    SetTooltipText(title_text_);
++    GetViewAccessibility().SetName(title_text_);
++  }
++
++  if (closed_tab.url != url_ || favicon_.IsEmpty()) {
++    url_ = closed_tab.url;
++    content::WebContents* contents = keeper.GetContents();
++    LoadFavicon(contents
++                    ? Profile::FromBrowserContext(contents->GetBrowserContext())
++                    : nullptr);
++  }
++}
++
++void ClosedTabView::Open() {
++  tabs::TabInterface* keeper = keeper_.Get();
++  BrowserWindowInterface* browser =
++      keeper ? keeper->GetBrowserWindowInterface() : nullptr;
++  if (!browser) {
++    return;
++  }
++  ClosedTabsService::Open(*browser->GetTabStripModel(), closed_tab_id_);
++}
++
++gfx::Size ClosedTabView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  return gfx::Size(
++      GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth),
++      GetLayoutConstant(pinned_ ? LayoutConstant::kVerticalTabPinnedHeight
++                                : LayoutConstant::kVerticalTabHeight));
++}
++
++void ClosedTabView::Layout(PassKey) {
++  // A pinned tile, or a collapsed tab strip, only shows the icon.
++  const bool centered =
++      pinned_ ||
++      width() < 2 * GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth);
++  title_->SetVisible(!centered);
++  if (centered) {
++    icon_->SetBounds((width() - kIconSize) / 2, (height() - kIconSize) / 2,
++                     kIconSize, kIconSize);
++    return;
++  }
++  gfx::Rect bounds = GetLocalBounds();
++  bounds.Inset(gfx::Insets::VH(
++      GetLayoutConstant(LayoutConstant::kTabVerticalPadding),
++      GetLayoutConstant(LayoutConstant::kTabHorizontalPadding)));
++  icon_->SetBounds(bounds.x(), bounds.y() + (bounds.height() - kIconSize) / 2,
++                   kIconSize, kIconSize);
++  const int title_x = bounds.x() + kIconSize + kIconTitleSpacing;
++  const int line_height = title_->GetLineHeight();
++  title_->SetBounds(
++      title_x, bounds.y() + (bounds.height() - line_height) / 2,
++      std::max(0, bounds.right() - kTitleTrailingPadding - title_x),
++      line_height);
++}
++
++void ClosedTabView::OnPaintBackground(gfx::Canvas* canvas) {
++  if (GetState() != STATE_HOVERED && GetState() != STATE_PRESSED) {
++    return;
++  }
++  const bool frame_active =
++      GetWidget() ? GetWidget()->ShouldPaintAsActive() : true;
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  flags.setColor(TabStyle::Get()->GetTabBackgroundColor(
++      TabStyle::TabSelectionState::kInactive, /*hovered=*/true, frame_active,
++      GetColorProvider()));
++  canvas->DrawRoundRect(
++      GetLocalBounds(),
++      GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius), flags);
++}
++
++void ClosedTabView::OnThemeChanged() {
++  views::Button::OnThemeChanged();
++  UpdateColors();
++}
++
++void ClosedTabView::StateChanged(ButtonState old_state) {
++  views::Button::StateChanged(old_state);
++  SchedulePaint();
++}
++
++void ClosedTabView::LoadFavicon(Profile* profile) {
++  favicon_tracker_.TryCancelAll();
++  favicon_ = favicon::GetDefaultFaviconModel();
++  icon_->SetImage(favicon_);
++  favicon::FaviconService* service =
++      profile ? FaviconServiceFactory::GetForProfile(
++                    profile, ServiceAccessType::EXPLICIT_ACCESS)
++              : nullptr;
++  if (!service) {
++    return;
++  }
++  service->GetFaviconImageForPageURL(
++      url_,
++      base::BindOnce(&ClosedTabView::OnFaviconLoaded,
++                     weak_factory_.GetWeakPtr()),
++      &favicon_tracker_);
++}
++
++void ClosedTabView::OnFaviconLoaded(
++    const favicon_base::FaviconImageResult& result) {
++  if (result.image.IsEmpty()) {
++    return;
++  }
++  favicon_ = ui::ImageModel::FromImage(result.image);
++  icon_->SetImage(favicon_);
++}
++
++void ClosedTabView::UpdateColors() {
++  const ui::ColorProvider* color_provider = GetColorProvider();
++  if (!color_provider) {
++    return;
++  }
++  const bool frame_active =
++      GetWidget() ? GetWidget()->ShouldPaintAsActive() : true;
++  title_->SetEnabledColor(TabStyle::Get()->GetTabForegroundColor(
++      /*apparently_active=*/false, frame_active, color_provider));
++  if (pinned_) {
++    SetBorder(views::CreateRoundedRectBorder(
++        GetLayoutConstant(LayoutConstant::kVerticalTabPinnedBorderThickness),
++        GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius),
++        frame_active ? kColorVerticalTabPinnedOutline
++                     : kColorTabDividerFrameInactive));
++  }
++}
++
++BEGIN_METADATA(ClosedTabView)
++END_METADATA
++
++ClosedTabViews::ClosedTabViews(views::View& host,
++                               bool pinned,
++                               GetChildrenCallback get_children,
++                               base::RepeatingClosure on_updated)
++    : host_(host),
++      pinned_(pinned),
++      get_children_(std::move(get_children)),
++      on_updated_(std::move(on_updated)) {}
++
++ClosedTabViews::~ClosedTabViews() = default;
++
++void ClosedTabViews::ScheduleUpdate() {
++  if (update_pending_) {
++    return;
++  }
++  update_pending_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(&ClosedTabViews::Update, weak_factory_.GetWeakPtr()));
++}
++
++std::vector<views::View*> ClosedTabViews::GetChildren(
++    TabCollectionNode::ChildViews children) const {
++  std::vector<views::View*> result;
++  auto append = [this, &result](const ClosedTabs& closed_tabs) {
++    for (const ClosedTab& closed_tab : closed_tabs) {
++      if (auto it = views_.find(closed_tab.id); it != views_.end()) {
++        result.push_back(it->second.get());
++      }
++    }
++  };
++  for (views::View* child : children) {
++    const std::vector<const tabs::TabInterface*> tabs = GetTabs(*child);
++    for (const tabs::TabInterface* tab : tabs) {
++      if (const TabState* state = TabState::From(tab)) {
++        append(state->closed_before());
++      }
++    }
++    result.push_back(child);
++    for (const tabs::TabInterface* tab : tabs) {
++      if (const TabState* state = TabState::From(tab)) {
++        append(state->closed_after());
++      }
++    }
++  }
++  return result;
++}
++
++void ClosedTabViews::HideMissingViews(const std::vector<views::View*>& children,
++                                      views::ProposedLayout& layouts) const {
++  for (const auto& [id, view] : views_) {
++    if (!std::ranges::contains(children, view.get())) {
++      layouts.child_layouts.emplace_back(view.get(), false, gfx::Rect());
++    }
++  }
++}
++
++void ClosedTabViews::Update() {
++  update_pending_ = false;
++  std::set<int> ids;
++  bool changed = false;
++  for (views::View* child : get_children_.Run()) {
++    for (const tabs::TabInterface* tab : GetTabs(*child)) {
++      const TabState* state = TabState::From(tab);
++      if (!state) {
++        continue;
++      }
++      for (const ClosedTabs* closed_tabs :
++           {&state->closed_before(), &state->closed_after()}) {
++        for (const ClosedTab& closed_tab : *closed_tabs) {
++          ids.insert(closed_tab.id);
++          if (auto it = views_.find(closed_tab.id); it != views_.end()) {
++            it->second->SetClosedTab(closed_tab, *tab);
++            continue;
++          }
++          // Adding the view lays out the host: it is listed once added.
++          auto view = std::make_unique<ClosedTabView>(pinned_);
++          view->SetClosedTab(closed_tab, *tab);
++          views_[closed_tab.id] = host_->AddChildView(std::move(view));
++          changed = true;
++        }
++      }
++    }
++  }
++  for (auto it = views_.begin(); it != views_.end();) {
++    if (ids.contains(it->first)) {
++      ++it;
++      continue;
++    }
++    ClosedTabView* view = it->second;
++    it = views_.erase(it);
++    host_->RemoveChildViewT(view);
++    changed = true;
++  }
++  host_->InvalidateLayout();
++  if (changed) {
++    on_updated_.Run();
++  }
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/closed_tab_view.h
+@@ -0,0 +1,129 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_CLOSED_TAB_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_CLOSED_TAB_VIEW_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/raw_ref.h"
++#include "base/memory/weak_ptr.h"
++#include "base/task/cancelable_task_tracker.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "components/favicon_base/favicon_types.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/views/controls/button/button.h"
++#include "url/gurl.h"
++
++class Profile;
++class TabTitle;
++
++namespace views {
++class ImageView;
++struct ProposedLayout;
++}  // namespace views
++
++namespace helium_plus {
++
++// A closed tab (see helium_plus/closed_tabs.h) in the vertical tab strip, in
++// its place: an inactive tab with no close button, or a pinned tile. Clicking
++// it opens the tab again.
++class ClosedTabView : public views::Button {
++  METADATA_HEADER(ClosedTabView, views::Button)
++
++ public:
++  explicit ClosedTabView(bool pinned);
++  ClosedTabView(const ClosedTabView&) = delete;
++  ClosedTabView& operator=(const ClosedTabView&) = delete;
++  ~ClosedTabView() override;
++
++  // `keeper` is the tab keeping `closed_tab`.
++  void SetClosedTab(const ClosedTab& closed_tab,
++                    const tabs::TabInterface& keeper);
++
++  int closed_tab_id() const { return closed_tab_id_; }
++  tabs::TabHandle keeper() const { return keeper_; }
++  const ui::ImageModel& favicon() const { return favicon_; }
++  const std::u16string& title() const { return title_text_; }
++
++  // Opens the closed tab.
++  void Open();
++
++  // views::Button:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void Layout(PassKey) override;
++  void OnPaintBackground(gfx::Canvas* canvas) override;
++  void OnThemeChanged() override;
++  void StateChanged(ButtonState old_state) override;
++
++ private:
++  void LoadFavicon(Profile* profile);
++  void OnFaviconLoaded(const favicon_base::FaviconImageResult& result);
++  void UpdateColors();
++
++  const bool pinned_;
++  int closed_tab_id_ = 0;
++  GURL url_;
++  std::u16string title_text_;
++  tabs::TabHandle keeper_;
++  ui::ImageModel favicon_;
++  raw_ptr<views::ImageView> icon_ = nullptr;
++  raw_ptr<TabTitle> title_ = nullptr;
++  base::CancelableTaskTracker favicon_tracker_;
++  base::WeakPtrFactory<ClosedTabView> weak_factory_{this};
++};
++
++// The closed tabs of a container of the vertical tab strip (a tab group or the
++// pinned tabs), shown among its tabs.
++class ClosedTabViews {
++ public:
++  using GetChildrenCallback =
++      base::RepeatingCallback<TabCollectionNode::ChildViews()>;
++
++  // `get_children` returns the children of the container (tabs and split
++  // tabs); `on_updated` runs once closed tab views were added or removed.
++  ClosedTabViews(views::View& host,
++                 bool pinned,
++                 GetChildrenCallback get_children,
++                 base::RepeatingClosure on_updated);
++  ClosedTabViews(const ClosedTabViews&) = delete;
++  ClosedTabViews& operator=(const ClosedTabViews&) = delete;
++  ~ClosedTabViews();
++
++  // Updates the closed tab views soon, once the closed tabs changed.
++  void ScheduleUpdate();
++
++  // Returns `children` with the views of their closed tabs around them, in
++  // display order.
++  std::vector<views::View*> GetChildren(
++      TabCollectionNode::ChildViews children) const;
++
++  // Hides the closed tab views missing from `children`, whose closed tab moved
++  // and that the next update removes.
++  void HideMissingViews(const std::vector<views::View*>& children,
++                        views::ProposedLayout& layouts) const;
++
++ private:
++  void Update();
++
++  const raw_ref<views::View> host_;
++  const bool pinned_;
++  const GetChildrenCallback get_children_;
++  const base::RepeatingClosure on_updated_;
++  std::map<int, raw_ptr<ClosedTabView>> views_;
++  bool update_pending_ = false;
++  base::WeakPtrFactory<ClosedTabViews> weak_factory_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_CLOSED_TAB_VIEW_H_
+--- a/chrome/browser/ui/views/helium_plus/group_tabs_popover.cc
++++ b/chrome/browser/ui/views/helium_plus/group_tabs_popover.cc
+@@ -11,9 +11,11 @@
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/views/controls/hover_button.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium_plus/closed_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_header_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+@@ -54,6 +56,15 @@ gfx::Rect GetAnchorRect(const views::Vie
+   return rect;
+ }
+ 
++void OpenClosedTab(tabs::TabHandle keeper, int id) {
++  tabs::TabInterface* tab = keeper.Get();
++  BrowserWindowInterface* browser =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  if (browser) {
++    ClosedTabsService::Open(*browser->GetTabStripModel(), id);
++  }
++}
++
+ }  // namespace
+ 
+ // Keeps the popover open while the mouse is over it, or over the header row
+@@ -118,7 +129,23 @@ void GroupTabsPopover::Show() {
+   auto tab_list = std::make_unique<views::View>();
+   tab_list->SetLayoutManager(std::make_unique<views::BoxLayout>(
+       views::BoxLayout::Orientation::kVertical));
+-  for (const views::View* child : node->GetDirectChildren()) {
++  for (const views::View* child : group_view_->GetDisplayedChildren()) {
++    if (const auto* closed_tab_view =
++            views::AsViewClass<ClosedTabView>(child)) {
++      tab_list->AddChildView(std::make_unique<HoverButton>(
++          base::BindRepeating(
++              [](base::WeakPtr<GroupTabsPopover> popover,
++                 tabs::TabHandle keeper, int id) {
++                if (popover) {
++                  popover->Hide();
++                }
++                OpenClosedTab(keeper, id);
++              },
++              weak_factory_.GetWeakPtr(), closed_tab_view->keeper(),
++              closed_tab_view->closed_tab_id()),
++          closed_tab_view->favicon(), closed_tab_view->title()));
++      continue;
++    }
+     const TabView* tab_view = views::AsViewClass<TabView>(child);
+     const tabs::TabInterface* tab =
+         tab_view ? tab_view->GetTabInterface() : nullptr;
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -4,10 +4,12 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ 
++#include "base/functional/callback_helpers.h"
+ #include "base/i18n/rtl.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/helium_plus/closed_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
+@@ -73,6 +75,17 @@ PinnedTabContainerView::PinnedTabContain
+               &PinnedTabContainerView::OnCollapseStateChanged,
+               base::Unretained(this)));
+     }
++    closed_tab_views_ = std::make_unique<helium_plus::ClosedTabViews>(
++        *this, /*pinned=*/true,
++        base::BindRepeating(
++            [](const PinnedTabContainerView* view) {
++              return view->collection_node_
++                         ? view->collection_node_->GetDirectChildren()
++                         : TabCollectionNode::ChildViews();
++            },
++            base::Unretained(this)),
++        base::DoNothing());
++    closed_tab_views_->ScheduleUpdate();
+   }
+ }
+ 
+@@ -116,7 +129,7 @@ gfx::Size PinnedTabContainerView::GetMin
+ 
+   // The minimum size should be enough to show a row and a half, if needed.
+   auto collapse_state = GetTabStripCollapseState();
+-  const int num_children = collection_node_->GetDirectChildren().size();
++  const int num_children = GetDisplayedChildren().size();
+   const float min_rows = std::min(
+       (collapse_state != tabs::VerticalTabStripCollapseState::kExpanded ? 1.5f
+                                                                         : 1.0f),
+@@ -129,6 +142,37 @@ gfx::Size PinnedTabContainerView::GetMin
+                    min_height);
+ }
+ 
++void PinnedTabContainerView::ViewHierarchyChanged(
++    const views::ViewHierarchyChangedDetails& details) {
++  TabCollectionZOrderManager::ViewHierarchyChanged(details);
++  // Helium+: a tab added to the pinned tabs may keep closed tabs.
++  if (details.is_add && details.parent == this &&
++      (views::IsViewClass<TabView>(details.child) ||
++       views::IsViewClass<SplitTabView>(details.child))) {
++    ScheduleClosedTabsUpdate();
++  }
++}
++
++std::vector<views::View*> PinnedTabContainerView::GetDisplayedChildren() const {
++  const TabCollectionNode::ChildViews children =
++      collection_node_ ? collection_node_->GetDirectChildren()
++                       : TabCollectionNode::ChildViews();
++  if (closed_tab_views_) {
++    return closed_tab_views_->GetChildren(children);
++  }
++  std::vector<views::View*> result;
++  for (views::View* child : children) {
++    result.push_back(child);
++  }
++  return result;
++}
++
++void PinnedTabContainerView::ScheduleClosedTabsUpdate() {
++  if (closed_tab_views_) {
++    closed_tab_views_->ScheduleUpdate();
++  }
++}
++
+ bool PinnedTabContainerView::IsDragging() const {
+   if (!collection_node_ || !collection_node_->GetController()) {
+     return false;
+@@ -374,8 +418,8 @@ views::ProposedLayout PinnedTabContainer
+ views::ProposedLayout PinnedTabContainerView::CalculateVerticalLayout(
+     const views::SizeBounds& size_bounds) const {
+   views::ProposedLayout layouts;
+-  const auto children = collection_node_ ? collection_node_->GetDirectChildren()
+-                                         : TabCollectionNode::ChildViews();
++  // Helium+: the closed pinned tabs are laid out among the pinned tabs.
++  const std::vector<views::View*> children = GetDisplayedChildren();
+ 
+   int total_width = 0;
+   int total_height = 0;
+@@ -476,6 +520,9 @@ views::ProposedLayout PinnedTabContainer
+   // otherwise snap to target.
+   layouts.host_size =
+       gfx::Size(size_bounds.width().value_or(total_width), total_height);
++  if (closed_tab_views_) {
++    closed_tab_views_->HideMissingViews(children, layouts);
++  }
+   return layouts;
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+@@ -5,6 +5,9 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
+ 
++#include <memory>
++#include <vector>
++
+ #include "base/callback_list.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+@@ -16,6 +19,10 @@
+ 
+ class TabCollectionNode;
+ 
++namespace helium_plus {
++class ClosedTabViews;
++}
++
+ // The view class that represents the pinned tab region for the
+ // tab strip. It manages the layout of all the pinned tabs and serves
+ // as the drag target for pinned tabs.
+@@ -38,6 +45,8 @@ class PinnedTabContainerView
+ 
+   // views::View:
+   gfx::Size GetMinimumSize() const override;
++  void ViewHierarchyChanged(
++      const views::ViewHierarchyChangedDetails& details) override;
+ 
+   // TabCollectionAnimatingLayoutManager::Delegate:
+   bool IsDragging() const override;
+@@ -49,6 +58,12 @@ class PinnedTabContainerView
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
+       const gfx::Point& loc_in_container);
+ 
++  // Helium+: the pinned tabs in display order, with the closed ones (see
++  // helium_plus/closed_tabs.h) among them in the vertical tab strip.
++  std::vector<views::View*> GetDisplayedChildren() const;
++  // Helium+: updates the closed tabs shown once they changed.
++  void ScheduleClosedTabsUpdate();
++
+  private:
+   // DraggedTabsContainer:
+   views::ScrollView* GetScrollViewForContainer() const override;
+@@ -85,6 +100,8 @@ class PinnedTabContainerView
+ 
+   base::CallbackListSubscription node_destroyed_subscription_;
+   base::CallbackListSubscription collapsed_state_changed_subscription_;
++  // Helium+: the closed pinned tabs of the vertical tab strip.
++  std::unique_ptr<helium_plus::ClosedTabViews> closed_tab_views_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_COMMON_PINNED_TAB_CONTAINER_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
++#include "chrome/browser/ui/views/helium_plus/closed_tab_view.h"
+ #include "chrome/browser/ui/views/helium_plus/group_tabs_popover.h"
+ #include "chrome/browser/ui/views/tabs/common/dragged_tabs_container.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+@@ -114,6 +115,18 @@ TabGroupView::TabGroupView(TabCollection
+   OnDataChanged();
+   if (orientation_ == TabStripOrientation::kVertical) {
+     tabs_popover_ = std::make_unique<helium_plus::GroupTabsPopover>(*this);
++    closed_tab_views_ = std::make_unique<helium_plus::ClosedTabViews>(
++        *this, /*pinned=*/false,
++        base::BindRepeating(
++            [](const TabGroupView* view) {
++              return view->collection_node_
++                         ? view->collection_node_->GetDirectChildren()
++                         : TabCollectionNode::ChildViews();
++            },
++            base::Unretained(this)),
++        base::BindRepeating(&TabGroupView::UpdateOpenTabsVisibility,
++                            base::Unretained(this)));
++    closed_tab_views_->ScheduleUpdate();
+   }
+ }
+ 
+@@ -134,6 +147,17 @@ void TabGroupView::OnThemeChanged() {
+   OnDataChanged();
+ }
+ 
++void TabGroupView::ViewHierarchyChanged(
++    const views::ViewHierarchyChangedDetails& details) {
++  TabCollectionZOrderManager::ViewHierarchyChanged(details);
++  // Helium+: a tab added to the group may keep closed tabs.
++  if (details.is_add && details.parent == this &&
++      (views::IsViewClass<TabView>(details.child) ||
++       views::IsViewClass<SplitTabView>(details.child))) {
++    ScheduleClosedTabsUpdate();
++  }
++}
++
+ void TabGroupView::OnGestureEvent(ui::GestureEvent* event) {
+   if (event->type() == ui::EventType::kGestureLongTap) {
+     ui::GestureEvent converted_event(*event, static_cast<views::View*>(this),
+@@ -352,7 +376,7 @@ void TabGroupView::UpdateChildVisibility
+   }
+   SetIsCollapsed(collapsed);
+   const bool keep_open_tabs = orientation_ == TabStripOrientation::kVertical;
+-  for (auto* child : collection_node_->GetDirectChildren()) {
++  for (auto* child : GetDisplayedChildren()) {
+     child->SetVisible(!collapsed || (keep_open_tabs && IsOpenTab(*child)));
+   }
+ }
+@@ -372,6 +396,26 @@ void TabGroupView::UpdateOpenTabsVisibil
+   }
+ }
+ 
++std::vector<views::View*> TabGroupView::GetDisplayedChildren() const {
++  const TabCollectionNode::ChildViews children =
++      collection_node_ ? collection_node_->GetDirectChildren()
++                       : TabCollectionNode::ChildViews();
++  if (closed_tab_views_) {
++    return closed_tab_views_->GetChildren(children);
++  }
++  std::vector<views::View*> result;
++  for (views::View* child : children) {
++    result.push_back(child);
++  }
++  return result;
++}
++
++void TabGroupView::ScheduleClosedTabsUpdate() {
++  if (closed_tab_views_) {
++    closed_tab_views_->ScheduleUpdate();
++  }
++}
++
+ bool TabGroupView::IsCollapsed() const {
+   return tab_group_visual_data_.is_collapsed();
+ }
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_GROUP_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_TABS_COMMON_TAB_GROUP_VIEW_H_
+ 
++#include <vector>
++
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+ #include "chrome/browser/ui/views/frame/browser_root_view.h"
+@@ -22,8 +24,9 @@ class TabGroupHeaderView;
+ class TabGroupLineView;
+ 
+ namespace helium_plus {
++class ClosedTabViews;
+ class GroupTabsPopover;
+-}
++}  // namespace helium_plus
+ 
+ namespace tabs {
+ class TabGroupDataObserver;
+@@ -51,6 +54,8 @@ class TabGroupView : public TabCollectio
+   void RemovedFromWidget() override;
+   void OnThemeChanged() override;
+   void OnGestureEvent(ui::GestureEvent* event) override;
++  void ViewHierarchyChanged(
++      const views::ViewHierarchyChangedDetails& details) override;
+ 
+   // TabGroupHeaderView::Delegate:
+   void ToggleCollapsedState(ToggleTabGroupCollapsedStateOrigin origin) override;
+@@ -88,6 +93,12 @@ class TabGroupView : public TabCollectio
+   static bool IsOpenTab(const views::View& child);
+   void UpdateOpenTabsVisibility();
+ 
++  // Helium+: the tabs of the group in display order, with its closed tabs
++  // (see helium_plus/closed_tabs.h) among them in the vertical tab strip.
++  std::vector<views::View*> GetDisplayedChildren() const;
++  // Helium+: updates the closed tabs shown once they changed.
++  void ScheduleClosedTabsUpdate();
++
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndex(
+       const gfx::Point& point_in_local_coords);
+ 
+@@ -152,6 +163,8 @@ class TabGroupView : public TabCollectio
+ 
+   // Helium+: lists the tabs of a collapsed vertical group on header hover.
+   std::unique_ptr<helium_plus::GroupTabsPopover> tabs_popover_;
++  // Helium+: the closed tabs of a vertical group.
++  std::unique_ptr<helium_plus::ClosedTabViews> closed_tab_views_;
+ 
+   const raw_ref<TabCollectionAnimatingLayoutManager> layout_manager_;
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/helium_plus/closed_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_header_view.h"
+@@ -107,10 +108,9 @@ views::ProposedLayout TabGroupViewLayout
+     group_line_bounds.set_y(height);
+   }
+ 
+-  const auto children =
+-      tab_group_view->collection_node_
+-          ? tab_group_view->collection_node_->GetDirectChildren()
+-          : TabCollectionNode::ChildViews();
++  // Helium+: the closed tabs of the group are laid out among its tabs.
++  const std::vector<views::View*> children =
++      tab_group_view->GetDisplayedChildren();
+ 
+   const bool is_focused = tab_group_view->IsGroupFocused();
+   // Helium+: a collapsed group still lays out its open tabs under the header.
+@@ -150,6 +150,9 @@ views::ProposedLayout TabGroupViewLayout
+     height += bounds.height() + kTabVerticalPadding;
+     width = std::max(width, bounds.width());
+   }
++  if (tab_group_view->closed_tab_views_) {
++    tab_group_view->closed_tab_views_->HideMissingViews(children, layouts);
++  }
+   // Remove excess padding.
+   height -= kTabVerticalPadding;
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -36,6 +36,7 @@
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/helium/native_frame_materials.h"
++#include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_z_order_manager.h"
+@@ -1210,6 +1211,19 @@ void TabView::UpdateTabData(const tabs::
+   if (auto* group_view = views::AsViewClass<TabGroupView>(parent())) {
+     group_view->UpdateOpenTabsVisibility();
+   }
++  // Helium+: the closed tabs kept by the tab are shown around it.
++  if (old_data.closed_tabs_revision != tab_data_.closed_tabs_revision) {
++    views::View* container = parent();
++    if (container && views::IsViewClass<SplitTabView>(container)) {
++      container = container->parent();
++    }
++    if (auto* group_view = views::AsViewClass<TabGroupView>(container)) {
++      group_view->ScheduleClosedTabsUpdate();
++    } else if (auto* pinned_view =
++                   views::AsViewClass<PinnedTabContainerView>(container)) {
++      pinned_view->ScheduleClosedTabsUpdate();
++    }
++  }
+ }
+ 
+ void TabView::SetDataForTesting(const tabs::TabData& data) {
