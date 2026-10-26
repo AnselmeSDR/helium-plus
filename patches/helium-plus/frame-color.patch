@@ -1,0 +1,188 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1751,6 +1751,9 @@ void BrowserViewTabbedLayoutImpl::Config
+       IsParentedTo(views().horizontal_tab_strip_region_view,
+                    views().top_container)) {
+     background->SetPrimaryColor(ui::kColorFrameActive);
++  } else if (layout_data_->tab_strip_type == TabStripType::kVertical) {
++    // Helium+: frame color of the vertical tab strip, like the toolbar.
++    background->SetPrimaryColor(CustomCornersBackground::FrameTheme());
+   } else {
+     background->SetPrimaryColor(CustomCornersBackground::ToolbarTheme());
+   }
+--- a/chrome/browser/ui/views/frame/multi_contents_background_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_background_view.cc
+@@ -4,11 +4,22 @@
+ 
+ #include "chrome/browser/ui/views/frame/multi_contents_background_view.h"
+ 
++#include "base/functional/bind.h"
+ #include "chrome/browser/ui/views/frame/themed_background.h"
+ #include "chrome/browser/ui/views/helium/native_frame_materials.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/compositor/layer_solid_color.h"
+ #include "ui/gfx/geometry/rounded_corners_f.h"
++#include "ui/views/widget/widget.h"
++
++namespace {
++
++ThemedBackground::ThemeChoice GetThemeChoice(bool use_frame_theme) {
++  return use_frame_theme ? ThemedBackground::kFrameTheme
++                         : ThemedBackground::kToolbarTheme;
++}
++
++}  // namespace
+ 
+ MultiContentsBackgroundView::MultiContentsBackgroundView(
+     BrowserView* browser_view)
+@@ -35,8 +46,29 @@ const gfx::RoundedCornersF& MultiContent
+   return layer()->rounded_corner_radii();
+ }
+ 
++void MultiContentsBackgroundView::SetUseFrameTheme(bool use_frame_theme) {
++  if (use_frame_theme_ == use_frame_theme) {
++    return;
++  }
++  use_frame_theme_ = use_frame_theme;
++  if (GetWidget()) {
++    UpdateBackground();
++  }
++}
++
++void MultiContentsBackgroundView::AddedToWidget() {
++  paint_as_active_subscription_ =
++      GetWidget()->RegisterPaintAsActiveChangedCallback(
++          base::BindRepeating(&MultiContentsBackgroundView::UpdateBackground,
++                              base::Unretained(this)));
++}
++
+ void MultiContentsBackgroundView::OnThemeChanged() {
+   views::View::OnThemeChanged();
++  UpdateBackground();
++}
++
++void MultiContentsBackgroundView::UpdateBackground() {
+   SetPaintToLayer(CalculateLayerType());
+ 
+   if (layer()->AsSolidColor()) {
+@@ -52,21 +84,25 @@ void MultiContentsBackgroundView::OnPain
+   if (helium::ShouldUseNativeFrameMaterials(browser_view_)) {
+     return;
+   }
+-  ThemedBackground::PaintBackground(canvas, this, browser_view_);
++  ThemedBackground::PaintBackground(canvas, this, browser_view_,
++                                    GetThemeChoice(use_frame_theme_));
+ }
+ 
+ ui::LayerType MultiContentsBackgroundView::CalculateLayerType() const {
+   const bool has_custom_image =
+-      !ThemedBackground::GetBackgroundColor(this, browser_view_).has_value();
++      !ThemedBackground::GetBackgroundColor(this, browser_view_,
++                                            GetThemeChoice(use_frame_theme_))
++           .has_value();
+   const bool use_native_materials =
+       helium::ShouldUseNativeFrameMaterials(browser_view_);
+   return has_custom_image || use_native_materials ? ui::LAYER_TEXTURED
+-                                                 : ui::LAYER_SOLID_COLOR;
++                                                  : ui::LAYER_SOLID_COLOR;
+ }
+ 
+ void MultiContentsBackgroundView::UpdateSolidLayerColor() {
+   CHECK(layer()->AsSolidColor());
+-  if (auto color = ThemedBackground::GetBackgroundColor(this, browser_view_)) {
++  if (auto color = ThemedBackground::GetBackgroundColor(
++          this, browser_view_, GetThemeChoice(use_frame_theme_))) {
+     layer()->AsSolidColor()->SetColor(SkColor4f::FromColor(*color));
+   }
+ }
+--- a/chrome/browser/ui/views/frame/multi_contents_background_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_background_view.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_BACKGROUND_VIEW_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_BACKGROUND_VIEW_H_
+ 
++#include "base/callback_list.h"
+ #include "ui/views/view.h"
+ class BrowserView;
+ 
+@@ -29,16 +30,25 @@ class MultiContentsBackgroundView : publ
+   void SetRoundedCorners(const gfx::RoundedCornersF& radii);
+   const gfx::RoundedCornersF& GetRoundedCorners() const;
+ 
++  // Helium+: paints the frame color instead of the toolbar color, like the
++  // vertical tab strip.
++  void SetUseFrameTheme(bool use_frame_theme);
++
+   // views::View:
++  void AddedToWidget() override;
+   void OnThemeChanged() override;
+   void OnPaint(gfx::Canvas* canvas) override;
+ 
+  private:
+   ui::LayerType CalculateLayerType() const;
+ 
++  void UpdateBackground();
+   void UpdateSolidLayerColor();
+ 
+   const raw_ptr<BrowserView> browser_view_;
++  bool use_frame_theme_ = false;
++  // The frame color depends on whether the window is active.
++  base::CallbackListSubscription paint_as_active_subscription_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_BACKGROUND_VIEW_H_
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -628,6 +628,10 @@ views::ProposedLayout MultiContentsView:
+ }
+ 
+ void MultiContentsView::BeforeApplyLayout(const views::ProposedLayout& layout) {
++  // Helium+: same color around the web contents as the vertical tab strip.
++  background_view_->SetUseFrameTheme(
++      browser_view_->ShouldDrawVerticalTabStrip());
++
+   if (!target_content_bounds_) {
+     for (auto& contents : contents_container_views_) {
+       contents->SetTargetContentBounds(std::nullopt);
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -371,6 +371,23 @@ class CenteredLocationBarLayout : public
+   GetCenteredBoundsCallback callback_;
+ };
+ 
++// Helium+: with vertical tabs, the toolbar has the frame color of the vertical
++// tab strip, so that the whole window has one color.
++void UpdateBackgroundColor(views::View& toolbar, bool vertical_tabs) {
++  auto* const background =
++      toolbar.background()
++          ? toolbar.background()->AsA<CustomCornersBackground>()
++          : nullptr;
++  if (!background) {
++    return;
++  }
++  if (vertical_tabs) {
++    background->SetPrimaryColor(CustomCornersBackground::FrameTheme());
++  } else {
++    background->SetPrimaryColor(CustomCornersBackground::ToolbarTheme());
++  }
++}
++
+ }  // namespace
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -620,6 +637,7 @@ void ToolbarView::Init() {
+                                 base::Unretained(this)));
+     should_display_vertical_tabs_ =
+         vertical_tab_strip_state_controller->ShouldDisplayVerticalTabs();
++    UpdateBackgroundColor(*this, should_display_vertical_tabs_);
+   }
+ 
+   bool is_glic_left_of_profile =
+@@ -954,6 +972,7 @@ void ToolbarView::InitGlicContainer() {
+ void ToolbarView::OnVerticalTabStripModeChanged(
+     tabs::VerticalTabStripStateController* controller) {
+   should_display_vertical_tabs_ = controller->ShouldDisplayVerticalTabs();
++  UpdateBackgroundColor(*this, should_display_vertical_tabs_);
+   UpdateGlicButtonVisibility();
+   UpdateGlicActorVisibility();
+   UpdateToolbarLayout();
