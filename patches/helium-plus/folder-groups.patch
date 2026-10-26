@@ -1,0 +1,287 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3579,6 +3579,8 @@ static_library("ui") {
+       "views/helium/frame_corner_radius.h",
+       "views/helium_plus/closed_tab_view.cc",
+       "views/helium_plus/closed_tab_view.h",
++      "views/helium_plus/folder_icon_view.cc",
++      "views/helium_plus/folder_icon_view.h",
+       "views/helium_plus/group_tabs_popover.cc",
+       "views/helium_plus/group_tabs_popover.h",
+       "views/helium_plus/profile_switcher_view.cc",
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/folder_icon_view.cc
+@@ -0,0 +1,88 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium_plus/folder_icon_view.h"
++
++#include <memory>
++
++#include "chrome/browser/ui/tabs/tab_style.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/font_list.h"
++#include "ui/views/background.h"
++#include "ui/views/controls/image_view.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/layout/fill_layout.h"
++#include "ui/views/painter.h"
++#include "ui/views/view_class_properties.h"
++#include "ui/views/widget/widget.h"
++
++namespace helium_plus {
++
++namespace {
++
++constexpr int kIconSize = 16;
++constexpr int kIconNamePadding = 8;
++// Opacity of the border of a folder header, from the color of its name.
++constexpr SkAlpha kBorderAlpha = 0x26;
++
++bool IsFrameActive(const views::View& view) {
++  return !view.GetWidget() || view.GetWidget()->ShouldPaintAsActive();
++}
++
++}  // namespace
++
++FolderIconView::FolderIconView() {
++  SetLayoutManager(std::make_unique<views::FillLayout>());
++  SetPreferredSize(gfx::Size(kIconSize, kIconSize));
++  SetCanProcessEventsWithinSubtree(false);
++  folder_ = AddChildView(std::make_unique<views::ImageView>());
++}
++
++FolderIconView::~FolderIconView() = default;
++
++void FolderIconView::SetFolder(SkColor color, bool collapsed) {
++  folder_->SetImage(
++      ui::ImageModel::FromVectorIcon(collapsed ? vector_icons::kFolderFilledIcon
++                                               : vector_icons::kFolderOpenIcon,
++                                     color, kIconSize));
++}
++
++void StyleFolderHeader(views::View& icon, views::Label& name) {
++  icon.SetProperty(views::kMarginsKey,
++                   gfx::Insets::TLBR(0, 0, 0, kIconNamePadding));
++  name.SetFontList(
++      name.font_list().DeriveWithWeight(gfx::Font::Weight::SEMIBOLD));
++  // Like tab titles, painted over the tab strip without a background.
++  name.SetSkipSubpixelRenderingOpacityCheck(true);
++}
++
++SkColor GetFolderTextColor(const views::View& view) {
++  return TabStyle::Get()->GetTabForegroundColor(
++      /*apparently_active=*/false, IsFrameActive(view),
++      view.GetColorProvider());
++}
++
++std::unique_ptr<views::Background> CreateFolderBackground(
++    const views::View& view,
++    bool highlighted,
++    float corner_radius) {
++  const SkColor background_color =
++      highlighted
++          ? TabStyle::Get()->GetTabBackgroundColor(
++                TabStyle::TabSelectionState::kInactive,
++                /*hovered=*/true, IsFrameActive(view), view.GetColorProvider())
++          : SK_ColorTRANSPARENT;
++  return views::CreateBackgroundFromPainter(
++      views::Painter::CreateRoundRectWith1PxBorderPainter(
++          background_color, SkColorSetA(GetFolderTextColor(view), kBorderAlpha),
++          corner_radius));
++}
++
++BEGIN_METADATA(FolderIconView)
++END_METADATA
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/folder_icon_view.h
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_FOLDER_ICON_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_FOLDER_ICON_VIEW_H_
++
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++namespace views {
++class Background;
++class ImageView;
++class Label;
++}  // namespace views
++
++namespace helium_plus {
++
++// Like in Arc and Dia, a group of the vertical tab strip looks like a folder:
++// this icon then its name, without a colored chip. The icon is a folder in the
++// group color, open while the group is expanded.
++class FolderIconView : public views::View {
++  METADATA_HEADER(FolderIconView, views::View)
++
++ public:
++  FolderIconView();
++  FolderIconView(const FolderIconView&) = delete;
++  FolderIconView& operator=(const FolderIconView&) = delete;
++  ~FolderIconView() override;
++
++  void SetFolder(SkColor color, bool collapsed);
++
++ private:
++  raw_ptr<views::ImageView> folder_ = nullptr;
++};
++
++// Styles the header of a folder: `icon` then `name`.
++void StyleFolderHeader(views::View& icon, views::Label& name);
++
++// Colors of a folder header of the tab strip of `view`: its name, and its
++// background with a discreet border, transparent unless `highlighted` (hovered
++// or edited).
++SkColor GetFolderTextColor(const views::View& view);
++std::unique_ptr<views::Background> CreateFolderBackground(
++    const views::View& view,
++    bool highlighted,
++    float corner_radius);
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_FOLDER_ICON_VIEW_H_
+--- a/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/event_utils.h"
++#include "chrome/browser/ui/views/helium_plus/folder_icon_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_style.h"
+ #include "chrome/browser/ui/views/tabs/groups/tab_group_accessibility.h"
+ #include "chrome/browser/ui/views/tabs/groups/tab_group_editor_bubble_tracker.h"
+@@ -139,6 +140,10 @@ TabGroupHeaderView::TabGroupHeaderView(
+     const tab_groups::TabGroupVisualData* tab_group_visual_data)
+     : HoverCardAnchorTarget(this),
+       tab_group_visual_data_(*tab_group_visual_data),
++      folder_icon_(
++          orientation == TabStripOrientation::kVertical
++              ? AddChildView(std::make_unique<helium_plus::FolderIconView>())
++              : nullptr),
+       sync_icon_(AddChildView(std::make_unique<views::ImageView>())),
+       group_header_label_(
+           AddChildView(std::make_unique<TabGroupHeaderLabel>())),
+@@ -203,6 +208,9 @@ TabGroupHeaderView::TabGroupHeaderView(
+     collapse_icon_->SetVisible(!delegate_->IsGroupFocused());
+   }
+ 
++  if (folder_icon_) {
++    helium_plus::StyleFolderHeader(*folder_icon_, *group_header_label_);
++  }
+   sync_icon_->SetProperty(views::kMarginsKey,
+                           gfx::Insets::TLBR(0, 0, 0, kSyncIconLabelPadding));
+   attention_indicator_->SetProperty(
+@@ -387,6 +395,7 @@ void TabGroupHeaderView::OnMouseMoved(co
+ void TabGroupHeaderView::OnMouseEntered(const ui::MouseEvent& event) {
+   delegate_->UpdateHoverCard(TabSlotController::HoverCardUpdateType::kHover);
+   UpdateEditorBubbleButtonVisibility();
++  UpdateColors();
+ }
+ 
+ void TabGroupHeaderView::OnMouseExited(const ui::MouseEvent& event) {
+@@ -397,6 +406,7 @@ void TabGroupHeaderView::OnMouseExited(c
+ #else
+   UpdateEditorBubbleButtonVisibility();
+ #endif
++  UpdateColors();
+ }
+ 
+ void TabGroupHeaderView::OnFocus() {
+@@ -612,8 +622,15 @@ void TabGroupHeaderView::UpdateColors()
+   if (!GetColorProvider()) {
+     return;
+   }
+-  const SkColor background_color = GetBackgroundColor();
+-  const SkColor foreground_color = GetForegroundColor();
++  // Helium+: a vertical group looks like a folder.
++  const bool highlighted = IsMouseHovered() || editor_bubble_tracker_.is_open();
++  const SkColor foreground_color = folder_icon_
++                                       ? helium_plus::GetFolderTextColor(*this)
++                                       : GetForegroundColor();
++  if (folder_icon_) {
++    folder_icon_->SetFolder(GetBackgroundColor(),
++                            tab_group_visual_data_.is_collapsed());
++  }
+ 
+   // Update label.
+   group_header_label_->SetEnabledColor(foreground_color);
+@@ -657,8 +674,10 @@ void TabGroupHeaderView::UpdateColors()
+   }
+ 
+   // Update background.
+-  SetBackground(
+-      views::CreateRoundedRectBackground(background_color, GetCornerRadius()));
++  SetBackground(folder_icon_ ? helium_plus::CreateFolderBackground(
++                                   *this, highlighted, GetCornerRadius())
++                             : views::CreateRoundedRectBackground(
++                                   GetBackgroundColor(), GetCornerRadius()));
+ }
+ 
+ void TabGroupHeaderView::UpdateEditorBubbleButtonVisibility() {
+--- a/chrome/browser/ui/views/tabs/common/tab_group_header_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_header_view.h
+@@ -28,6 +28,10 @@ struct TabGroupData;
+ class VerticalTabStripStateController;
+ }  // namespace tabs
+ 
++namespace helium_plus {
++class FolderIconView;
++}  // namespace helium_plus
++
+ namespace views {
+ class LabelButton;
+ class ImageView;
+@@ -147,6 +151,9 @@ class TabGroupHeaderView : public views:
+   bool needs_attention_ = false;
+   bool is_shared_ = false;
+ 
++  // Helium+: the folder icon of a vertical group.
++  const raw_ptr<helium_plus::FolderIconView> folder_icon_ = nullptr;
++
+   // The sync icon that is displayed in the tab group header of saved groups in
+   // the tabstrip.
+   const raw_ptr<views::ImageView> sync_icon_ = nullptr;
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.h
+@@ -42,7 +42,8 @@ class TabGroupView : public TabCollectio
+   METADATA_HEADER(TabGroupView, TabCollectionZOrderManager)
+ 
+  public:
+-  static constexpr int kTabLeadingPadding = 6;
++  // Helium+: tabs of a folder are indented, see helium_plus::FolderIconView.
++  static constexpr int kTabLeadingPadding = 12;
+ 
+   explicit TabGroupView(TabCollectionNode* collection_node);
+   TabGroupView(const TabGroupView&) = delete;
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
+@@ -28,8 +28,9 @@ namespace {
+ constexpr int kTabVerticalPadding = 2;
+ constexpr int kGroupLineWidth = 2;
+ constexpr int kGroupLineCollapsedLeadingPadding = 2;
+-constexpr int kGroupHeaderHeight = 26;
+-constexpr int kGroupHeaderVerticalMargin = 3;
++// Helium+: a folder header is as tall as a tab.
++constexpr int kGroupHeaderHeight = 30;
++constexpr int kGroupHeaderVerticalMargin = 1;
+ }  // namespace
+ 
+ TabGroupViewLayout::TabGroupViewLayout(TabStripOrientation orientation)
