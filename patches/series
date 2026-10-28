@@ -45,3 +45,4 @@ helium-plus/group-icons.patch
 helium-plus/closed-tabs-drag.patch
 helium-plus/reopen-closed-tabs.patch
 helium-plus/hover-expanded-groups.patch
+helium-plus/split-view-hibernation.patch

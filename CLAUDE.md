@@ -212,6 +212,16 @@ two-line calls.
     collapsed strip minus its padding), in `tab_group_view_layout.cc`,
     `unpinned_tab_container_view_layout.cc` and `TabGroupHeaderView::UpdateIconOnly` (also called
     from `OnBoundsChanged`).
+22. `split-view-hibernation.patch`: Chromium never discards the active tab of a window
+    (`PageLiveStateDecorator::SetIsActiveTab`), but did discard the other tab of the active split
+    (Memory Saver, `HibernationService`): its pane kept the destroyed WebContents and stayed blank,
+    reloading it needed an unsplit. `ActiveTabObserver` (`page_live_state_decorator_helper.cc`)
+    marks all foreground tabs (`TabStripModel::GetForegroundTabs`) as active; if one is discarded
+    anyway (critical memory pressure, `chrome.tabs.discard`), `BrowserView::OnTabStripModelChanged`
+    shows its new contents in its pane (`kReplaced`), reloaded by Chromium when the window gets the
+    focus again or the tab is activated (`TabLifecycleUnitSource::UpdateFocusedTabTo`). A discarded
+    tab gets a new session id: `SessionServiceBrowserHelper` (`kReplaced`) saves its split again,
+    otherwise the split came back broken after a restart.
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

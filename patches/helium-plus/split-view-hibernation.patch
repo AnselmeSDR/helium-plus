@@ -1,0 +1,95 @@
+--- a/chrome/browser/performance_manager/decorators/helpers/page_live_state_decorator_helper.cc
++++ b/chrome/browser/performance_manager/decorators/helpers/page_live_state_decorator_helper.cc
+@@ -29,6 +29,8 @@
+ #include "chrome/browser/ui/android/tab_model/tab_model_observer.h"
+ #include "third_party/abseil-cpp/absl/container/flat_hash_map.h"
+ #else
++#include <algorithm>
++
+ #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"  // nogncheck crbug.com/40147906
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+@@ -168,6 +170,7 @@ class ActiveTabObserver : public TabStri
+       if (selection.new_contents) {
+         PageLiveStateDecorator::SetIsActiveTab(selection.new_contents, true);
+       }
++      UpdateSplitTabs(tab_strip_model);
+     }
+ 
+     if (change.type() == TabStripModelChange::kInserted) {
+@@ -185,6 +188,7 @@ class ActiveTabObserver : public TabStri
+             replace->new_contents,
+             tab_strip_model->IsTabPinned(replace->index));
+       }
++      UpdateSplitTabs(tab_strip_model);
+     }
+   }
+ 
+@@ -193,6 +197,28 @@ class ActiveTabObserver : public TabStri
+     PageLiveStateDecorator::SetIsPinnedTab(tab->GetContents(), tab->IsPinned());
+   }
+ 
++  void OnSplitTabChanged(const SplitTabChange& change) override {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (change.type != SplitTabChange::Type::kVisualsChanged) {
++      UpdateSplitTabs(change.model);
++    }
++  }
++
++  // Helium+: the tabs of the active tab's split are shown with it, so they are
++  // active tabs too. Otherwise one could be discarded and leave its pane blank.
++  void UpdateSplitTabs(TabStripModel* tab_strip_model) {
++    if (tab_strip_model->empty()) {
++      return;
++    }
++    const std::vector<tabs::TabInterface*> foreground_tabs =
++        tab_strip_model->GetForegroundTabs();
++    for (int i = 0; i < tab_strip_model->count(); ++i) {
++      tabs::TabInterface* tab = tab_strip_model->GetTabAtIndex(i);
++      PageLiveStateDecorator::SetIsActiveTab(
++          tab->GetContents(), std::ranges::contains(foreground_tabs, tab));
++    }
++  }
++
+   // BrowserCollectionObserver:
+   void OnBrowserCreated(BrowserWindowInterface* browser) override {
+     AddBrowserTabStripObservation(browser);
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -4260,6 +4260,19 @@ void BrowserView::OnTabStripModelChanged
+     }
+   }
+ 
++  // Helium+: the other tab of the active split was discarded, show its new
++  // contents in its pane (they load once visible).
++  if (change.type() == TabStripModelChange::kReplaced &&
++      !selection.active_tab_changed()) {
++    const tabs::TabInterface* active_tab = tab_strip_model->GetActiveTab();
++    if (active_tab && active_tab->IsSplit() &&
++        tab_strip_model->GetTabAtIndex(change.GetReplace()->index)
++                ->GetSplit() == active_tab->GetSplit()) {
++      ShowSplitView(GetActiveContentsWebView()->HasFocus() ||
++                    !GetFocusManager()->GetFocusedView());
++    }
++  }
++
+   if (change.type() != TabStripModelChange::kInserted) {
+     return;
+   }
+--- a/chrome/browser/ui/sessions/session_service_browser_helper.cc
++++ b/chrome/browser/ui/sessions/session_service_browser_helper.cc
+@@ -155,6 +155,14 @@ void SessionServiceBrowserHelper::OnTabS
+         session_service->TabRestored(
+             replace->new_contents,
+             tab_strip_model->IsTabPinned(replace->index));
++
++        // Helium+: the new contents get a new session id, keep the split of
++        // the tab (its group is kept by SyncHistoryWithTabs).
++        tabs::TabInterface* tab =
++            tab_strip_model->GetTabAtIndex(replace->index);
++        if (!IsRelevantToAppSessionService(browser_type_) && tab->IsSplit()) {
++          UpdateSplitTabSessionData(tab, tab->GetSplit());
++        }
+       }
+       break;
+     }
