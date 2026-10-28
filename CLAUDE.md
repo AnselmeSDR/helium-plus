@@ -205,6 +205,13 @@ two-line calls.
     Cmd+Shift+T opened those windows a second time (groups duplicated, closed tabs moved to unsaved
     copies of the groups): `UnloadController` no longer records them when quitting and the session
     comes back on next start (startup pref or `--restore-last-session`).
+21. `hover-expanded-groups.patch`: when the collapsed vertical strip expands on hover (Chromium,
+    pref `vertical_tabs.expand_on_hover`, right-click on the collapse button), groups show in full
+    (header, tabs, closed tabs) instead of icons. During the hover the collapse state stays
+    `kCollapsed`: the hover is detected by width (`TabGroupView::IsExpandedOnHover`, wider than the
+    collapsed strip minus its padding), in `tab_group_view_layout.cc`,
+    `unpinned_tab_container_view_layout.cc` and `TabGroupHeaderView::UpdateIconOnly` (also called
+    from `OnBoundsChanged`).
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

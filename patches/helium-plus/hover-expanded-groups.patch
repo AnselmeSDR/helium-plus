@@ -1,0 +1,142 @@
+--- a/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_header_view.cc
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/ui/views/event_utils.h"
+ #include "chrome/browser/ui/views/helium_plus/folder_icon_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_style.h"
++#include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/groups/tab_group_accessibility.h"
+ #include "chrome/browser/ui/views/tabs/groups/tab_group_editor_bubble_tracker.h"
+ #include "chrome/browser/ui/views/tabs/horizontal/horizontal_tab_closing_helper.h"
+@@ -695,7 +696,27 @@ void TabGroupHeaderView::UpdateColors()
+ 
+ void TabGroupHeaderView::OnTabStripCollapseStateChanged(
+     tabs::VerticalTabStripCollapseState state) {
+-  icon_only_ = state != tabs::VerticalTabStripCollapseState::kExpanded;
++  tab_strip_collapse_state_ = state;
++  UpdateIconOnly(/*force=*/true);
++}
++
++void TabGroupHeaderView::OnBoundsChanged(const gfx::Rect& previous_bounds) {
++  views::FlexLayoutView::OnBoundsChanged(previous_bounds);
++  if (folder_icon_) {
++    UpdateIconOnly(/*force=*/false);
++  }
++}
++
++void TabGroupHeaderView::UpdateIconOnly(bool force) {
++  // Expanded on hover, the collapsed tab strip shows the whole header.
++  const bool icon_only =
++      tab_strip_collapse_state_ !=
++          tabs::VerticalTabStripCollapseState::kExpanded &&
++      !TabGroupView::IsExpandedOnHover(tab_strip_collapse_state_, width());
++  if (icon_only == icon_only_ && !force) {
++    return;
++  }
++  icon_only_ = icon_only;
+   helium_plus::SetFolderHeaderIconOnly(*this, *folder_icon_,
+                                        *group_header_label_, icon_only_);
+   UpdateEditorBubbleButtonVisibility();
+--- a/chrome/browser/ui/views/tabs/common/tab_group_header_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_header_view.h
+@@ -148,6 +148,9 @@ class TabGroupHeaderView : public views:
+   SkColor GetBackgroundColor() const;
+   SkColor GetForegroundColor() const;
+   void UpdateColors();
++  void OnBoundsChanged(const gfx::Rect& previous_bounds) override;
++  // Helium+: shows only the folder icon in the collapsed tab strip.
++  void UpdateIconOnly(bool force);
+   void OnTabStripCollapseStateChanged(
+       tabs::VerticalTabStripCollapseState state);
+ 
+@@ -155,6 +158,8 @@ class TabGroupHeaderView : public views:
+   bool needs_attention_ = false;
+   bool is_shared_ = false;
+   bool icon_only_ = false;
++  tabs::VerticalTabStripCollapseState tab_strip_collapse_state_ =
++      tabs::VerticalTabStripCollapseState::kExpanded;
+ 
+   // Helium+: the folder icon of a vertical group.
+   const raw_ptr<helium_plus::FolderIconView> folder_icon_ = nullptr;
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.cc
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/helium_plus/anchored_tabs.h"
+ #include "chrome/browser/ui/helium_plus/closed_tabs.h"
++#include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_data.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+@@ -391,6 +392,16 @@ bool TabGroupView::IsOpenTab(const views
+          (tab->IsActivated() || !helium_plus::IsClosedAnchoredTab(*tab));
+ }
+ 
++// static
++bool TabGroupView::IsExpandedOnHover(tabs::VerticalTabStripCollapseState state,
++                                     int width) {
++  // Collapsed, a group takes the strip width minus the padding after it.
++  return state == tabs::VerticalTabStripCollapseState::kCollapsed &&
++         width > VerticalTabStripRegionView::kCollapsedWidth -
++                     GetLayoutConstant(
++                         LayoutConstant::kVerticalTabStripHorizontalPadding);
++}
++
+ void TabGroupView::UpdateOpenTabsVisibility() {
+   if (is_collapsed_ && orientation_ == TabStripOrientation::kVertical) {
+     UpdateChildVisibilityForCollapseState(true);
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view.h
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view.h
+@@ -94,6 +94,12 @@ class TabGroupView : public TabCollectio
+   static bool IsOpenTab(const views::View& child);
+   void UpdateOpenTabsVisibility();
+ 
++  // Helium+: whether the collapsed vertical tab strip is expanded on hover, for
++  // a group or its header laid out `width` wide: whole groups show then, the
++  // way tabs show their title (TabView::IsInExpandOnHover()).
++  static bool IsExpandedOnHover(tabs::VerticalTabStripCollapseState state,
++                                int width);
++
+   // Helium+: the tabs of the group in display order, with its closed tabs
+   // (see helium_plus/closed_tabs.h) among them in the vertical tab strip.
+   std::vector<views::View*> GetDisplayedChildren() const;
+--- a/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_group_view_layout.cc
+@@ -71,6 +71,12 @@ views::ProposedLayout TabGroupViewLayout
+   int width = 0;
+   int height = kGroupHeaderVerticalMargin;
+   auto tab_strip_collapse_state = tab_group_view->GetTabStripCollapseState();
++  // Helium+: expanded on hover, the collapsed tab strip shows whole groups.
++  if (size_bounds.width().is_bounded() &&
++      TabGroupView::IsExpandedOnHover(tab_strip_collapse_state,
++                                      size_bounds.width().value())) {
++    tab_strip_collapse_state = tabs::VerticalTabStripCollapseState::kExpanded;
++  }
+ 
+   gfx::Rect header_bounds;
+   gfx::Rect group_line_bounds;
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -10,6 +10,7 @@
+ #include "base/numerics/safe_conversions.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
++#include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
+@@ -241,6 +242,14 @@ views::ProposedLayout UnpinnedTabContain
+ 
+   const int horizontal_padding =
+       GetLayoutConstant(LayoutConstant::kVerticalTabStripHorizontalPadding);
++  // Helium+: expanded on hover (wider than collapsed), the collapsed tab strip
++  // shows whole groups, placed as when expanded.
++  if (collapse_state == tabs::VerticalTabStripCollapseState::kCollapsed &&
++      size_bounds.width().is_bounded() &&
++      size_bounds.width().value() >
++          VerticalTabStripRegionView::kCollapsedWidth) {
++    collapse_state = tabs::VerticalTabStripCollapseState::kExpanded;
++  }
+ 
+   for (auto* child : children) {
+     int x =
