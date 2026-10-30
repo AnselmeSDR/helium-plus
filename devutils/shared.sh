@@ -98,6 +98,8 @@ write_gn_args() {
     fi
     if [ "$mode" = dev ]; then
       sed -i '' s/is_official_build/is_component_build/ "$args"
+      # Helium+: failed DCHECKs are only logged, they no longer crash tabs
+      echo 'dcheck_is_configurable=true' >> "$args"
     fi
   fi
 

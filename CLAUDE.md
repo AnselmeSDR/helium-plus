@@ -260,6 +260,12 @@ To fix a patch that isn't on top: `quilt pop` down to it, `quilt refresh`, `quil
 (`refresh -f` would mix in the changes of the following patches). `he unmerge` before committing:
 it puts our patches back into `patches/series`.
 
+Local (dev) build: not official, so Chromium enables DCHECKs, and a failed DCHECK in Blink crashed
+tabs on ordinary sites ("Error code: 6" = SIGABRT; dumps in
+`~/Library/Application Support/net.imput.helium/Crashpad/pending`, `LOG_FATAL` in `strings`).
+`devutils/shared.sh` adds `dcheck_is_configurable=true` in dev mode: failed DCHECKs are only
+logged ("DCHECK failed" in the run log).
+
 Build: ccache is required (`brew install ccache`): without it, precompiled headers fail under
 Chromium 156 (`missing 'export module' declaration`). `tools/build-local.sh full` runs the build
 with the remaining time in the Ghostty title; to compile a single file:
