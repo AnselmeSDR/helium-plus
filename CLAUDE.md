@@ -83,7 +83,10 @@ two-line calls.
    `helium_plus::ProfileSwitcherView` (bottom of the vertical tab strip,
    `vertical_tab_strip_region_view.cc`): one icon per profile, in the Local State
    `profile.profiles_order` order, and two-finger swipe in the strip. Icons at the very bottom
-   (flexible empty space above, `AddToTabStrip`), shrunk when the strip is narrow. Vector icon
+   (flexible empty space above, `AddToTabStrip`), sized to share the width of the expanded strip
+   (`UpdateButtonSizes`, from `OnBoundsChanged`), never flexed (a long tab list squashed them
+   in height): the current profile in a pill
+   (`kColorSysPrimary`), the others dimmed (layer opacity) until hovered. Vector icon
    instead of the avatar when the profile's Local State entry (`profile.info_cache.<dir>`) has
    `helium_plus_icon`: `game`, `computer`, `home`, `work`, `code` (icons from
    `components/vector_icons`). Each profile keeps its window: `profile_switcher.cc` shows the

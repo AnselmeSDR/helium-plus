@@ -270,13 +270,14 @@
    bool collapsed = state != tabs::VerticalTabStripCollapseState::kExpanded;
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium_plus/profile_switcher_view.cc
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,415 @@
 +// Copyright 2026 The Helium+ Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/views/helium_plus/profile_switcher_view.h"
 +
++#include <algorithm>
 +#include <cmath>
 +#include <string>
 +#include <string_view>
@@ -302,6 +303,8 @@
 +#include "components/vector_icons/vector_icons.h"
 +#include "ui/base/metadata/metadata_impl_macros.h"
 +#include "ui/base/models/image_model.h"
++#include "ui/color/color_id.h"
++#include "ui/compositor/layer.h"
 +#include "ui/events/event.h"
 +#include "ui/events/event_handler.h"
 +#include "ui/gfx/vector_icon_types.h"
@@ -324,6 +327,13 @@
 +// The gesture that switched profile goes on over the window shown in its
 +// place: it must not switch again.
 +base::TimeTicks g_last_switch_gesture_event;
++
++// Smallest button, below it the icons shrink (narrow tab strip).
++constexpr int kMinButtonSize = 20;
++// Space between an icon and the edge of its button.
++constexpr int kIconPadding = 3;
++// The other profiles are dimmed, shown in full when hovered.
++constexpr float kInactiveOpacity = 0.45f;
 +
 +// Icon shown instead of the avatar, like an Arc space icon: its name is stored
 +// under this key in the profile's Local State entry (profile.info_cache).
@@ -357,6 +367,68 @@
 +  }
 +  return nullptr;
 +}
++
++// One profile: the current one in a pill, the others dimmed until hovered.
++class ProfileButton : public views::ImageButton {
++  METADATA_HEADER(ProfileButton, views::ImageButton)
++
++ public:
++  ProfileButton(PressedCallback callback,
++                const base::FilePath& path,
++                bool current)
++      : views::ImageButton(std::move(callback)),
++        path_(path),
++        current_(current) {
++    SetImageHorizontalAlignment(ALIGN_CENTER);
++    SetImageVerticalAlignment(ALIGN_MIDDLE);
++    ConfigureInkDrop(this);
++    if (current_) {
++      SetBackground(views::CreateRoundedRectBackground(
++          ui::kColorSysPrimary,
++          GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius)));
++      return;
++    }
++    SetPaintToLayer();
++    layer()->SetFillsBoundsOpaquely(false);
++    layer()->SetOpacity(kInactiveOpacity);
++  }
++
++  void SetSizes(int button_size, int icon_size) {
++    ProfileAttributesEntry* entry = g_browser_process->profile_manager()
++                                        ->GetProfileAttributesStorage()
++                                        .GetProfileAttributesWithPath(path_);
++    if (!entry) {
++      return;
++    }
++    const gfx::VectorIcon* icon = GetProfileIcon(path_);
++    const ui::ColorId icon_color =
++        current_ ? ui::ColorId{ui::kColorSysOnPrimary}
++                 : ui::ColorId{kColorTabForegroundInactiveFrameActive};
++    SetImageModel(
++        STATE_NORMAL,
++        icon ? ui::ImageModel::FromVectorIcon(*icon, icon_color, icon_size)
++             : ui::ImageModel::FromImage(profiles::GetSizedAvatarIcon(
++                   entry->GetAvatarIcon(icon_size), icon_size, icon_size,
++                   profiles::SHAPE_CIRCLE)));
++    SetPreferredSize(gfx::Size(button_size, button_size));
++  }
++
++ protected:
++  // views::ImageButton:
++  void StateChanged(ButtonState old_state) override {
++    views::ImageButton::StateChanged(old_state);
++    if (!current_) {
++      layer()->SetOpacity(GetState() == STATE_NORMAL ? kInactiveOpacity : 1.0f);
++    }
++  }
++
++ private:
++  const base::FilePath path_;
++  const bool current_;
++};
++
++BEGIN_METADATA(ProfileButton)
++END_METADATA
 +
 +}  // namespace
 +
@@ -473,11 +545,8 @@
 +    tabs::VerticalTabStripStateController* state_controller,
 +    views::View* swipe_area)
 +    : browser_(browser) {
-+  // Icons 2px apart, shrinking when they do not all fit in a narrow tab strip.
-+  SetDefault(views::kMarginsKey, gfx::Insets(1));
-+  SetDefault(views::kFlexBehaviorKey,
-+             views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToZero,
-+                                      views::MaximumFlexSizeRule::kPreferred));
++  // The buttons keep their size (see UpdateButtonSizes()): with flex, a long
++  // tab list would squash them to make room.
 +  if (!browser_->GetProfile()->IsRegularProfile()) {
 +    SetVisible(false);
 +    return;
@@ -523,39 +592,50 @@
 +    return;
 +  }
 +
-+  const int icon_size =
-+      GetLayoutConstant(LayoutConstant::kVerticalTabStripButtonIconSize);
-+  const int button_size =
-+      GetLayoutConstant(LayoutConstant::kVerticalTabStripCollapseButtonSize);
 +  const base::FilePath& current = browser_->GetProfile()->GetPath();
 +  for (ProfileAttributesEntry* entry : profiles) {
 +    const base::FilePath path = entry->GetPath();
-+    auto button = std::make_unique<views::ImageButton>(base::BindRepeating(
-+        [](BrowserWindowInterface* browser, const base::FilePath& path) {
-+          SwitchToProfile(browser, path);
-+        },
-+        browser_, path));
-+    const gfx::VectorIcon* icon = GetProfileIcon(path);
-+    button->SetImageModel(
-+        views::Button::STATE_NORMAL,
-+        icon ? ui::ImageModel::FromVectorIcon(
-+                   *icon, kColorTabForegroundInactiveFrameActive, icon_size)
-+             : ui::ImageModel::FromImage(profiles::GetSizedAvatarIcon(
-+                   entry->GetAvatarIcon(icon_size), icon_size, icon_size,
-+                   profiles::SHAPE_CIRCLE)));
-+    button->SetImageHorizontalAlignment(views::ImageButton::ALIGN_CENTER);
-+    button->SetImageVerticalAlignment(views::ImageButton::ALIGN_MIDDLE);
-+    button->SetPreferredSize(gfx::Size(button_size, button_size));
++    auto button = std::make_unique<ProfileButton>(
++        base::BindRepeating(
++            [](BrowserWindowInterface* browser, const base::FilePath& path) {
++              SwitchToProfile(browser, path);
++            },
++            browser_, path),
++        path, path == current);
 +    button->SetTooltipText(entry->GetName());
 +    button->GetViewAccessibility().SetName(entry->GetName());
-+    ConfigureInkDrop(button.get());
-+    if (path == current) {
-+      button->SetBackground(views::CreateRoundedRectBackground(
-+          kColorTabBackgroundActiveFrameActive,
-+          GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius)));
-+    }
 +    AddChildView(std::move(button));
 +  }
++  button_size_ = 0;
++  UpdateButtonSizes();
++}
++
++void ProfileSwitcherView::UpdateButtonSizes() {
++  if (children().empty()) {
++    return;
++  }
++  // Expanded strip: the buttons share its width instead of overflowing it.
++  int button_size =
++      GetLayoutConstant(LayoutConstant::kVerticalTabStripCollapseButtonSize);
++  if (GetOrientation() == views::LayoutOrientation::kHorizontal) {
++    button_size = std::clamp(width() / static_cast<int>(children().size()),
++                             kMinButtonSize, button_size);
++  }
++  if (button_size == button_size_) {
++    return;
++  }
++  button_size_ = button_size;
++  const int icon_size = std::min(
++      GetLayoutConstant(LayoutConstant::kVerticalTabStripButtonIconSize),
++      button_size - 2 * kIconPadding);
++  for (views::View* child : children()) {
++    static_cast<ProfileButton*>(child)->SetSizes(button_size, icon_size);
++  }
++}
++
++void ProfileSwitcherView::OnBoundsChanged(const gfx::Rect& previous_bounds) {
++  views::FlexLayoutView::OnBoundsChanged(previous_bounds);
++  UpdateButtonSizes();
 +}
 +
 +void ProfileSwitcherView::OnCollapseChanged(
@@ -568,6 +648,8 @@
 +                                : views::LayoutAlignment::kEnd);
 +  SetCrossAxisAlignment(expanded ? views::LayoutAlignment::kEnd
 +                                 : views::LayoutAlignment::kCenter);
++  button_size_ = 0;
++  UpdateButtonSizes();
 +}
 +
 +void ProfileSwitcherView::OnProfileAdded(const base::FilePath&) {
@@ -606,7 +688,7 @@
 +}  // namespace helium_plus
 --- /dev/null
 +++ b/chrome/browser/ui/views/helium_plus/profile_switcher_view.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,93 @@
 +// Copyright 2026 The Helium+ Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -628,7 +710,8 @@
 +
 +namespace gfx {
 +class Insets;
-+}
++class Rect;
++}  // namespace gfx
 +
 +namespace tabs {
 +class VerticalTabStripStateController;
@@ -638,7 +721,8 @@
 +namespace helium_plus {
 +
 +// Like Arc's spaces bar: one icon per profile at the bottom of the vertical tab
-+// strip, the current profile highlighted. Clicking an icon, or swiping
++// strip, the current profile in a pill and the others dimmed, sharing the width
++// of the strip. Clicking an icon, or swiping
 +// horizontally with two fingers across `swipe_area`, switches profile (see
 +// profile_switcher.h). Hidden when there is a single profile.
 +class ProfileSwitcherView : public views::FlexLayoutView,
@@ -667,7 +751,12 @@
 +  class SwipeHandler;
 +
 +  void Rebuild();
++  // Sizes the buttons for the width of the expanded strip.
++  void UpdateButtonSizes();
 +  void OnCollapseChanged(tabs::VerticalTabStripCollapseState state);
++
++  // views::FlexLayoutView:
++  void OnBoundsChanged(const gfx::Rect& previous_bounds) override;
 +
 +  // ProfileAttributesStorageObserver:
 +  void OnProfileAdded(const base::FilePath& profile_path) override;
@@ -684,6 +773,7 @@
 +  const raw_ptr<BrowserWindowInterface> browser_;
 +  std::unique_ptr<SwipeHandler> swipe_handler_;
 +  base::CallbackListSubscription collapse_subscription_;
++  int button_size_ = 0;
 +  base::ScopedObservation<ProfileAttributesStorage,
 +                          ProfileAttributesStorageObserver>
 +      storage_observation_{this};
