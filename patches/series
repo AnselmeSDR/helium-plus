@@ -49,3 +49,4 @@ helium-plus/split-view-hibernation.patch
 helium-plus/split-grid.patch
 helium-plus/replica-windows.patch
 helium-plus/fullscreen-profile-switch.patch
+helium-plus/move-tab-to-profile.patch

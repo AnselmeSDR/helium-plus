@@ -267,6 +267,12 @@ two-line calls.
     (`FullscreenController::RunOrDeferUntilTransitionIsComplete`; macOS gives it back its own
     frame from before fullscreen). Chromium's "hold Esc to exit" bubble shows when the target goes
     fullscreen, as with the green button.
+26. `move-tab-to-profile.patch`: tab menu "Déplacer vers le profil" › one item per other profile
+    (`CommandMoveToProfile`, submenu kept in `TabMenuModel::move_to_profile_submenu_`,
+    `helium_plus/move_to_profile.cc`). A WebContents can't change profile: the selected tabs
+    reopen (URL and custom title; not pinned, group or history) at the end of the target profile's
+    window in the same slot, which shows in place of this one (`SwitchToProfile(from, path,
+    shown)`), then close here without a tab restore entry.
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

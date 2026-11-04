@@ -1,0 +1,413 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3565,6 +3565,8 @@ static_library("ui") {
+       "helium_plus/group_icons.h",
+       "helium_plus/hibernation_service.cc",
+       "helium_plus/hibernation_service.h",
++      "helium_plus/move_to_profile.cc",
++      "helium_plus/move_to_profile.h",
+       "helium_plus/profile_switcher.cc",
+       "helium_plus/profile_switcher.h",
+       "helium_plus/replica_windows.cc",
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/move_to_profile.cc
+@@ -0,0 +1,175 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/move_to_profile.h"
++
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/functional/bind.h"
++#include "base/memory/raw_ref.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_entry.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium_plus/profile_switcher.h"
++#include "chrome/browser/ui/helium_plus/strings.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/tabs/public/tab_context_menu_command.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/menus/simple_menu_model.h"
++#include "url/gurl.h"
++
++namespace helium_plus {
++
++namespace {
++
++// The tabs a command on the tab at `index` applies to.
++std::vector<int> GetIndicesForCommand(const TabStripModel& model, int index) {
++  if (!model.IsTabSelected(index)) {
++    return {index};
++  }
++  std::vector<int> indices;
++  for (int i = 0; i < model.count(); ++i) {
++    if (model.IsTabSelected(i)) {
++      indices.push_back(i);
++    }
++  }
++  return indices;
++}
++
++class MoveToProfileMenuModel : public ui::SimpleMenuModel,
++                               public ui::SimpleMenuModel::Delegate {
++ public:
++  MoveToProfileMenuModel(TabStripModel& model,
++                         int index,
++                         const std::vector<ProfileAttributesEntry*>& profiles)
++      : ui::SimpleMenuModel(this), model_(model), index_(index) {
++    for (ProfileAttributesEntry* entry : profiles) {
++      paths_.push_back(entry->GetPath());
++      // Command ids from 1.
++      AddItem(static_cast<int>(paths_.size()), entry->GetName());
++    }
++  }
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override {
++    if (command_id < 1 || command_id > static_cast<int>(paths_.size()) ||
++        !model_->ContainsIndex(index_)) {
++      return;
++    }
++    MoveTabsToProfile(*model_, GetIndicesForCommand(*model_, index_),
++                      paths_[command_id - 1]);
++  }
++
++ private:
++  const raw_ref<TabStripModel> model_;
++  const int index_;
++  std::vector<base::FilePath> paths_;
++};
++
++struct MovedTab {
++  GURL url;
++  std::u16string custom_title;
++  tabs::TabHandle handle;
++};
++
++// Once the window of the other profile shows: the tabs open there, then close
++// here.
++void OpenMovedTabs(std::vector<MovedTab> moved_tabs, BrowserWindowInterface* to) {
++  if (!to) {
++    return;
++  }
++  bool first = true;
++  for (const MovedTab& moved : moved_tabs) {
++    content::WebContents* contents = chrome::AddAndReturnTabAt(
++        to, moved.url, /*index=*/-1, /*foreground=*/first,
++        /*group=*/std::nullopt, /*pinned=*/false,
++        NavigateParams::WindowAction::kNoAction);
++    first = false;
++    tabs::TabInterface* tab =
++        contents ? tabs::TabInterface::MaybeGetFromContents(contents) : nullptr;
++    TabState* state = tab ? TabState::From(tab) : nullptr;
++    if (state && !moved.custom_title.empty()) {
++      state->SetCustomTitle(moved.custom_title);
++    }
++  }
++  for (const MovedTab& moved : moved_tabs) {
++    tabs::TabInterface* tab = moved.handle.Get();
++    BrowserWindowInterface* browser =
++        tab ? tab->GetBrowserWindowInterface() : nullptr;
++    if (!browser) {
++      continue;
++    }
++    TabStripModel* model = browser->GetTabStripModel();
++    const int index = model->GetIndexOfTab(tab);
++    if (index != TabStripModel::kNoTab) {
++      // Moved, not closed: nothing to reopen here.
++      model->CloseWebContentsAt(index, TabCloseTypes::CLOSE_NONE);
++    }
++  }
++}
++
++}  // namespace
++
++void AddMoveToProfileMenu(ui::SimpleMenuModel& menu,
++                          TabStripModel& model,
++                          int index,
++                          std::unique_ptr<ui::SimpleMenuModel>& submenu) {
++  if (!model.ContainsIndex(index) || model.profile()->IsOffTheRecord()) {
++    return;
++  }
++  std::vector<ProfileAttributesEntry*> profiles = GetSwitchableProfiles();
++  std::erase_if(profiles, [&model](ProfileAttributesEntry* entry) {
++    return entry->GetPath() == model.profile()->GetPath();
++  });
++  if (profiles.empty()) {
++    return;
++  }
++  submenu = std::make_unique<MoveToProfileMenuModel>(model, index, profiles);
++  menu.AddSubMenu(tabs::CommandMoveToProfile,
++                  GetString(StringId::kMoveToProfile), submenu.get());
++}
++
++void MoveTabsToProfile(TabStripModel& model,
++                       const std::vector<int>& indices,
++                       const base::FilePath& path) {
++  std::vector<MovedTab> moved_tabs;
++  BrowserWindowInterface* from = nullptr;
++  for (int index : indices) {
++    if (!model.ContainsIndex(index)) {
++      continue;
++    }
++    tabs::TabInterface* tab = model.GetTabAtIndex(index);
++    content::WebContents* contents = tab->GetContents();
++    if (!contents) {
++      continue;
++    }
++    // Also for a hibernated tab, not loaded.
++    const content::NavigationEntry* entry =
++        contents->GetController().GetLastCommittedEntry();
++    const GURL url = entry && !entry->GetURL().is_empty()
++                         ? entry->GetURL()
++                         : contents->GetVisibleURL();
++    const TabState* state = TabState::From(tab);
++    moved_tabs.push_back(
++        {url, state ? state->custom_title() : std::u16string(),
++         tab->GetHandle()});
++    from = tab->GetBrowserWindowInterface();
++  }
++  if (!from || moved_tabs.empty()) {
++    return;
++  }
++  SwitchToProfile(from, path,
++                  base::BindOnce(&OpenMovedTabs, std::move(moved_tabs)));
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/move_to_profile.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_MOVE_TO_PROFILE_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_MOVE_TO_PROFILE_H_
++
++#include <memory>
++#include <vector>
++
++class TabStripModel;
++
++namespace base {
++class FilePath;
++}
++
++namespace ui {
++class SimpleMenuModel;
++}
++
++namespace helium_plus {
++
++// Adds to the context menu `menu` of the tab at `index` the "Move to Profile"
++// submenu, kept in `submenu`: one item per other profile. Nothing without
++// another profile.
++void AddMoveToProfileMenu(ui::SimpleMenuModel& menu,
++                          TabStripModel& model,
++                          int index,
++                          std::unique_ptr<ui::SimpleMenuModel>& submenu);
++
++// A tab can't change profile (separate cookies and accounts): the tabs at
++// `indices` of `model` open again, in that order, in the window of the
++// profile at `path`, which shows in place of theirs like with the profile
++// switcher (helium_plus/profile_switcher.h), then close here.
++void MoveTabsToProfile(TabStripModel& model,
++                       const std::vector<int>& indices,
++                       const base::FilePath& path);
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_MOVE_TO_PROFILE_H_
+--- a/chrome/browser/ui/helium_plus/profile_switcher.cc
++++ b/chrome/browser/ui/helium_plus/profile_switcher.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/helium_plus/profile_switcher.h"
+ 
+ #include <algorithm>
++#include <utility>
+ 
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+@@ -134,8 +135,13 @@ std::vector<ProfileAttributesEntry*> Get
+   return profiles;
+ }
+ 
+-void SwitchToProfile(BrowserWindowInterface* from, const base::FilePath& path) {
++void SwitchToProfile(BrowserWindowInterface* from,
++                     const base::FilePath& path,
++                     base::OnceCallback<void(BrowserWindowInterface*)> shown) {
+   if (path == from->GetProfile()->GetPath()) {
++    if (shown) {
++      std::move(shown).Run(nullptr);
++    }
+     return;
+   }
+   Profile* profile =
+@@ -154,19 +160,27 @@ void SwitchToProfile(BrowserWindowInterf
+     }
+     if (to) {
+       ShowInPlaceOf(from, to);
++      if (shown) {
++        std::move(shown).Run(to);
++      }
+       return;
+     }
+   }
+-  profiles::SwitchToProfile(path, /*always_create=*/false,
+-                            base::BindOnce(
+-                                [](base::WeakPtr<BrowserWindowInterface> from,
+-                                   int slot, BrowserWindowInterface* to) {
+-                                  if (from && to) {
+-                                    ReplicaWindows::SetSlot(to, slot);
+-                                    ShowInPlaceOf(from.get(), to);
+-                                  }
+-                                },
+-                                from->GetWeakPtr(), slot));
++  profiles::SwitchToProfile(
++      path, /*always_create=*/false,
++      base::BindOnce(
++          [](base::WeakPtr<BrowserWindowInterface> from, int slot,
++             base::OnceCallback<void(BrowserWindowInterface*)> shown,
++             BrowserWindowInterface* to) {
++            if (from && to) {
++              ReplicaWindows::SetSlot(to, slot);
++              ShowInPlaceOf(from.get(), to);
++            }
++            if (shown) {
++              std::move(shown).Run(from ? to : nullptr);
++            }
++          },
++          from->GetWeakPtr(), slot, std::move(shown)));
+ }
+ 
+ void SwitchToAdjacentProfile(BrowserWindowInterface* from, bool forward) {
+--- a/chrome/browser/ui/helium_plus/profile_switcher.h
++++ b/chrome/browser/ui/helium_plus/profile_switcher.h
+@@ -7,6 +7,8 @@
+ 
+ #include <vector>
+ 
++#include "base/functional/callback.h"
++
+ class BrowserWindowInterface;
+ class ProfileAttributesEntry;
+ 
+@@ -25,8 +27,12 @@ namespace helium_plus {
+ std::vector<ProfileAttributesEntry*> GetSwitchableProfiles();
+ 
+ // Shows the window of the profile at `path` in place of `from`, opening one if
+-// the profile has none.
+-void SwitchToProfile(BrowserWindowInterface* from, const base::FilePath& path);
++// the profile has none. Then calls `shown`, if any, with that window (null if
++// none could be shown).
++void SwitchToProfile(
++    BrowserWindowInterface* from,
++    const base::FilePath& path,
++    base::OnceCallback<void(BrowserWindowInterface*)> shown = {});
+ 
+ // Switches to the previous or next profile, if there is one.
+ void SwitchToAdjacentProfile(BrowserWindowInterface* from, bool forward);
+--- a/chrome/browser/ui/helium_plus/strings.cc
++++ b/chrome/browser/ui/helium_plus/strings.cc
+@@ -45,6 +45,8 @@ std::u16string GetString(StringId id) {
+       return french ? u"Ajouter à la vue fractionnée" : u"Add to Split View";
+     case StringId::kSplitPane:
+       return french ? u"volet $1 sur $2" : u"pane $1 of $2";
++    case StringId::kMoveToProfile:
++      return french ? u"Déplacer vers le profil" : u"Move to Profile";
+   }
+ }
+ 
+--- a/chrome/browser/ui/helium_plus/strings.h
++++ b/chrome/browser/ui/helium_plus/strings.h
+@@ -24,6 +24,7 @@ enum class StringId {
+   kGroupIconSvgFileTitle,
+   kAddToSplit,
+   kSplitPane,
++  kMoveToProfile,
+ };
+ 
+ std::u16string GetString(StringId id);
+--- a/chrome/browser/ui/helium_plus/tab_commands.cc
++++ b/chrome/browser/ui/helium_plus/tab_commands.cc
+@@ -108,6 +108,9 @@ bool IsTabCommandEnabled(const TabStripM
+       return HasUngroupedTabs(model);
+     case tabs::CommandAddToActiveSplit:
+       return GetSplitToJoin(model, index).has_value();
++    case tabs::CommandMoveToProfile:
++      // A submenu (helium_plus/move_to_profile.h).
++      return true;
+     default:
+       return false;
+   }
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -28,6 +28,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/helium_plus/move_to_profile.h"
+ #include "chrome/browser/ui/helium_plus/tab_commands.h"
+ #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_context_menu_delegate.h"
+@@ -630,6 +631,8 @@ void TabMenuModel::Build(int index) {
+ #endif
+ 
+   helium_plus::AddTabMenuItems(*this, *tab_strip_, index, indices.size());
++  helium_plus::AddMoveToProfileMenu(*this, *tab_strip_, index,
++                                    move_to_profile_submenu_);
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
+   AddItemWithStringId(TabStripModel::CommandDiscard,
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -102,6 +102,8 @@ class TabMenuModel : public ui::SimpleMe
+       add_to_existing_comparison_table_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> swap_with_split_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> split_layout_submenu_;
++  // Helium+
++  std::unique_ptr<ui::SimpleMenuModel> move_to_profile_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> arrange_split_view_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> glic_tab_sub_menu_model_;
+   std::unique_ptr<ui::SimpleMenuModel> send_tab_to_self_submenu_;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2950,6 +2950,7 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandReplaceAnchor:
+     case CommandCloseUngroupedTabs:
+     case CommandAddToActiveSplit:
++    case CommandMoveToProfile:
+       return helium_plus::IsTabCommandEnabled(*this, context_index, command_id);
+   }
+   SCOPED_CRASH_KEY_NUMBER("TabStripModel", "command_id", command_id);
+@@ -3166,6 +3167,7 @@ void TabStripModel::ExecuteContextMenuCo
+     case CommandReplaceAnchor:
+     case CommandCloseUngroupedTabs:
+     case CommandAddToActiveSplit:
++    case CommandMoveToProfile:
+       helium_plus::ExecuteTabCommand(*this, context_index, command_id);
+       break;
+ 
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -47,6 +47,7 @@ enum TabContextMenuCommand {
+   CommandReplaceAnchor,
+   CommandCloseUngroupedTabs,
+   CommandAddToActiveSplit,
++  CommandMoveToProfile,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
