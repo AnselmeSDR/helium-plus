@@ -225,6 +225,20 @@ two-line calls.
     focus again or the tab is activated (`TabLifecycleUnitSource::UpdateFocusedTabTo`). A discarded
     tab gets a new session id: `SessionServiceBrowserHelper` (`kReplaced`) saves its split again,
     otherwise the split came back broken after a restart.
+23. `split-grid.patch`: a split view holds up to 8 tabs (Chromium: exactly 2). Grid in columns of
+    2 rows; with an odd count the first tab spans the full height of the first column (3: A│B/C,
+    5: A│B/C│D/E, 8: 4×2), layout and resize handles in `views/helium_plus/split_grid_layout.cc`
+    (from `MultiContentsView`, which creates the 8 contents containers up front: Chromium
+    controllers copy that list once). Adding a pane: drag to the edge of the page, tab menu
+    "Ajouter à la vue fractionnée" (`tab_commands.cc`), `chrome.tabs.create({splitWithTabId})`
+    (`tabs_api.cc`). `TabStripModel`: a move within a grid reorders it (`ResplitImpl`); a pane
+    closed or moved out (`MoveWebContentsAt`, `KeepPanesLeftOnMove`) leaves the others in a grid
+    (`shrunk_splits_`, split again by `ResplitShrunkSplits` once the change is notified). Chromium
+    CHECKs on a size of 2 relaxed (split metrics, menus, swap, tab accessibility, link drop).
+    Saved with the session (membership per tab, visual data with the grid ratios appended at the
+    end of `kCommandSetSplitTabData`) and in tab restore. Vertical strip: the tabs of a grid share
+    rows, as many per row as fit, spread evenly (8 tabs fitting 6 per row: 4 + 4,
+    `split_tab_view.cc`).
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

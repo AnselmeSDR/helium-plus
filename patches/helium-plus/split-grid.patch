@@ -1,0 +1,2626 @@
+--- a/chrome/browser/extensions/api/bookmark_manager_private/bookmark_manager_private_api.cc
++++ b/chrome/browser/extensions/api/bookmark_manager_private/bookmark_manager_private_api.cc
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -66,7 +67,10 @@
+ #include "components/bookmarks/common/bookmark_pref_names.h"
+ #include "components/bookmarks/managed/managed_bookmark_service.h"
+ #include "components/prefs/pref_service.h"
++#include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/strings/grit/components_strings.h"
++#include "components/tabs/public/split_tab_data.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/undo/bookmark_undo_service.h"
+ #include "components/user_prefs/user_prefs.h"
+ #include "content/public/browser/navigation_handle.h"
+@@ -848,6 +852,16 @@ BookmarkManagerPrivateOpenInNewTabFuncti
+           new_tab_index == tab_strip->active_index()) {
+         return RespondNow(NoArguments());
+       }
++      // Helium+: a new pane in the active split.
++      if (const std::optional<split_tabs::SplitTabId> split_id =
++              tab_strip->GetActiveTab()->GetSplit()) {
++        if (tab_strip->GetSplitData(*split_id)->ListTabs().size() <
++            split_tabs::kMaxTabsInSplit) {
++          tab_strip->AddToExistingSplit(*split_id, {new_tab_index},
++                                        /*at_start=*/false);
++        }
++        return RespondNow(NoArguments());
++      }
+       tab_strip->AddToNewSplit(
+           {new_tab_index}, split_tabs::SplitTabVisualData(),
+           split_tabs::SplitTabCreatedSource::kExtensionsApi);
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -989,7 +989,12 @@ std::pair<int, const gfx::VectorIcon*> G
+   int string_id = IDS_CONTENT_CONTEXT_OPENLINKSPLITVIEW;
+   const gfx::VectorIcon* icon = &(
+       features::IsRoundedIconsEnabled() ? kSplitSceneIcon : kSplitSceneOldIcon);
+-  if (tab && tab->IsSplit()) {
++  // Helium+: a split with room left gets a new pane.
++  if (tab && tab->IsSplit() &&
++      browser->GetTabStripModel()
++              ->GetSplitData(tab->GetSplit().value())
++              ->ListTabs()
++              .size() >= split_tabs::kMaxTabsInSplit) {
+     split_tabs::SplitTabData* split_data =
+         browser->GetTabStripModel()->GetSplitData(tab->GetSplit().value());
+     switch (split_data->visual_data()->split_layout()) {
+@@ -5922,7 +5927,11 @@ void RenderViewContextMenu::OpenLinkInSp
+   TabStripModel* const tab_strip_model = browser->GetTabStripModel();
+   tabs::TabInterface* const source_tab =
+       tabs::TabInterface::MaybeGetFromContents(source_web_contents_);
+-  if (source_tab && source_tab->IsSplit()) {
++  // Helium+: a split with room left gets a new pane (below).
++  if (source_tab && source_tab->IsSplit() &&
++      tab_strip_model->GetSplitData(source_tab->GetSplit().value())
++              ->ListTabs()
++              .size() >= split_tabs::kMaxTabsInSplit) {
+     // Navigate the inactive tab to the URL
+     const split_tabs::SplitTabId split_id = source_tab->GetSplit().value();
+     for (tabs::TabInterface* tab :
+@@ -5962,9 +5971,15 @@ void RenderViewContextMenu::OpenLinkInSp
+     }
+ 
+     // Create split and activate new tab.
+-    tab_strip_model->AddToNewSplit(
+-        {new_tab_index}, split_tabs::SplitTabVisualData(layout),
+-        split_tabs::SplitTabCreatedSource::kLinkContextMenu);
++    if (source_tab && source_tab->IsSplit()) {
++      tab_strip_model->AddToExistingSplit(source_tab->GetSplit().value(),
++                                          {new_tab_index},
++                                          /*at_start=*/false);
++    } else {
++      tab_strip_model->AddToNewSplit(
++          {new_tab_index}, split_tabs::SplitTabVisualData(layout),
++          split_tabs::SplitTabCreatedSource::kLinkContextMenu);
++    }
+     tab_strip_model->ActivateTabAt(
+         tab_strip_model->GetIndexOfWebContents(new_web_contents));
+   }
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -1091,14 +1091,15 @@ class SessionRestoreImpl : public Browse
+     }
+ 
+     for (const auto& [split_id, tabs] : tabs_by_split_id) {
+-      // Only pairs are supported. A tab may have been skipped during restore.
+-      if (tabs.size() != 2) {
++      // Helium+: grids of up to kMaxTabsInSplit tabs. A tab may have been
++      // skipped during restore.
++      if (tabs.size() < 2 || tabs.size() > split_tabs::kMaxTabsInSplit) {
+         continue;
+       }
+-      std::vector<int> tab_indices = {
+-          browser->tab_strip_model()->GetIndexOfTab(tabs[0]),
+-          browser->tab_strip_model()->GetIndexOfTab(tabs[1]),
+-      };
++      std::vector<int> tab_indices;
++      for (tabs::TabInterface* tab : tabs) {
++        tab_indices.push_back(browser->tab_strip_model()->GetIndexOfTab(tab));
++      }
+       // RestoreSplit() needs tab-strip order, not restoration order.
+       std::ranges::sort(tab_indices);
+       browser->tab_strip_model()->RestoreSplit(
+@@ -1212,6 +1213,10 @@ class SessionRestoreImpl : public Browse
+       browser->GetTabStripModel()->UpdateSplitRatio(
+           session_split_tab->id_,
+           session_split_tab->split_visual_data_.split_ratio());
++      browser->GetTabStripModel()->UpdateSplitGridRatios(
++          session_split_tab->id_,
++          session_split_tab->split_visual_data_.line_ratios(),
++          session_split_tab->split_visual_data_.pane_ratios());
+     }
+   }
+ 
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3591,6 +3591,8 @@ static_library("ui") {
+       "views/helium_plus/group_tabs_popover.h",
+       "views/helium_plus/profile_switcher_view.cc",
+       "views/helium_plus/profile_switcher_view.h",
++      "views/helium_plus/split_grid_layout.cc",
++      "views/helium_plus/split_grid_layout.h",
+       "views/helium_plus/tab_rename_dialog.cc",
+       "views/helium_plus/tab_rename_dialog.h",
+       "views/helium/native_frame_materials.cc",
+--- a/chrome/browser/ui/bookmarks/bookmark_utils_desktop.cc
++++ b/chrome/browser/ui/bookmarks/bookmark_utils_desktop.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <iterator>
+ #include <numeric>
++#include <optional>
+ 
+ #include "base/containers/flat_set.h"
+ #include "base/functional/bind.h"
+@@ -49,6 +50,7 @@
+ #include "components/saved_tab_groups/public/saved_tab_group_tab.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "content/public/browser/navigation_handle.h"
+@@ -314,6 +316,16 @@ void DoOpen(BrowserWindowInterface* brow
+     if (opened_web_contents_index == TabStripModel::kNoTab) {
+       return;
+     }
++    // Helium+: a new pane in the active split.
++    if (const std::optional<split_tabs::SplitTabId> split_id =
++            model->GetActiveTab()->GetSplit()) {
++      if (model->GetSplitData(*split_id)->ListTabs().size() <
++          split_tabs::kMaxTabsInSplit) {
++        model->AddToExistingSplit(*split_id, {opened_web_contents_index},
++                                  /*at_start=*/false);
++      }
++      return;
++    }
+     model->AddToNewSplit(
+         {opened_web_contents_index}, split_tabs::SplitTabVisualData(),
+         split_tabs::SplitTabCreatedSource::kBookmarkContextMenu);
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -874,10 +874,9 @@ void BrowserCommandController::HandleCom
+       MoveActiveTabToNewWindow(browser_);
+       break;
+     case IDC_NEW_SPLIT_TAB:
+-      if (!browser_->tab_strip_model()->GetActiveTab()->IsSplit()) {
+-        NewSplitTab(browser_, split_tabs::SplitTabLayout::kSideBySide,
+-                    split_tabs::SplitTabCreatedSource::kKeyboardShortcut);
+-      }
++      // Helium+: adds a pane to the active split (see NewSplitTab()).
++      NewSplitTab(browser_, split_tabs::SplitTabLayout::kSideBySide,
++                  split_tabs::SplitTabCreatedSource::kKeyboardShortcut);
+       break;
+     case IDC_NAME_WINDOW:
+       PromptToNameWindow(browser_);
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -765,8 +765,13 @@ void ReloadInternal(BrowserWindowInterfa
+   // compare the number of model selected tabs wither either 2 or 1 depending on
+   // whether the active tab is split.
+   bool multiple_ui_tabs_selected =
+-      active_tab && tab_strip_model->selection_model().size() >
+-                        (active_tab->IsSplit() ? 2 : 1);
++      active_tab &&
++      tab_strip_model->selection_model().size() >
++          (active_tab->IsSplit() ? tab_strip_model
++                                       ->GetSplitData(*active_tab->GetSplit())
++                                       ->ListTabs()
++                                       .size()
++                                 : 1);
+ 
+   if (multiple_ui_tabs_selected) {
+     // Reloading a tab may change the selection (see crbug.com/339061099), so
+@@ -1497,7 +1502,11 @@ void CloseTab(BrowserWindowInterface* br
+   // the split.
+   const bool only_active_split_tab_selected =
+       active_tab->IsSplit() &&
+-      browser->GetTabStripModel()->selection_model().size() == 2;
++      browser->GetTabStripModel()->selection_model().size() ==
++          browser->GetTabStripModel()
++              ->GetSplitData(*active_tab->GetSplit())
++              ->ListTabs()
++              .size();
+ 
+   if (only_active_split_tab_selected) {
+     RecordTabCloseCount(1);
+@@ -1790,11 +1799,7 @@ void DuplicateSplit(BrowserWindowInterfa
+   int active_index = split_tabs::GetIndexOfLastActiveTab(model, split) +
+                      split_indices_range.length();
+   model->ActivateTabAt(active_index);
+-  // AddToNewSplit always creates a split with the active index so remove it
+-  // from the passed in indices.
+-  duplicated_tab_indices.erase(std::find(duplicated_tab_indices.begin(),
+-                                         duplicated_tab_indices.end(),
+-                                         active_index));
++  // Helium+: AddToNewSplit takes all the tabs of a grid.
+   model->AddToNewSplit(duplicated_tab_indices,
+                        split_tabs::SplitTabVisualData(
+                            *(model->GetSplitData(split)->visual_data())),
+@@ -1847,6 +1852,25 @@ void NewSplitTab(BrowserWindowInterface*
+               tab_strip_model->count() > 1
+           ? GURL(chrome::kChromeUISplitViewNewTabPageURL)
+           : chrome::ChromeUINewTabURLAsGURL();
++  // Helium+: a new pane at the end of the active split.
++  if (const std::optional<split_tabs::SplitTabId> split_id =
++          tab_strip_model->GetActiveTab()->GetSplit()) {
++    const std::vector<tabs::TabInterface*> split_tabs =
++        tab_strip_model->GetSplitData(*split_id)->ListTabs();
++    if (split_tabs.size() >= split_tabs::kMaxTabsInSplit) {
++      return;
++    }
++    const int index = tab_strip_model->GetIndexOfTab(split_tabs.back()) + 1;
++    tab_strip_model->delegate()->AddTabAt(
++        new_tab_url, index, /*foreground=*/false,
++        tab_strip_model->GetTabGroupForTab(active_index),
++        tab_strip_model->IsTabPinned(active_index));
++    tabs::TabInterface* const new_tab = tab_strip_model->GetTabAtIndex(index);
++    tab_strip_model->AddToExistingSplit(*split_id, {index},
++                                        /*at_start=*/false);
++    tab_strip_model->ActivateTab(new_tab);
++    return;
++  }
+   tab_strip_model->delegate()->AddTabAt(
+       new_tab_url, active_index + 1, true,
+       tab_strip_model->GetTabGroupForTab(active_index),
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -514,6 +514,23 @@ void BrowserLiveTabContext::ReconstructS
+   }
+ }
+ 
++void BrowserLiveTabContext::ReconstructGrid(
++    const std::vector<sessions::LiveTab*>& tabs,
++    split_tabs::SplitTabId split_id,
++    const split_tabs::SplitTabVisualData& visual_data) {
++  std::vector<int> indices;
++  for (sessions::LiveTab* tab : tabs) {
++    const int index = tab_strip_model_->GetIndexOfWebContents(
++        &static_cast<sessions::ContentLiveTab*>(tab)->GetWebContents());
++    if (index == TabStripModel::kNoTab) {
++      return;
++    }
++    indices.push_back(index);
++  }
++  std::ranges::sort(indices);
++  tab_strip_model_->RestoreSplit(split_id, indices, visual_data);
++}
++
+ void BrowserLiveTabContext::CloseTab() {
+   chrome::CloseTab(&*browser_);
+ }
+--- a/chrome/browser/ui/browser_live_tab_context.h
++++ b/chrome/browser/ui/browser_live_tab_context.h
+@@ -114,6 +114,10 @@ class BrowserLiveTabContext : public ses
+       sessions::LiveTab* trailing_tab,
+       split_tabs::SplitTabId split_id,
+       const split_tabs::SplitTabVisualData& visual_data) override;
++  void ReconstructGrid(
++      const std::vector<sessions::LiveTab*>& tabs,
++      split_tabs::SplitTabId split_id,
++      const split_tabs::SplitTabVisualData& visual_data) override;
+   void CloseTab() override;
+ 
+   // see Browser::Create
+--- a/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
++++ b/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
+@@ -74,6 +74,7 @@
+ #include "components/permissions/permission_request_manager.h"
+ #include "components/printing/browser/print_composite_client.h"
+ #include "components/split_tabs/split_tab_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/keyboard_event_processing_result.h"
+@@ -555,7 +556,12 @@ content::WebContents* BrowserWebContents
+   if (params.disposition == WindowOpenDisposition::NEW_SPLIT_VIEW && source) {
+     tabs::TabInterface* const source_tab =
+         tabs::TabInterface::MaybeGetFromContents(source);
+-    if (source_tab && source_tab->IsSplit()) {
++    // Helium+: a split with room left gets a new pane (see Navigate()).
++    if (source_tab && source_tab->IsSplit() &&
++        browser_->GetTabStripModel()
++                ->GetSplitData(source_tab->GetSplit().value())
++                ->ListTabs()
++                .size() >= split_tabs::kMaxTabsInSplit) {
+       const split_tabs::SplitTabId split_id = source_tab->GetSplit().value();
+       for (tabs::TabInterface* tab :
+            browser_->GetTabStripModel()->GetSplitData(split_id)->ListTabs()) {
+--- a/chrome/browser/ui/helium_plus/strings.cc
++++ b/chrome/browser/ui/helium_plus/strings.cc
+@@ -41,6 +41,10 @@ std::u16string GetString(StringId id) {
+       return french ? u"Fichier SVG…" : u"SVG File…";
+     case StringId::kGroupIconSvgFileTitle:
+       return french ? u"Choisir une icône SVG" : u"Choose an SVG Icon";
++    case StringId::kAddToSplit:
++      return french ? u"Ajouter à la vue fractionnée" : u"Add to Split View";
++    case StringId::kSplitPane:
++      return french ? u"volet $1 sur $2" : u"pane $1 of $2";
+   }
+ }
+ 
+--- a/chrome/browser/ui/helium_plus/strings.h
++++ b/chrome/browser/ui/helium_plus/strings.h
+@@ -22,6 +22,8 @@ enum class StringId {
+   kGroupIconFolder,
+   kGroupIconSvgFile,
+   kGroupIconSvgFileTitle,
++  kAddToSplit,
++  kSplitPane,
+ };
+ 
+ std::u16string GetString(StringId id);
+--- a/chrome/browser/ui/helium_plus/tab_commands.cc
++++ b/chrome/browser/ui/helium_plus/tab_commands.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/helium_plus/tab_commands.h"
+ 
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -15,6 +16,9 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/views/helium_plus/tab_rename_dialog.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/menus/simple_menu_model.h"
+@@ -71,6 +75,22 @@ void RenameTab(TabStripModel& model, int
+           tab->GetHandle()));
+ }
+ 
++// The split of the active tab, if `index` can join it.
++std::optional<split_tabs::SplitTabId> GetSplitToJoin(const TabStripModel& model,
++                                                     int index) {
++  const tabs::TabInterface* active_tab = model.GetActiveTab();
++  if (!active_tab || !active_tab->IsSplit() ||
++      model.GetTabAtIndex(index)->IsSplit()) {
++    return std::nullopt;
++  }
++  const split_tabs::SplitTabId split_id = active_tab->GetSplit().value();
++  if (model.GetSplitData(split_id)->ListTabs().size() >=
++      split_tabs::kMaxTabsInSplit) {
++    return std::nullopt;
++  }
++  return split_id;
++}
++
+ }  // namespace
+ 
+ bool IsTabCommandEnabled(const TabStripModel& model,
+@@ -86,6 +106,8 @@ bool IsTabCommandEnabled(const TabStripM
+       return CanReplaceAnchor(model, index);
+     case tabs::CommandCloseUngroupedTabs:
+       return HasUngroupedTabs(model);
++    case tabs::CommandAddToActiveSplit:
++      return GetSplitToJoin(model, index).has_value();
+     default:
+       return false;
+   }
+@@ -107,6 +129,10 @@ void ExecuteTabCommand(TabStripModel& mo
+     case tabs::CommandCloseUngroupedTabs:
+       CloseUngroupedTabs(model);
+       break;
++    case tabs::CommandAddToActiveSplit:
++      model.AddToExistingSplit(GetSplitToJoin(model, index).value(), {index},
++                               /*at_start=*/false);
++      break;
+     default:
+       break;
+   }
+@@ -129,6 +155,27 @@ void AddTabMenuItems(ui::SimpleMenuModel
+                GetString(StringId::kCloseUngroupedTabs));
+ }
+ 
++int GetSplitInsertionIndex(const TabStripModel& model,
++                           split_tabs::SplitTabId split_id,
++                           bool at_start) {
++  const std::vector<tabs::TabInterface*> split_tabs =
++      model.GetSplitData(split_id)->ListTabs();
++  return at_start ? model.GetIndexOfTab(split_tabs.front())
++                  : model.GetIndexOfTab(split_tabs.back()) + 1;
++}
++
++bool IsActiveSplitFull(const TabStripModel& model) {
++  const tabs::TabInterface* active_tab = model.GetActiveTab();
++  return active_tab && active_tab->IsSplit() &&
++         model.GetSplitData(active_tab->GetSplit().value())->ListTabs().size() >=
++             split_tabs::kMaxTabsInSplit;
++}
++
++void AddSplitMenuItem(ui::SimpleMenuModel& menu, size_t selected_count) {
++  menu.AddItem(tabs::CommandAddToActiveSplit, GetString(StringId::kAddToSplit));
++  menu.SetEnabledAt(menu.GetItemCount() - 1, selected_count == 1);
++}
++
+ void CloseUngroupedTabs(TabStripModel& model) {
+   std::vector<tabs::TabHandle> handles;
+   for (int i = 0; i < model.count(); ++i) {
+--- a/chrome/browser/ui/helium_plus/tab_commands.h
++++ b/chrome/browser/ui/helium_plus/tab_commands.h
+@@ -7,6 +7,7 @@
+ 
+ #include <cstddef>
+ 
++#include "components/split_tabs/split_tab_id.h"
+ #include "components/tabs/public/tab_context_menu_command.h"
+ 
+ class TabStripModel;
+@@ -34,6 +35,17 @@ void AddTabMenuItems(ui::SimpleMenuModel
+ // Closes the tabs that are neither pinned nor grouped, keeping the window open.
+ void CloseUngroupedTabs(TabStripModel& model);
+ 
++// Where a tab inserted before (`at_start`) or after the split `split_id` goes.
++int GetSplitInsertionIndex(const TabStripModel& model,
++                           split_tabs::SplitTabId split_id,
++                           bool at_start);
++
++// Whether the active tab is in a split that can't take another tab.
++bool IsActiveSplitFull(const TabStripModel& model);
++
++// "Add to Split View", for a tab that isn't split while the active one is.
++void AddSplitMenuItem(ui::SimpleMenuModel& menu, size_t selected_count);
++
+ }  // namespace helium_plus
+ 
+ #endif  // CHROME_BROWSER_UI_HELIUM_PLUS_TAB_COMMANDS_H_
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -1091,7 +1091,13 @@ base::WeakPtr<content::NavigationHandle>
+           params->source_contents ? tabs::TabInterface::MaybeGetFromContents(
+                                         params->source_contents)
+                                   : active_tab;
+-      if (new_tab_index != TabStripModel::kNoTab && active_tab &&
++      // Helium+: a new pane in the source's split.
++      if (new_tab_index != TabStripModel::kNoTab && source_tab &&
++          source_tab != new_tab && source_tab->IsSplit() && !new_tab->IsSplit()) {
++        tab_strip_model->AddToExistingSplit(source_tab->GetSplit().value(),
++                                            {new_tab_index},
++                                            /*at_start=*/false);
++      } else if (new_tab_index != TabStripModel::kNoTab && active_tab &&
+           active_tab != new_tab && !active_tab->IsSplit() &&
+           (!source_tab || !source_tab->IsSplit())) {
+         tab_strip_model->AddToNewSplit(
+--- a/chrome/browser/ui/tabs/split_tab_metrics.cc
++++ b/chrome/browser/ui/tabs/split_tab_metrics.cc
+@@ -94,7 +94,7 @@ void LogSplitViewCreatedUKM(const TabStr
+                             const SplitTabId split_id) {
+   SplitTabData* split_data = tab_strip_model->GetSplitData(split_id);
+   std::vector<tabs::TabInterface*> split_tabs = split_data->ListTabs();
+-  CHECK(split_tabs.size() == 2);
++  CHECK_GE(split_tabs.size(), 2u);
+ 
+   int64_t split_event_id = base::RandUint64();
+ 
+@@ -112,7 +112,7 @@ void LogSplitViewUpdatedUKM(const TabStr
+                             const SplitTabId split_id) {
+   SplitTabData* split_data = tab_strip_model->GetSplitData(split_id);
+   std::vector<tabs::TabInterface*> split_tabs = split_data->ListTabs();
+-  CHECK(split_tabs.size() == 2);
++  CHECK_GE(split_tabs.size(), 2u);
+ 
+   int64_t split_event_id = base::RandUint64();
+ 
+--- a/chrome/browser/ui/tabs/split_tab_swap_menu_model.cc
++++ b/chrome/browser/ui/tabs/split_tab_swap_menu_model.cc
+@@ -102,13 +102,14 @@ void SplitTabSwapMenuModel::ExecuteComma
+   split_tabs::SplitTabData* const split_tab_data =
+       tab_strip_model_->GetSplitData(*split_id);
+   std::vector<tabs::TabInterface*> tabs_in_split = split_tab_data->ListTabs();
+-  CHECK_EQ(tabs_in_split.size(), 2U);
++  CHECK_GE(tabs_in_split.size(), 2U);
+ 
++  // Helium+: the first and last panes of a grid.
+   if (id == CommandId::kSwapStartTab) {
+-    tab_strip_model_->UpdateTabInSplit(tabs_in_split[0], tab_index_,
++    tab_strip_model_->UpdateTabInSplit(tabs_in_split.front(), tab_index_,
+                                        TabStripModel::SplitUpdateType::kSwap);
+   } else if (id == CommandId::kSwapEndTab) {
+-    tab_strip_model_->UpdateTabInSplit(tabs_in_split[1], tab_index_,
++    tab_strip_model_->UpdateTabInSplit(tabs_in_split.back(), tab_index_,
+                                        TabStripModel::SplitUpdateType::kSwap);
+   }
+ }
+--- a/chrome/browser/ui/tabs/split_tab_util.cc
++++ b/chrome/browser/ui/tabs/split_tab_util.cc
+@@ -51,7 +51,7 @@ SplitTabActiveLocation GetLastActiveTabL
+   split_tabs::SplitTabData* const split_tab_data =
+       tab_strip_model->GetSplitData(split_id);
+   std::vector<tabs::TabInterface*> tabs_in_split = split_tab_data->ListTabs();
+-  CHECK_EQ(tabs_in_split.size(), 2U);
++  CHECK_GE(tabs_in_split.size(), 2U);
+ 
+   const int last_active_index =
+       GetIndexOfLastActiveTab(tab_strip_model, split_id);
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -356,6 +356,7 @@ void TabMenuModel::Build(int index) {
+       const int swap_with_split_index = GetItemCount() - 1;
+       SetEnabledAt(swap_with_split_index, num_tabs == 1);
+       SetElementIdentifierAt(swap_with_split_index, kSwapSplitTabsMenuItem);
++      helium_plus::AddSplitMenuItem(*this, num_tabs);
+     } else {
+       if (tabs::IsSplitViewHorizontalDirectAccessEnabledForTab()) {
+         split_layout_submenu_ =
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -324,6 +324,13 @@ struct TabStripModel::DetachNotification
+ 
+ constexpr int TabStripModel::kNoTab;
+ 
++TabStripModel::ShrunkSplit::ShrunkSplit(split_tabs::SplitTabId split_id)
++    : split_id(split_id) {}
++TabStripModel::ShrunkSplit::ShrunkSplit(ShrunkSplit&&) = default;
++TabStripModel::ShrunkSplit& TabStripModel::ShrunkSplit::operator=(
++    ShrunkSplit&&) = default;
++TabStripModel::ShrunkSplit::~ShrunkSplit() = default;
++
+ TabStripModel::TabStripModel(TabStripModelDelegate* delegate,
+                              Profile* profile,
+                              TabGroupModelFactory* group_model_factory)
+@@ -1069,6 +1076,8 @@ void TabStripModel::SendDetachWebContent
+       observer.TabStripEmpty();
+     }
+   }
++
++  ResplitShrunkSplits();
+ }
+ 
+ void TabStripModel::ActivateTabAt(int index,
+@@ -1115,7 +1124,9 @@ int TabStripModel::MoveWebContentsAt(int
+ 
+   std::optional<tab_groups::TabGroupId> group =
+       GetGroupToAssign(index, to_position);
++  KeepPanesLeftOnMove(index, to_position, group, pinned);
+   MoveTabToIndexImpl(index, to_position, group, pinned, select_after_move);
++  ResplitShrunkSplits();
+ 
+   return to_position;
+ }
+@@ -1131,7 +1142,9 @@ int TabStripModel::MoveWebContentsAt(
+ 
+   bool pinned = IsTabPinned(index);
+   to_position = ConstrainMoveIndex(to_position, pinned);
++  KeepPanesLeftOnMove(index, to_position, group, pinned);
+   MoveTabToIndexImpl(index, to_position, group, pinned, select_after_move);
++  ResplitShrunkSplits();
+   return to_position;
+ }
+ 
+@@ -1635,7 +1648,9 @@ void TabStripModel::DeselectTabAt(int in
+     // If the tab is already deselected, no need to do anything.
+     return;
+   } else if (selection_model_.size() == 1 ||
+-             (selection_model_.size() == 2 && tab->GetSplit().has_value())) {
++             (tab->GetSplit().has_value() &&
++              selection_model_.size() ==
++                  GetSplitData(tab->GetSplit().value())->ListTabs().size())) {
+     // One tab must be selected and this tab is currently selected so we can't
+     // unselect it.
+     return;
+@@ -2034,7 +2049,15 @@ void TabStripModel::UpdateTabInSplit(tab
+ void TabStripModel::ReverseTabsInSplit(split_tabs::SplitTabId split_id) {
+   ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+ 
+-  tabs::TabInterface* first_tab = GetSplitData(split_id)->ListTabs()[0];
++  std::vector<tabs::TabInterface*> split_tabs =
++      GetSplitData(split_id)->ListTabs();
++  if (split_tabs.size() > 2) {
++    // Helium+: a grid is reversed by splitting its tabs again.
++    std::ranges::reverse(split_tabs);
++    ResplitImpl(split_id, split_tabs, *GetSplitData(split_id)->visual_data());
++    return;
++  }
++  tabs::TabInterface* first_tab = split_tabs[0];
+   const int index_of_first_tab_in_split = GetIndexOfTab(first_tab);
+   MoveTabToIndexImpl(index_of_first_tab_in_split,
+                      index_of_first_tab_in_split + 1, first_tab->GetGroup(),
+@@ -2047,7 +2070,7 @@ split_tabs::SplitTabId TabStripModel::Ad
+     split_tabs::SplitTabCreatedSource source) {
+   ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+ 
+-  CHECK(indices.size() == 1u || indices.size() == 2u)
++  CHECK(!indices.empty() && indices.size() <= split_tabs::kMaxTabsInSplit)
+       << "Invalid index count: " << indices.size();
+ 
+   // If there is only one entry in `indices`, use the active index as the pivot
+@@ -2090,7 +2113,8 @@ void TabStripModel::RestoreSplit(split_t
+                                  split_tabs::SplitTabVisualData visual_data) {
+   ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+   CHECK(std::ranges::is_sorted(indices));
+-  CHECK_EQ(indices.size(), 2u);
++  CHECK_GE(indices.size(), 2u);
++  CHECK_LE(indices.size(), split_tabs::kMaxTabsInSplit);
+ 
+   // Ideally these are consecutive indices from the restore flow and the pivot
+   // index does not matter. However, given there are numerous steps in restore
+@@ -2102,6 +2126,61 @@ void TabStripModel::RestoreSplit(split_t
+   CompleteModelUpdateTransaction();
+ }
+ 
++void TabStripModel::AddToExistingSplit(split_tabs::SplitTabId split_id,
++                                       const std::vector<int>& indices,
++                                       bool at_start) {
++  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
++
++  std::vector<tabs::TabInterface*> split_tabs =
++      GetSplitData(split_id)->ListTabs();
++  CHECK_LE(split_tabs.size() + indices.size(), split_tabs::kMaxTabsInSplit);
++  std::vector<tabs::TabInterface*> added_tabs = GetTabsAtIndices(indices);
++  split_tabs.insert(at_start ? split_tabs.begin() : split_tabs.end(),
++                    added_tabs.begin(), added_tabs.end());
++
++  // The grid changes shape: its panes start with equal sizes.
++  split_tabs::SplitTabVisualData visual_data =
++      *GetSplitData(split_id)->visual_data();
++  visual_data.set_grid_ratios({}, {});
++  ResplitImpl(split_id, split_tabs, visual_data);
++}
++
++void TabStripModel::UpdateSplitGridRatios(split_tabs::SplitTabId split_id,
++                                          std::vector<double> line_ratios,
++                                          std::vector<double> pane_ratios,
++                                          bool is_intermediate) {
++  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
++  split_tabs::SplitTabData* split_data = GetSplitData(split_id);
++  if (split_data->visual_data()->line_ratios() == line_ratios &&
++      split_data->visual_data()->pane_ratios() == pane_ratios) {
++    return;
++  }
++
++  split_tabs::SplitTabVisualData old_visual_data = *split_data->visual_data();
++  split_data->visual_data()->set_grid_ratios(std::move(line_ratios),
++                                             std::move(pane_ratios));
++
++  NotifySplitTabVisualsChanged(
++      split_id, old_visual_data, *split_data->visual_data(),
++      SplitTabChange::SplitVisualChangeReason::kRatioUpdated, is_intermediate);
++}
++
++void TabStripModel::SwapTabsInSplit(split_tabs::SplitTabId split_id,
++                                    size_t first,
++                                    size_t second) {
++  ReentrancyCheck reentrancy_check(&reentrancy_guard_);
++
++  std::vector<tabs::TabInterface*> split_tabs =
++      GetSplitData(split_id)->ListTabs();
++  CHECK_LT(first, split_tabs.size());
++  CHECK_LT(second, split_tabs.size());
++  if (first == second) {
++    return;
++  }
++  std::swap(split_tabs[first], split_tabs[second]);
++  ResplitImpl(split_id, split_tabs, *GetSplitData(split_id)->visual_data());
++}
++
+ tab_groups::TabGroupId TabStripModel::AddToNewGroup(
+     const std::vector<int> indices,
+     bool is_ephemeral) {
+@@ -2874,6 +2953,7 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandRenameTab:
+     case CommandReplaceAnchor:
+     case CommandCloseUngroupedTabs:
++    case CommandAddToActiveSplit:
+       return helium_plus::IsTabCommandEnabled(*this, context_index, command_id);
+   }
+   SCOPED_CRASH_KEY_NUMBER("TabStripModel", "command_id", command_id);
+@@ -3089,6 +3169,7 @@ void TabStripModel::ExecuteContextMenuCo
+     case CommandRenameTab:
+     case CommandReplaceAnchor:
+     case CommandCloseUngroupedTabs:
++    case CommandAddToActiveSplit:
+       helium_plus::ExecuteTabCommand(*this, context_index, command_id);
+       break;
+ 
+@@ -4890,6 +4971,88 @@ void TabStripModel::RemoveSplitImpl(
+   NotifySplitTabRemoved(split_id, tabs_with_indices, reason);
+ }
+ 
++void TabStripModel::ResplitImpl(split_tabs::SplitTabId split_id,
++                                const std::vector<tabs::TabInterface*>& tabs,
++                                split_tabs::SplitTabVisualData visual_data) {
++  CHECK_GE(tabs.size(), 2u);
++  if (contents_data_->GetSplitTabCollection(split_id)) {
++    RemoveSplitImpl(split_id,
++                    SplitTabChange::SplitTabRemoveReason::kSplitTabUpdated);
++  }
++
++  // Line the tabs up from the first one in the strip, keeping its group and
++  // pinned state: the tabs already placed are never moved again.
++  tabs::TabInterface* const first_tab = *std::ranges::min_element(
++      tabs, {}, [this](tabs::TabInterface* tab) { return GetIndexOfTab(tab); });
++  const int start_index = GetIndexOfTab(first_tab);
++  const std::optional<tab_groups::TabGroupId> group = first_tab->GetGroup();
++  const bool pinned = first_tab->IsPinned();
++  std::vector<int> indices;
++  for (size_t i = 0; i < tabs.size(); ++i) {
++    const int index = start_index + static_cast<int>(i);
++    MoveTabToIndexImpl(GetIndexOfTab(tabs[i]), index, group, pinned,
++                       /*select_after_move=*/false);
++    indices.push_back(index);
++  }
++
++  AddToSplitImpl(split_id, indices, start_index, visual_data,
++                 SplitTabChange::SplitTabAddReason::kSplitTabUpdated);
++}
++
++void TabStripModel::KeepPanesLeft(tabs::TabInterface* leaving_tab) {
++  const split_tabs::SplitTabId split_id = leaving_tab->GetSplit().value();
++  const std::vector<tabs::TabInterface*> split_tabs =
++      GetSplitData(split_id)->ListTabs();
++  if (split_tabs.size() <= 2) {
++    return;
++  }
++  ShrunkSplit shrunk_split(split_id);
++  for (tabs::TabInterface* tab : split_tabs) {
++    if (tab != leaving_tab) {
++      shrunk_split.tabs.push_back(tab->GetHandle());
++    }
++  }
++  shrunk_split.visual_data = *GetSplitData(split_id)->visual_data();
++  shrunk_split.visual_data.set_grid_ratios({}, {});
++  shrunk_splits_.push_back(std::move(shrunk_split));
++}
++
++void TabStripModel::KeepPanesLeftOnMove(
++    int index,
++    int to_position,
++    const std::optional<tab_groups::TabGroupId>& group,
++    bool pinned) {
++  tabs::TabInterface* const tab = GetTabAtIndex(index);
++  if (!tab->IsSplit()) {
++    return;
++  }
++  // A move within the grid only reorders it (see MoveTabToIndexImpl()).
++  if (GetTabAtIndex(to_position)->GetSplit() == tab->GetSplit() &&
++      tab->GetGroup() == group && tab->IsPinned() == pinned) {
++    return;
++  }
++  KeepPanesLeft(tab);
++}
++
++void TabStripModel::ResplitShrunkSplits() {
++  if (closing_all_) {
++    shrunk_splits_.clear();
++    return;
++  }
++  for (ShrunkSplit& shrunk_split : std::exchange(shrunk_splits_, {})) {
++    std::vector<tabs::TabInterface*> tabs;
++    for (const tabs::TabHandle& handle : shrunk_split.tabs) {
++      tabs::TabInterface* const tab = handle.Get();
++      if (tab && GetIndexOfTab(tab) != kNoTab && !tab->IsSplit()) {
++        tabs.push_back(tab);
++      }
++    }
++    if (tabs.size() >= 2) {
++      ResplitImpl(shrunk_split.split_id, tabs, shrunk_split.visual_data);
++    }
++  }
++}
++
+ void TabStripModel::UpdateTabInSplitImpl(tabs::TabInterface* split_tab,
+                                          int update_index,
+                                          SplitUpdateType update_type) {
+@@ -4976,6 +5139,8 @@ void TabStripModel::UpdateTabInSplitImpl
+   for (tabs::TabInterface* tab : tabs_to_split) {
+     split_indices.emplace_back(GetIndexOfTab(tab));
+   }
++  // Helium+: more than one other pane in a grid.
++  std::ranges::sort(split_indices);
+ 
+   // Insert the active index into the sorted `indices`.
+   auto position =
+@@ -5217,9 +5382,17 @@ std::unique_ptr<tabs::TabModel> TabStrip
+       DetermineNewSelectedIndex(tab_to_remove);
+   const bool removed_tab_is_split = tab_to_remove->IsSplit();
+   if (removed_tab_is_split) {
+-    next_selected_index = GetIndexOfTab(
+-        GetSplitData(tab_to_remove->GetSplit().value())->ListTabs()[0]);
+-    RemoveSplitImpl(tab_to_remove->GetSplit().value(),
++    const split_tabs::SplitTabId split_id = tab_to_remove->GetSplit().value();
++    std::vector<tabs::TabInterface*> split_tabs =
++        GetSplitData(split_id)->ListTabs();
++    // Helium+: the pane after the removed one becomes active (it takes its
++    // index), or the one before for the last pane.
++    const auto removed = std::ranges::find(split_tabs, tab_to_remove);
++    next_selected_index = std::next(removed) != split_tabs.end()
++                              ? index
++                              : GetIndexOfTab(*std::prev(removed));
++    KeepPanesLeft(tab_to_remove);
++    RemoveSplitImpl(split_id,
+                     SplitTabChange::SplitTabRemoveReason::kSplitTabRemoved);
+   }
+ 
+@@ -5298,6 +5471,23 @@ void TabStripModel::MoveTabToIndexImpl(
+ 
+   MaybeRemoveSplitsForMove(initial_index, final_index, group, pin);
+ 
++  // Helium+: a move within a grid reorders its panes.
++  if (initial_index != final_index && tab->GetSplit().has_value()) {
++    const split_tabs::SplitTabId split_id = tab->GetSplit().value();
++    std::vector<tabs::TabInterface*> split_tabs =
++        GetSplitData(split_id)->ListTabs();
++    if (split_tabs.size() > 2) {
++      const int first_index = GetIndexOfTab(split_tabs.front());
++      std::erase(split_tabs, tab);
++      const int position = std::clamp(final_index - first_index, 0,
++                                      static_cast<int>(split_tabs.size()));
++      split_tabs.insert(split_tabs.begin() + position, tab);
++      ResplitImpl(split_id, split_tabs,
++                  *GetSplitData(split_id)->visual_data());
++      return;
++    }
++  }
++
+   // If the tab still has a split id after MaybeRemoveSplitsForMove, then it
+   // must be a move within a split.
+   bool move_within_split =
+@@ -6376,7 +6566,9 @@ void TabStripModel::CreateHistoricalSpli
+       }
+     }
+     for (const auto& [split_id, count] : split_closing_counts) {
+-      if (count == 2) {
++      if (static_cast<size_t>(count) ==
++          contents_data_->GetSplitTabCollection(split_id)
++              ->TabCountRecursive()) {
+         delegate_->CreateHistoricalSplit(split_id);
+       }
+     }
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -673,6 +673,24 @@ class TabStripModel {
+       split_tabs::SplitTabVisualData visual_data,
+       split_tabs::SplitTabCreatedSource source);
+ 
++  // Helium+: adds the tabs at `indices` to the split `split_id`, before its
++  // first tab if `at_start`, else after its last one.
++  void AddToExistingSplit(split_tabs::SplitTabId split_id,
++                          const std::vector<int>& indices,
++                          bool at_start);
++
++  // Helium+: sets the shares of the lines and panes of the grid of the split
++  // `split_id` (see SplitTabVisualData::set_grid_ratios()).
++  void UpdateSplitGridRatios(split_tabs::SplitTabId split_id,
++                             std::vector<double> line_ratios,
++                             std::vector<double> pane_ratios,
++                             bool is_intermediate = false);
++
++  // Helium+: swaps the panes at `first` and `second` in the split `split_id`.
++  void SwapTabsInSplit(split_tabs::SplitTabId split_id,
++                       size_t first,
++                       size_t second);
++
+   // Adds all the tabs in `indices` to a split with `split_id` and
+   // `visual_data`. `pivot_index` is the index in indices to determine the
+   // properties of the split like group, pin, destination index.
+@@ -1257,6 +1275,25 @@ class TabStripModel {
+   void RemoveSplitImpl(split_tabs::SplitTabId split_id,
+                        SplitTabChange::SplitTabRemoveReason reason);
+ 
++  // Helium+: splits `tabs` again under `split_id`, in this order, after moving
++  // them next to each other. Ends the split first if it still exists.
++  void ResplitImpl(split_tabs::SplitTabId split_id,
++                   const std::vector<tabs::TabInterface*>& tabs,
++                   split_tabs::SplitTabVisualData visual_data);
++
++  // Helium+: once `leaving_tab` leaves its grid, the panes left form a grid
++  // again (see ResplitShrunkSplits()).
++  void KeepPanesLeft(tabs::TabInterface* leaving_tab);
++  // Helium+: the same for the tab at `index` if moving it to `to_position`
++  // takes it out of its grid.
++  void KeepPanesLeftOnMove(int index,
++                           int to_position,
++                           const std::optional<tab_groups::TabGroupId>& group,
++                           bool pinned);
++  // Helium+: splits again the panes left in splits that lost one of their
++  // tabs (`shrunk_splits_`), once the removals are notified.
++  void ResplitShrunkSplits();
++
+   void UpdateTabInSplitImpl(tabs::TabInterface* split_tab,
+                             int update_index,
+                             SplitUpdateType update_type);
+@@ -1522,6 +1559,19 @@ class TabStripModel {
+   // True if all tabs are currently being closed via CloseAllTabs.
+   bool closing_all_ = false;
+ 
++  // Helium+: splits of more than two tabs that lost one, with the panes left.
++  struct ShrunkSplit {
++    explicit ShrunkSplit(split_tabs::SplitTabId split_id);
++    ShrunkSplit(ShrunkSplit&&);
++    ShrunkSplit& operator=(ShrunkSplit&&);
++    ~ShrunkSplit();
++
++    split_tabs::SplitTabId split_id;
++    std::vector<tabs::TabHandle> tabs;
++    split_tabs::SplitTabVisualData visual_data;
++  };
++  std::vector<ShrunkSplit> shrunk_splits_;
++
+   // This must be kept in sync with `contents_data_`.
+   tabs::TabStripModelSelectionState selection_model_;
+ 
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -108,6 +108,7 @@
+ #include "chrome/browser/ui/global_error/global_error.h"
+ #include "chrome/browser/ui/global_error/global_error_service.h"
+ #include "chrome/browser/ui/global_error/global_error_service_factory.h"
++#include "chrome/browser/ui/helium_plus/tab_commands.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+@@ -2687,7 +2688,8 @@ void BrowserView::OnActiveTabChanged(con
+       GetWidget()->GetFocusManager()->ClearFocus();
+     }
+ 
+-    multi_contents_view_->GetInactiveContentsView()->SetWebContents(nullptr);
++    // Helium+: every other pane of a grid.
++    multi_contents_view_->ClearInactiveWebContents();
+     active_contents_view->SetWebContents(nullptr);
+   }
+ 
+@@ -2856,7 +2858,17 @@ void BrowserView::SetContentsSize(const
+ 
+   // If in split view, the size diff needs to be scaled by the split ratio to
+   // account for the combined width of both contents views.
+-  if (multi_contents_view_->IsInSplitView()) {
++  // Helium+: in a grid, the share of the window that the active pane takes.
++  if (const ContentsContainerView* const active_container =
++          multi_contents_view_->GetActiveContentsContainerView();
++      multi_contents_view_->IsInSplitView() &&
++      multi_contents_view_->contents_container_views()[2]->GetVisible() &&
++      active_container->width() > 0 && active_container->height() > 0) {
++    width_diff = std::round(width_diff * multi_contents_view_->width() /
++                            static_cast<double>(active_container->width()));
++    height_diff = std::round(height_diff * multi_contents_view_->height() /
++                             static_cast<double>(active_container->height()));
++  } else if (multi_contents_view_->IsInSplitView()) {
+     const double split_ratio = multi_contents_view_->GetSplitRatio();
+     CHECK(split_ratio > 0.0 && split_ratio < 1.0);
+     const double divider = multi_contents_view_->GetActiveIndex() == 0
+@@ -3192,7 +3204,8 @@ TabDragTarget* BrowserView::GetTabDragTa
+       return target;
+     }
+   }
+-  if (multi_contents_view_->IsInSplitView() ||
++  // Helium+: a split takes new panes while it has room.
++  if (helium_plus::IsActiveSplitFull(*browser_->GetTabStripModel()) ||
+       !multi_contents_view_->IsDragAndDropEnabled()) {
+     return nullptr;
+   }
+@@ -3995,8 +4008,9 @@ void BrowserView::PreHandleDragUpdate(co
+     // Read the split state from the active tab because when BrowserView is in
+     // full screen it may not be rendering a split, even though the active tab
+     // is in a split.
++    // Helium+: a split takes new panes while it has room.
+     const bool is_in_split_view =
+-        browser_->GetTabStripModel()->GetActiveTab()->IsSplit();
++        helium_plus::IsActiveSplitFull(*browser_->GetTabStripModel());
+     const gfx::Point point_in_multi_contents_view =
+         views::View::ConvertPointToTarget(GetActiveContentsContainerView(),
+                                           multi_contents_view_,
+@@ -5065,6 +5079,8 @@ void BrowserView::ShowSplitView(bool foc
+   for (size_t i = 0; tabs::TabInterface* tab : split_tabs) {
+     multi_contents_view_->SetWebContentsAtIndex(tab->GetContents(), i++);
+   }
++  // Helium+: the panes of a previous, larger grid.
++  multi_contents_view_->HidePanesFrom(split_tabs.size());
+   const int first_split_tab_index =
+       browser_->GetTabStripModel()->GetIndexOfTab(split_tabs[0]);
+   const int relative_active_position = active_index - first_split_tab_index;
+@@ -5111,18 +5127,22 @@ void BrowserView::UpdateActiveTabInSplit
+   // However, there are cases where inactive tab can be activated without a
+   // focus change e.g. using tab shortcuts and in these cases update focus.
+   if (GetWidget()->IsActive() &&
+-      multi_contents_view_->GetInactiveContentsView()->HasFocus()) {
++      multi_contents_view_->InactiveContentsViewHasFocus()) {
+     multi_contents_view_->GetActiveContentsView()->RequestFocus();
+   }
+ }
+ 
+ bool BrowserView::IsTabChangeInSplitView(content::WebContents* old_contents,
+                                          content::WebContents* new_contents) {
++  // Helium+: any other pane of a grid.
++  const ContentsContainerView* const new_container =
++      multi_contents_view_->GetContentsContainerViewFor(new_contents);
+   return multi_contents_view_->IsInSplitView() &&
+          multi_contents_view_->GetActiveContentsView()->web_contents() ==
+              old_contents &&
+-         multi_contents_view_->GetInactiveContentsView()->web_contents() ==
+-             new_contents;
++         new_container && new_container->GetVisible() &&
++         new_container !=
++             multi_contents_view_->GetActiveContentsContainerView();
+ }
+ 
+ void BrowserView::UpdateTabModalDialogHost() {
+@@ -5171,10 +5191,15 @@ void BrowserView::MaybeUpdateStoredFocus
+ std::vector<ContentsWebView*> BrowserView::GetAllVisibleContentsWebViews() {
+   std::vector<ContentsWebView*> contents_views;
+   contents_views.push_back(multi_contents_view_->GetActiveContentsView());
+-  ContentsWebView* inactive_contents_view =
+-      multi_contents_view_->GetInactiveContentsView();
++  // Helium+: all the panes of a grid.
+   if (multi_contents_view_->IsInSplitView()) {
+-    contents_views.push_back(inactive_contents_view);
++    for (ContentsContainerView* container :
++         multi_contents_view_->contents_container_views()) {
++      if (container->GetVisible() &&
++          container->contents_view() != contents_views.front()) {
++        contents_views.push_back(container->contents_view());
++      }
++    }
+   }
+   return contents_views;
+ }
+--- a/chrome/browser/ui/views/frame/multi_contents_resize_area.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_resize_area.cc
+@@ -83,7 +83,7 @@ END_METADATA
+ MultiContentsResizeArea::MultiContentsResizeArea(
+     MultiContentsView* multi_contents_view,
+     TabStripModel* tab_strip_model)
+-    : ResizeArea(multi_contents_view),
++    : ResizeArea(this),
+       multi_contents_view_(multi_contents_view),
+       split_tab_menu_(std::make_unique<SplitTabMenuModel>(
+           tab_strip_model,
+@@ -119,6 +119,11 @@ void MultiContentsResizeArea::OnSplitTab
+   CancelMenu();
+ }
+ 
++void MultiContentsResizeArea::OnResize(int resize_amount, bool done_resizing) {
++  multi_contents_view_->OnGridResize(grid_handle_, resize_amount,
++                                     done_resizing);
++}
++
+ void MultiContentsResizeArea::SetLayout(split_tabs::SplitTabLayout layout) {
+   Axis old_axis = axis();
+   set_axis(layout == split_tabs::SplitTabLayout::kSideBySide ? Axis::kHorizontal
+@@ -160,7 +165,7 @@ bool MultiContentsResizeArea::OnKeyPress
+     return false;
+   }
+ 
+-  multi_contents_view_->OnResize(resize_amount, true);
++  multi_contents_view_->OnGridResize(grid_handle_, resize_amount, true);
+ 
+   if ((axis() == Axis::kHorizontal ? multi_contents_view_->width()
+                                    : multi_contents_view_->height()) > 0) {
+--- a/chrome/browser/ui/views/frame/multi_contents_resize_area.h
++++ b/chrome/browser/ui/views/frame/multi_contents_resize_area.h
+@@ -14,6 +14,7 @@
+ #include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/controls/resize_area.h"
++#include "ui/views/controls/resize_area_delegate.h"
+ #include "ui/views/focus/focus_manager.h"
+ #include "ui/views/view.h"
+ 
+@@ -55,6 +56,7 @@ class MultiContentsResizeHandle : public
+ // ResizeArea meant to draw in between WebContents within a MultiContentsView,
+ // and responsiveness to key events via a focusable MultiContentsResizeHandle.
+ class MultiContentsResizeArea : public views::ResizeArea,
++                                public views::ResizeAreaDelegate,
+                                 public views::ContextMenuController,
+                                 public TabStripModelObserver {
+   METADATA_HEADER(MultiContentsResizeArea, ResizeArea)
+@@ -71,6 +73,12 @@ class MultiContentsResizeArea : public v
+ 
+   void SetLayout(split_tabs::SplitTabLayout layout);
+ 
++  // Helium+: the place of the handle in a grid (see helium_plus::SplitGrid).
++  void set_grid_handle(size_t grid_handle) { grid_handle_ = grid_handle; }
++
++  // views::ResizeAreaDelegate:
++  void OnResize(int resize_amount, bool done_resizing) override;
++
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+       TabStripModel* tab_strip_model,
+@@ -105,6 +113,7 @@ class MultiContentsResizeArea : public v
+   std::pair<int, int> GetAccessibleAlertStringIds();
+ 
+   raw_ptr<MultiContentsView> multi_contents_view_;
++  size_t grid_handle_ = 0;
+   raw_ptr<MultiContentsResizeHandle> resize_handle_;
+ 
+   raw_ptr<views::FlexLayout> flex_layout_manager_;
+--- a/chrome/browser/ui/views/frame/multi_contents_view.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view.cc
+@@ -107,6 +107,22 @@ MultiContentsView::MultiContentsView(
+       AddChildView(std::make_unique<ContentsContainerView>(browser_view_)));
+   contents_container_views_[1]->SetVisible(false);
+ 
++  // Helium+: the panes and handles of a grid, created up front as the window
++  // features take the list of containers once.
++  resize_areas_.push_back(resize_area_);
++  for (size_t i = 2; i < split_tabs::kMaxTabsInSplit; ++i) {
++    resize_areas_.push_back(AddChildView(
++        std::make_unique<MultiContentsResizeArea>(
++            this, browser_view_->browser()->tab_strip_model())));
++    resize_areas_.back()->SetVisible(false);
++    contents_container_views_.push_back(
++        AddChildView(std::make_unique<ContentsContainerView>(browser_view_)));
++    contents_container_views_.back()->SetVisible(false);
++  }
++  for (size_t i = 0; i < resize_areas_.size(); ++i) {
++    resize_areas_[i]->set_grid_handle(i);
++  }
++
+   drop_target_view_ =
+       AddChildView(std::make_unique<MultiContentsDropTargetView>());
+   drop_target_controller_ =
+@@ -208,6 +224,7 @@ MultiContentsView::~MultiContentsView()
+   drop_target_view_ = nullptr;
+   lens_overlay_view_ = nullptr;
+   resize_area_ = nullptr;
++  resize_areas_.clear();
+   contents_separators_.Reset();
+   background_view_ = nullptr;
+   RemoveAllChildViews();
+@@ -277,13 +294,16 @@ bool MultiContentsView::IsInSplitView()
+ void MultiContentsView::SetWebContentsAtIndex(
+     content::WebContents* web_contents,
+     int index) {
+-  CHECK(index >= 0 && index < 2);
++  CHECK(index >= 0 &&
++        static_cast<size_t>(index) < contents_container_views_.size());
+   contents_container_views_[index]->contents_view()->SetWebContents(
+       web_contents);
+ 
+-  if (index == 1 && !contents_container_views_[1]->GetVisible()) {
+-    contents_container_views_[1]->SetVisible(true);
+-    resize_area_->SetVisible(true);
++  // Helium+: any pane of a grid.
++  if (index >= 1 && !contents_container_views_[index]->GetVisible()) {
++    contents_container_views_[index]->SetVisible(true);
++    pane_count_ = std::max(pane_count_, static_cast<size_t>(index) + 1);
++    UpdateGridHandles();
+     UpdateContentsBorderAndOverlay();
+   }
+ 
+@@ -301,8 +321,8 @@ void MultiContentsView::ShowSplitView(
+     // visibility.
+     visual_data_ = visual_data;
+     contents_container_views_[1]->SetVisible(true);
+-    resize_area_->SetVisible(true);
+-    resize_area_->SetLayout(visual_data.split_layout());
++    pane_count_ = std::max<size_t>(pane_count_, 2);
++    UpdateGridHandles();
+     UpdateContentsBorderAndOverlay();
+   } else {
+     // If the split view is visible, update the split visual data.
+@@ -316,11 +336,16 @@ void MultiContentsView::CloseSplitView()
+   }
+ 
+   if (active_index_ != 0) {
+-    SwapContentsInSplitView();
++    SwapContainers(0, active_index_);
++    active_index_ = 0;
+   }
+-  contents_container_views_[1]->contents_view()->SetWebContents(nullptr);
+-  contents_container_views_[1]->SetVisible(false);
+-  resize_area_->SetVisible(false);
++  // Helium+: all the other panes of a grid.
++  for (size_t i = 1; i < contents_container_views_.size(); ++i) {
++    contents_container_views_[i]->contents_view()->SetWebContents(nullptr);
++    contents_container_views_[i]->SetVisible(false);
++  }
++  pane_count_ = 1;
++  UpdateGridHandles();
+   UpdateContentsBorderAndOverlay();
+ 
+   SafeInvoke(GetActiveContentsView()->web_contents())
+@@ -331,29 +356,81 @@ void MultiContentsView::CloseSplitView()
+ }
+ 
+ void MultiContentsView::SwapContentsInSplitView() {
++  SwapContainers(0, 1);
++  active_index_ = active_index_ == 0 ? 1 : 0;
++}
++
++void MultiContentsView::SwapContainers(size_t first, size_t second) {
+   // Reorder the child views so that focus order will be consistent with
+   // contents_container_views_.
+-  ContentsContainerView* start_view = contents_container_views_[0];
+-  ContentsContainerView* end_view = contents_container_views_[1];
++  ContentsContainerView* start_view = contents_container_views_[first];
++  ContentsContainerView* end_view = contents_container_views_[second];
+   size_t start_view_child_index = GetIndexOf(start_view).value();
+   size_t end_view_child_index = GetIndexOf(end_view).value();
+   ReorderChildView(start_view, end_view_child_index);
+   ReorderChildView(end_view, start_view_child_index);
+ 
+-  std::swap(contents_container_views_[0], contents_container_views_[1]);
++  std::swap(contents_container_views_[first],
++            contents_container_views_[second]);
++}
+ 
+-  active_index_ = active_index_ == 0 ? 1 : 0;
++void MultiContentsView::HidePanesFrom(size_t count) {
++  if (count >= pane_count_) {
++    return;
++  }
++  for (size_t i = count; i < contents_container_views_.size(); ++i) {
++    contents_container_views_[i]->contents_view()->SetWebContents(nullptr);
++    contents_container_views_[i]->SetVisible(false);
++  }
++  pane_count_ = count;
++  UpdateGridHandles();
++  UpdateContentsBorderAndOverlay();
++  InvalidateLayout();
++}
++
++void MultiContentsView::ClearInactiveWebContents() {
++  for (size_t i = 0; i < contents_container_views_.size(); ++i) {
++    if (static_cast<int>(i) != active_index_) {
++      contents_container_views_[i]->contents_view()->SetWebContents(nullptr);
++    }
++  }
++}
++
++bool MultiContentsView::InactiveContentsViewHasFocus() const {
++  for (size_t i = 0; i < pane_count_; ++i) {
++    if (static_cast<int>(i) != active_index_ &&
++        contents_container_views_[i]->contents_view()->HasFocus()) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void MultiContentsView::UpdateGridHandles() {
++  for (size_t i = 0; i < resize_areas_.size(); ++i) {
++    resize_areas_[i]->SetVisible(i + 1 < pane_count_);
++    resize_areas_[i]->SetLayout(
++        pane_count_ > 2
++            ? helium_plus::GetSplitGridHandleLayout(pane_count_, i,
++                                                     GetSplitLayout())
++            : GetSplitLayout());
++  }
+ }
+ 
+ void MultiContentsView::SetActiveIndex(int index) {
+   // Index should never be less than 0 or equal to or greater than the total
+   // number of contents views.
+-  CHECK(index >= 0 && index < 2);
++  CHECK(index >= 0 &&
++        static_cast<size_t>(index) < contents_container_views_.size());
+   // We will only activate a visible contents view.
+   CHECK(contents_container_views_[index]->GetVisible());
+   active_index_ = index;
+-  GetActiveContentsView()->set_is_primary_web_contents_for_window(true);
+-  GetInactiveContentsView()->set_is_primary_web_contents_for_window(false);
++  // Helium+: every other pane of a grid.
++  for (auto& contents_container_view : contents_container_views_) {
++    contents_container_view->contents_view()
++        ->set_is_primary_web_contents_for_window(
++            contents_container_view == GetActiveContentsContainerView());
++  }
+   UpdateContentsBorderAndOverlay();
+ }
+ 
+@@ -364,7 +441,7 @@ void MultiContentsView::UpdateSplitVisua
+   }
+ 
+   visual_data_ = visual_data;
+-  resize_area_->SetLayout(visual_data.split_layout());
++  UpdateGridHandles();
+   UpdateContentsBorderAndOverlay();
+   InvalidateLayout();
+ }
+@@ -411,6 +488,10 @@ void MultiContentsView::SetIsAnimatingCo
+ std::vector<views::View*> MultiContentsView::GetAccessiblePanes() {
+   std::vector<views::View*> accessible_panes;
+   for (auto& contents_container_view : contents_container_views_) {
++    // Helium+: the hidden panes of a grid.
++    if (!contents_container_view->GetVisible()) {
++      continue;
++    }
+     auto contents_accessible_panes =
+         contents_container_view->GetAccessiblePanes();
+     accessible_panes.insert(accessible_panes.end(),
+@@ -440,6 +521,30 @@ void MultiContentsView::OnResize(int res
+   }
+ }
+ 
++void MultiContentsView::OnGridResize(size_t handle,
++                                     int resize_amount,
++                                     bool done_resizing) {
++  if (pane_count_ <= 2) {
++    OnResize(resize_amount, done_resizing);
++    return;
++  }
++  if (!grid_on_resize_) {
++    grid_on_resize_.emplace();
++    for (size_t i = 0; i < pane_count_; ++i) {
++      grid_on_resize_->panes.push_back(contents_container_views_[i]->bounds());
++    }
++  }
++  split_tabs::SplitTabVisualData visual_data = visual_data_;
++  helium_plus::ResizeSplitGrid(*grid_on_resize_, handle, resize_amount,
++                               GetMinViewSize(GetLocalBounds()), kSnapDistance,
++                               visual_data);
++  delegate_->ResizeSplitGrid(visual_data.line_ratios(),
++                             visual_data.pane_ratios(), done_resizing);
++  if (done_resizing) {
++    grid_on_resize_.reset();
++  }
++}
++
+ double MultiContentsView::CalculateRatioWithSnapPoints(
+     double start_size,
+     double total_size) const {
+@@ -505,7 +610,10 @@ void MultiContentsView::OnWebContentsFoc
+   if (IsInSplitView()) {
+     // Check whether the widget is visible as otherwise during browser hide,
+     // inactive web contents gets focus. See crbug.com/419335827
+-    if (GetInactiveContentsView()->web_contents() == web_view->web_contents() &&
++    // Helium+: any other pane of a grid.
++    if (web_view->web_contents() &&
++        GetActiveContentsView()->web_contents() != web_view->web_contents() &&
++        GetContentsContainerViewFor(web_view->web_contents()) &&
+         GetWidget()->IsVisible()) {
+       delegate_->WebContentsFocused(web_view->web_contents());
+     }
+@@ -517,10 +625,10 @@ void MultiContentsView::OnActorOverlayFo
+     for (auto& contents_container_view : contents_container_views_) {
+       if (contents_container_view->actor_overlay_web_view() &&
+           contents_container_view->actor_overlay_web_view() == web_view &&
+-          GetInactiveContentsView() ==
+-              contents_container_view->contents_view()) {
++          contents_container_view->GetVisible() &&
++          GetActiveContentsContainerView() != contents_container_view) {
+         return delegate_->WebContentsFocused(
+-            GetInactiveContentsView()->web_contents());
++            contents_container_view->contents_view()->web_contents());
+       }
+     }
+   }
+@@ -531,10 +639,10 @@ void MultiContentsView::OnNtpFooterFocus
+     for (auto& contents_container_view : contents_container_views_) {
+       if (contents_container_view->new_tab_footer_view() &&
+           contents_container_view->new_tab_footer_view() == web_view &&
+-          GetInactiveContentsView() ==
+-              contents_container_view->contents_view()) {
++          contents_container_view->GetVisible() &&
++          GetActiveContentsContainerView() != contents_container_view) {
+         return delegate_->WebContentsFocused(
+-            GetInactiveContentsView()->web_contents());
++            contents_container_view->contents_view()->web_contents());
+       }
+     }
+   }
+@@ -544,7 +652,8 @@ void MultiContentsView::OnReadAnythingOv
+     ContentsContainerView* container,
+     views::WebView* web_view) {
+   if (IsInSplitView() && GetWidget()->IsVisible()) {
+-    if (GetInactiveContentsContainerView() == container) {
++    if (container->GetVisible() &&
++        GetActiveContentsContainerView() != container) {
+       delegate_->WebContentsFocused(container->contents_view()->web_contents());
+     }
+   }
+@@ -592,6 +701,33 @@ views::ProposedLayout MultiContentsView:
+                                 : kSplitViewContentInset);
+     available_space.Inset(single_insets);
+   }
++  // Helium+: a grid of more than two panes.
++  if (pane_count_ > 2) {
++    const int handle_size =
++        GetSplitLayout() == split_tabs::SplitTabLayout::kSideBySide
++            ? resize_area_->GetPreferredSize().width()
++            : resize_area_->GetPreferredSize().height();
++    const helium_plus::SplitGrid grid = helium_plus::CalculateSplitGrid(
++        available_space, pane_count_, visual_data_, handle_size,
++        GetMinViewSize(available_space));
++    for (size_t i = 0; i < contents_container_views_.size(); ++i) {
++      layouts.child_layouts.emplace_back(
++          contents_container_views_[i].get(),
++          contents_container_views_[i]->GetVisible(),
++          i < grid.panes.size() ? grid.panes[i] : gfx::Rect());
++    }
++    for (size_t i = 0; i < resize_areas_.size(); ++i) {
++      layouts.child_layouts.emplace_back(
++          resize_areas_[i].get(), resize_areas_[i]->GetVisible(),
++          i < grid.handles.size() ? grid.handles[i] : gfx::Rect());
++    }
++    layouts.child_layouts.emplace_back(lens_overlay_view_.get(),
++                                       lens_overlay_view_->GetVisible(),
++                                       gfx::Rect(width, height));
++    layouts.host_size = gfx::Size(width, height);
++    return layouts;
++  }
++
+   ViewSizes sizes = GetViewSizes(available_space);
+ 
+   gfx::Rect start_rect, resize_rect, end_rect;
+@@ -619,6 +755,15 @@ views::ProposedLayout MultiContentsView:
+   layouts.child_layouts.emplace_back(contents_container_views_[1].get(),
+                                      contents_container_views_[1]->GetVisible(),
+                                      end_rect);
++  // Helium+: the hidden panes and handles of a grid.
++  for (size_t i = 2; i < contents_container_views_.size(); ++i) {
++    layouts.child_layouts.emplace_back(contents_container_views_[i].get(),
++                                       false, gfx::Rect());
++  }
++  for (size_t i = 1; i < resize_areas_.size(); ++i) {
++    layouts.child_layouts.emplace_back(resize_areas_[i].get(), false,
++                                       gfx::Rect());
++  }
+   layouts.child_layouts.emplace_back(lens_overlay_view_.get(),
+                                      lens_overlay_view_->GetVisible(),
+                                      gfx::Rect(width, height));
+@@ -632,7 +777,8 @@ void MultiContentsView::BeforeApplyLayou
+   background_view_->SetUseFrameTheme(
+       browser_view_->ShouldDrawVerticalTabStrip());
+ 
+-  if (!target_content_bounds_) {
++  // Helium+: a grid follows its bounds while they animate.
++  if (!target_content_bounds_ || pane_count_ > 2) {
+     for (auto& contents : contents_container_views_) {
+       contents->SetTargetContentBounds(std::nullopt);
+     }
+@@ -907,8 +1053,6 @@ void MultiContentsView::UpdateContentsBo
+   const views::Widget* widget = browser_view_->GetWidget();
+   const bool is_fullscreen = widget && widget->IsFullscreen();
+   const bool is_in_split = IsInSplitView();
+-  const bool is_side_by_side =
+-      GetSplitLayout() == split_tabs::SplitTabLayout::kSideBySide;
+   const bool should_round_single_contents =
+       !is_in_split && ShouldUseRoundedFrame();
+   const bool is_drop_target_visible = drop_target_view_->GetVisible();
+@@ -943,15 +1087,21 @@ void MultiContentsView::UpdateContentsBo
+       can_use_system_corners && trailing_edge_is_window_edge &&
+       !is_drop_target_on_bottom;
+ 
+-  for (auto& contents_container_view : contents_container_views_) {
++  for (size_t i = 0; i < contents_container_views_.size(); ++i) {
++    ContentsContainerView* const contents_container_view =
++        contents_container_views_[i];
+     const bool is_active =
+         contents_container_view->contents_view() == GetActiveContentsView();
+-    const bool is_first_view =
+-        !is_in_split ||
+-        contents_container_view == contents_container_views_.front();
+-    const bool is_last_view =
+-        !is_in_split ||
+-        contents_container_view == contents_container_views_.back();
++    // Helium+: the corners of each pane in the grid (first and last panes
++    // with two tabs).
++    const helium_plus::SplitGridCorners corners =
++        is_in_split && i < pane_count_
++            ? helium_plus::GetSplitGridCorners(pane_count_, i,
++                                               GetSplitLayout())
++            : helium_plus::SplitGridCorners{.top_left = !is_in_split,
++                                            .top_right = !is_in_split,
++                                            .bottom_left = !is_in_split,
++                                            .bottom_right = !is_in_split};
+     const bool is_single_contents_view =
+         !is_in_split && contents_container_view->GetVisible();
+     const bool should_round_contents =
+@@ -964,12 +1114,10 @@ void MultiContentsView::UpdateContentsBo
+     contents_container_view->UpdateBorderAndOverlay(
+         is_in_split, should_round_contents, is_active,
+         is_active && active_contents_view_highlighted_,
+-        use_system_top_left_radius && is_first_view,
+-        use_system_top_right_radius &&
+-            (is_side_by_side ? is_last_view : is_first_view),
+-        use_system_bottom_left_radius &&
+-            (is_side_by_side ? is_first_view : is_last_view),
+-        use_system_bottom_right_radius && is_last_view);
++        use_system_top_left_radius && corners.top_left,
++        use_system_top_right_radius && corners.top_right,
++        use_system_bottom_left_radius && corners.bottom_left,
++        use_system_bottom_right_radius && corners.bottom_right);
+   }
+ }
+ 
+--- a/chrome/browser/ui/views/frame/multi_contents_view.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view.h
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/ui/tabs/split_tab_highlight_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/contents_container_view.h"
++#include "chrome/browser/ui/views/helium_plus/split_grid_layout.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "ui/base/interaction/element_identifier.h"
+@@ -103,6 +104,20 @@ class MultiContentsView
+   // and resize handle.
+   void CloseSplitView();
+ 
++  // Helium+: hides the panes from `count` on, for a grid that has fewer tabs
++  // than the one shown before.
++  void HidePanesFrom(size_t count);
++
++  // Helium+: removes the WebContents of all the panes but the active one.
++  void ClearInactiveWebContents();
++
++  // Helium+: whether a pane other than the active one has focus.
++  bool InactiveContentsViewHasFocus() const;
++
++  // Helium+: resize of the grid by `handle` (index of the MultiContentsResizeArea,
++  // see helium_plus::SplitGrid), like OnResize() for two tabs.
++  void OnGridResize(size_t handle, int resize_amount, bool done_resizing);
++
+   // Visually swaps the two contents of the active split view by doing an
+   // in-place swap of contents_container_views_, while also reordering the view
+   // hierarchy and updating active_index_.
+@@ -274,6 +289,12 @@ class MultiContentsView
+ 
+   int GetInactiveIndex() const;
+ 
++  // Helium+: shows the handles of the panes shown, oriented for the grid.
++  void UpdateGridHandles();
++
++  // Helium+: swaps two panes in `contents_container_views_` and the children.
++  void SwapContainers(size_t first, size_t second);
++
+   void OnWebContentsFocused(views::WebView*);
+   void OnNtpFooterFocused(views::WebView*);
+   void OnActorOverlayFocused(views::WebView*);
+@@ -324,6 +345,15 @@ class MultiContentsView
+   // each other.
+   raw_ptr<MultiContentsResizeArea> resize_area_ = nullptr;
+ 
++  // Helium+: all the handles of a grid, `resize_area_` first.
++  std::vector<raw_ptr<MultiContentsResizeArea>> resize_areas_;
++
++  // Helium+: the number of panes shown, more than two for a grid.
++  size_t pane_count_ = 1;
++
++  // Helium+: the grid when a resize began.
++  std::optional<helium_plus::SplitGrid> grid_on_resize_;
++
+   // The views that are shown for entering split view. E.g., this is shown when
+   // the user drags a link to the edge of the contents view.
+   raw_ptr<MultiContentsDropTargetView> drop_target_view_ = nullptr;
+--- a/chrome/browser/ui/views/frame/multi_contents_view_delegate.cc
++++ b/chrome/browser/ui/views/frame/multi_contents_view_delegate.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/helium_plus/tab_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+@@ -61,6 +62,21 @@ void MultiContentsViewDelegateImpl::Reve
+   tab_strip_model_->ReverseTabsInSplit(split_tab_id.value());
+ }
+ 
++void MultiContentsViewDelegateImpl::ResizeSplitGrid(
++    std::vector<double> line_ratios,
++    std::vector<double> pane_ratios,
++    bool done_resizing) {
++  const std::optional<split_tabs::SplitTabId> split_tab_id =
++      tab_strip_model_->GetActiveTab()->GetSplit();
++  if (!split_tab_id) {
++    return;
++  }
++  // The session saves the shares once the resize is done.
++  tab_strip_model_->UpdateSplitGridRatios(
++      split_tab_id.value(), std::move(line_ratios), std::move(pane_ratios),
++      !done_resizing);
++}
++
+ void MultiContentsViewDelegateImpl::ResizeWebContents(double start_ratio,
+                                                       bool done_resizing) {
+   const std::optional<split_tabs::SplitTabId> split_tab_id =
+@@ -94,7 +110,6 @@ void MultiContentsViewDelegateImpl::Hand
+   auto urls = event.data().GetURLs(ui::FilenameToURLPolicy::CONVERT_FILENAMES);
+   CHECK(!urls.empty());
+   tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
+-  CHECK(!active_tab->IsSplit());
+ 
+   // Disallow javascript: URLs to prevent self-XSS.
+   std::vector<GURL> filtered_urls;
+@@ -107,9 +122,16 @@ void MultiContentsViewDelegateImpl::Hand
+   }
+ 
+   // Insert the tab before or after the active tab, according to the drop side.
+-  const int new_tab_idx =
++  int new_tab_idx =
+       tab_strip_model_->active_index() +
+       (side == MultiContentsDropTargetView::DropSide::START ? 0 : 1);
++  // Helium+: a new pane at the start or end of the active split.
++  const std::optional<split_tabs::SplitTabId> split_id = active_tab->GetSplit();
++  const bool at_start = side == MultiContentsDropTargetView::DropSide::START;
++  if (split_id) {
++    new_tab_idx = helium_plus::GetSplitInsertionIndex(*tab_strip_model_,
++                                                      *split_id, at_start);
++  }
+ 
+   const split_tabs::SplitTabVisualData split_data(
+       side == MultiContentsDropTargetView::DropSide::BOTTOM
+@@ -121,7 +143,8 @@ void MultiContentsViewDelegateImpl::Hand
+   NavigateParams params(&browser_.get(), filtered_urls.front(),
+                         ui::PAGE_TRANSITION_LINK);
+   params.tabstrip_index = new_tab_idx;
+-  params.disposition = WindowOpenDisposition::NEW_FOREGROUND_TAB;
++  params.disposition = split_id ? WindowOpenDisposition::NEW_BACKGROUND_TAB
++                                : WindowOpenDisposition::NEW_FOREGROUND_TAB;
+   params.initiator_origin = event.data().GetRendererTaintedOrigin();
+   if (active_tab->IsPinned()) {
+     params.tabstrip_add_types |= AddTabTypes::ADD_PINNED;
+@@ -135,6 +158,19 @@ void MultiContentsViewDelegateImpl::Hand
+     return;
+   }
+ 
++  if (split_id) {
++    tabs::TabInterface* const new_tab = tabs::TabInterface::MaybeGetFromContents(
++        params.navigated_or_inserted_contents);
++    const int index =
++        new_tab ? tab_strip_model_->GetIndexOfTab(new_tab) : TabStripModel::kNoTab;
++    if (index == TabStripModel::kNoTab) {
++      return;
++    }
++    tab_strip_model_->AddToExistingSplit(*split_id, {index}, at_start);
++    tab_strip_model_->ActivateTab(new_tab);
++    return;
++  }
++
+   // Create a split with the previously active tab, which should be before or
+   // after the newly created tab.
+   tab_strip_model_->AddToNewSplit(
+@@ -146,7 +182,9 @@ void MultiContentsViewDelegateImpl::Hand
+ void MultiContentsViewDelegateImpl::HandleTabDrop(
+     MultiContentsDropTargetView::DropSide side,
+     TabDragTarget::DragController& drag_controller) {
+-  CHECK(!tab_strip_model_->GetActiveTab()->IsSplit());
++  // Helium+: the active split takes the tab as a new pane.
++  const std::optional<split_tabs::SplitTabId> split_id =
++      tab_strip_model_->GetActiveTab()->GetSplit();
+ 
+   const split_tabs::SplitTabVisualData split_data(
+       side == MultiContentsDropTargetView::DropSide::BOTTOM
+@@ -159,15 +197,25 @@ void MultiContentsViewDelegateImpl::Hand
+ 
+   // Insert the tab next to the currently active tab, add it to a split,
+   // then activate it.
++  const bool at_start = side == MultiContentsDropTargetView::DropSide::START;
+   const int new_tab_idx =
+-      tab_strip_model_->active_index() +
+-      (side == MultiContentsDropTargetView::DropSide::START ? 0 : 1);
++      split_id ? helium_plus::GetSplitInsertionIndex(*tab_strip_model_,
++                                                     *split_id, at_start)
++               : tab_strip_model_->active_index() + (at_start ? 0 : 1);
+ 
+   tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
+   const int inserted_tab_idx = tab_strip_model_->InsertDetachedTabAt(
+       new_tab_idx, std::move(detached_tab),
+       active_tab->IsPinned() ? AddTabTypes::ADD_PINNED : AddTabTypes::ADD_NONE,
+       active_tab->GetGroup());
++  if (split_id) {
++    tabs::TabInterface* const inserted_tab =
++        tab_strip_model_->GetTabAtIndex(inserted_tab_idx);
++    tab_strip_model_->AddToExistingSplit(*split_id, {inserted_tab_idx},
++                                         at_start);
++    tab_strip_model_->ActivateTab(inserted_tab);
++    return;
++  }
+   tab_strip_model_->AddToNewSplit(
+       {inserted_tab_idx}, split_data,
+       split_tabs::SplitTabCreatedSource::kDragAndDropTab);
+--- a/chrome/browser/ui/views/frame/multi_contents_view_delegate.h
++++ b/chrome/browser/ui/views/frame/multi_contents_view_delegate.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_VIEW_DELEGATE_H_
+ #define CHROME_BROWSER_UI_VIEWS_FRAME_MULTI_CONTENTS_VIEW_DELEGATE_H_
+ 
++#include <vector>
++
+ #include "chrome/browser/ui/views/frame/multi_contents_view_drop_target_controller.h"
+ 
+ class TabStripModel;
+@@ -22,6 +24,10 @@ class MultiContentsViewDelegate
+   virtual void WebContentsFocused(content::WebContents* contents) = 0;
+   virtual void ResizeWebContents(double ratio, bool done_resizing) = 0;
+   virtual void ReverseWebContents() = 0;
++  // Helium+: new shares of the grid of the active split.
++  virtual void ResizeSplitGrid(std::vector<double> line_ratios,
++                               std::vector<double> pane_ratios,
++                               bool done_resizing) {}
+ };
+ 
+ // Executes browser and tabstrip dependent behaviors on behalf of a
+@@ -45,6 +51,9 @@ class MultiContentsViewDelegateImpl : pu
+   // Reverses the order of split tabs.
+   // Must already be in a split.
+   void ReverseWebContents() override;
++  void ResizeSplitGrid(std::vector<double> line_ratios,
++                       std::vector<double> pane_ratios,
++                       bool done_resizing) override;
+ 
+   // Creates a new tab for the first valid URL in `urls` and creates a split
+   // with it and the active tab. If all URLs are blocked, then it will open
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/split_grid_layout.cc
+@@ -0,0 +1,270 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/helium_plus/split_grid_layout.h"
++
++#include <algorithm>
++#include <cmath>
++#include <numeric>
++
++#include "components/split_tabs/split_tab_visual_data.h"
++
++namespace helium_plus {
++
++namespace {
++
++bool IsSideBySide(split_tabs::SplitTabLayout layout) {
++  return layout == split_tabs::SplitTabLayout::kSideBySide;
++}
++
++// Size across the lines (width of a column side by side).
++int MainSize(const gfx::Rect& rect, bool side_by_side) {
++  return side_by_side ? rect.width() : rect.height();
++}
++
++// Size along a line (height of a column side by side).
++int CrossSize(const gfx::Rect& rect, bool side_by_side) {
++  return side_by_side ? rect.height() : rect.width();
++}
++
++// `ratios` summing to 1, or equal shares when they don't fit `count`.
++std::vector<double> NormalizeRatios(const std::vector<double>& ratios,
++                                    size_t count) {
++  const std::vector<double> equal(count, 1.0 / count);
++  if (ratios.size() != count ||
++      std::ranges::any_of(ratios, [](double ratio) { return !(ratio > 0); })) {
++    return equal;
++  }
++  const double sum = std::accumulate(ratios.begin(), ratios.end(), 0.0);
++  std::vector<double> normalized;
++  for (double ratio : ratios) {
++    normalized.push_back(ratio / sum);
++  }
++  return normalized;
++}
++
++// Splits `total` by `ratios`, each part at least `min_size` when they all fit.
++std::vector<int> Distribute(int total,
++                            const std::vector<double>& ratios,
++                            int min_size) {
++  const int count = static_cast<int>(ratios.size());
++  std::vector<int> sizes(count);
++  if (total < count * min_size) {
++    for (int i = 0; i < count; ++i) {
++      sizes[i] = total / count + (i < total % count ? 1 : 0);
++    }
++    return sizes;
++  }
++  // Rounding the cumulative positions leaves no pixel out.
++  double cumulative = 0;
++  int previous = 0;
++  for (int i = 0; i < count; ++i) {
++    cumulative += ratios[i];
++    const int end = i == count - 1 ? total : std::round(cumulative * total);
++    sizes[i] = end - previous;
++    previous = end;
++  }
++  for (int i = 0; i < count; ++i) {
++    // A part too small takes the missing size from the largest ones.
++    while (sizes[i] < min_size) {
++      auto largest = std::ranges::max_element(sizes);
++      const int taken = std::min(min_size - sizes[i], *largest - min_size);
++      if (taken <= 0) {
++        break;
++      }
++      *largest -= taken;
++      sizes[i] += taken;
++    }
++  }
++  return sizes;
++}
++
++// Index of the first pane of each line.
++std::vector<size_t> GetFirstPanes(const std::vector<int>& lines) {
++  std::vector<size_t> first_panes;
++  size_t pane = 0;
++  for (int line : lines) {
++    first_panes.push_back(pane);
++    pane += line;
++  }
++  return first_panes;
++}
++
++}  // namespace
++
++SplitGrid::SplitGrid() = default;
++SplitGrid::SplitGrid(const SplitGrid&) = default;
++SplitGrid& SplitGrid::operator=(const SplitGrid&) = default;
++SplitGrid::~SplitGrid() = default;
++
++SplitGrid CalculateSplitGrid(const gfx::Rect& bounds,
++                             size_t pane_count,
++                             const split_tabs::SplitTabVisualData& visual_data,
++                             int handle_size,
++                             int min_pane_size) {
++  const bool side_by_side = IsSideBySide(visual_data.split_layout());
++  const std::vector<int> lines = split_tabs::GetSplitGridLines(pane_count);
++  const int line_count = static_cast<int>(lines.size());
++  const int cross_size = CrossSize(bounds, side_by_side);
++  const std::vector<int> line_sizes = Distribute(
++      MainSize(bounds, side_by_side) - (line_count - 1) * handle_size,
++      NormalizeRatios(visual_data.line_ratios(), line_count), min_pane_size);
++
++  auto make_rect = [&](int main_start, int main_size, int cross_start,
++                       int cross_length) {
++    return side_by_side ? gfx::Rect(bounds.x() + main_start,
++                                    bounds.y() + cross_start, main_size,
++                                    cross_length)
++                        : gfx::Rect(bounds.x() + cross_start,
++                                    bounds.y() + main_start, cross_length,
++                                    main_size);
++  };
++
++  SplitGrid grid;
++  std::vector<gfx::Rect> pane_handles;
++  int main_start = 0;
++  for (int line = 0; line < line_count; ++line) {
++    const int size = line_sizes[line];
++    if (lines[line] == 1) {
++      grid.panes.push_back(make_rect(main_start, size, 0, cross_size));
++    } else {
++      const std::vector<double>& pane_ratios = visual_data.pane_ratios();
++      const double ratio =
++          line < static_cast<int>(pane_ratios.size()) &&
++                  pane_ratios[line] > 0 && pane_ratios[line] < 1
++              ? pane_ratios[line]
++              : 0.5;
++      const std::vector<int> pane_sizes = Distribute(
++          cross_size - handle_size, {ratio, 1 - ratio}, min_pane_size);
++      grid.panes.push_back(make_rect(main_start, size, 0, pane_sizes[0]));
++      pane_handles.push_back(
++          make_rect(main_start, size, pane_sizes[0], handle_size));
++      grid.panes.push_back(make_rect(main_start, size,
++                                     pane_sizes[0] + handle_size,
++                                     pane_sizes[1]));
++    }
++    main_start += size;
++    if (line < line_count - 1) {
++      grid.handles.push_back(make_rect(main_start, handle_size, 0, cross_size));
++      main_start += handle_size;
++    }
++  }
++  grid.handles.insert(grid.handles.end(), pane_handles.begin(),
++                      pane_handles.end());
++  return grid;
++}
++
++split_tabs::SplitTabLayout GetSplitGridHandleLayout(
++    size_t pane_count,
++    size_t handle,
++    split_tabs::SplitTabLayout layout) {
++  const size_t line_handles =
++      split_tabs::GetSplitGridLines(pane_count).size() - 1;
++  if (handle < line_handles) {
++    return layout;
++  }
++  return IsSideBySide(layout) ? split_tabs::SplitTabLayout::kStacked
++                              : split_tabs::SplitTabLayout::kSideBySide;
++}
++
++void ResizeSplitGrid(const SplitGrid& start,
++                     size_t handle,
++                     int amount,
++                     int min_pane_size,
++                     int snap_distance,
++                     split_tabs::SplitTabVisualData& visual_data) {
++  const bool side_by_side = IsSideBySide(visual_data.split_layout());
++  const std::vector<int> lines =
++      split_tabs::GetSplitGridLines(start.panes.size());
++  const std::vector<size_t> first_panes = GetFirstPanes(lines);
++
++  // The shares when the drag began.
++  std::vector<double> line_sizes;
++  std::vector<double> pane_ratios;
++  for (size_t line = 0; line < lines.size(); ++line) {
++    const gfx::Rect& first = start.panes[first_panes[line]];
++    line_sizes.push_back(MainSize(first, side_by_side));
++    double pane_ratio = 0.5;
++    if (lines[line] == 2) {
++      const gfx::Rect& second = start.panes[first_panes[line] + 1];
++      pane_ratio = static_cast<double>(CrossSize(first, side_by_side)) /
++                   (CrossSize(first, side_by_side) +
++                    CrossSize(second, side_by_side));
++    }
++    pane_ratios.push_back(pane_ratio);
++  }
++
++  // The new size of the first of two neighbours, snapped to half of both.
++  auto resize = [&](double first, double second) {
++    const double both = first + second;
++    const double min_size = std::min<double>(min_pane_size, both / 2);
++    const double new_first =
++        std::clamp(first + amount, min_size, both - min_size);
++    return std::abs(new_first - both / 2) < snap_distance ? both / 2
++                                                          : new_first;
++  };
++
++  const size_t line_handles = lines.size() - 1;
++  if (handle < line_handles) {
++    const double new_first =
++        resize(line_sizes[handle], line_sizes[handle + 1]);
++    line_sizes[handle + 1] += line_sizes[handle] - new_first;
++    line_sizes[handle] = new_first;
++  } else {
++    // The handle of the n-th line of two panes.
++    size_t pane_handle = handle - line_handles;
++    for (size_t line = 0; line < lines.size(); ++line) {
++      if (lines[line] != 2) {
++        continue;
++      }
++      if (pane_handle-- > 0) {
++        continue;
++      }
++      const double first =
++          CrossSize(start.panes[first_panes[line]], side_by_side);
++      const double second =
++          CrossSize(start.panes[first_panes[line] + 1], side_by_side);
++      pane_ratios[line] = resize(first, second) / (first + second);
++      break;
++    }
++  }
++
++  const double total =
++      std::accumulate(line_sizes.begin(), line_sizes.end(), 0.0);
++  std::vector<double> line_ratios;
++  for (double size : line_sizes) {
++    line_ratios.push_back(size / total);
++  }
++  visual_data.set_grid_ratios(std::move(line_ratios), std::move(pane_ratios));
++}
++
++SplitGridCorners GetSplitGridCorners(size_t pane_count,
++                                     size_t index,
++                                     split_tabs::SplitTabLayout layout) {
++  const std::vector<int> lines = split_tabs::GetSplitGridLines(pane_count);
++  const std::vector<size_t> first_panes = GetFirstPanes(lines);
++  size_t line = 0;
++  while (line + 1 < lines.size() && first_panes[line + 1] <= index) {
++    ++line;
++  }
++  const bool first_line = line == 0;
++  const bool last_line = line == lines.size() - 1;
++  const bool first_in_line = index == first_panes[line];
++  const bool last_in_line = index == first_panes[line] + lines[line] - 1;
++
++  // Side by side, lines are columns of panes from top to bottom; stacked,
++  // rows of panes from left to right.
++  if (IsSideBySide(layout)) {
++    return {.top_left = first_line && first_in_line,
++            .top_right = last_line && first_in_line,
++            .bottom_left = first_line && last_in_line,
++            .bottom_right = last_line && last_in_line};
++  }
++  return {.top_left = first_line && first_in_line,
++          .top_right = first_line && last_in_line,
++          .bottom_left = last_line && first_in_line,
++          .bottom_right = last_line && last_in_line};
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/views/helium_plus/split_grid_layout.h
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_SPLIT_GRID_LAYOUT_H_
++#define CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_SPLIT_GRID_LAYOUT_H_
++
++#include <cstddef>
++#include <vector>
++
++#include "ui/gfx/geometry/rect.h"
++
++namespace split_tabs {
++enum class SplitTabLayout;
++class SplitTabVisualData;
++}  // namespace split_tabs
++
++namespace helium_plus {
++
++// A split of more than two tabs, shown as a grid of lines (columns side by
++// side, rows when stacked) of one or two panes, see
++// split_tabs::GetSplitGridLines(). Handles go between the lines first, then
++// between the two panes of each line.
++struct SplitGrid {
++  SplitGrid();
++  SplitGrid(const SplitGrid&);
++  SplitGrid& operator=(const SplitGrid&);
++  ~SplitGrid();
++
++  // In tab order.
++  std::vector<gfx::Rect> panes;
++  std::vector<gfx::Rect> handles;
++};
++
++// The grid of `pane_count` panes in `bounds`, with the shares of
++// `visual_data`. Panes keep at least `min_pane_size` when there is room.
++SplitGrid CalculateSplitGrid(const gfx::Rect& bounds,
++                             size_t pane_count,
++                             const split_tabs::SplitTabVisualData& visual_data,
++                             int handle_size,
++                             int min_pane_size);
++
++// The orientation of `handle`: kSideBySide for a handle that resizes widths.
++split_tabs::SplitTabLayout GetSplitGridHandleLayout(
++    size_t pane_count,
++    size_t handle,
++    split_tabs::SplitTabLayout layout);
++
++// Updates the shares of `visual_data` for `handle` moved by `amount` pixels
++// from where it was in `start`.
++void ResizeSplitGrid(const SplitGrid& start,
++                     size_t handle,
++                     int amount,
++                     int min_pane_size,
++                     int snap_distance,
++                     split_tabs::SplitTabVisualData& visual_data);
++
++// Which corners of the grid pane `index` takes.
++struct SplitGridCorners {
++  bool top_left = false;
++  bool top_right = false;
++  bool bottom_left = false;
++  bool bottom_right = false;
++};
++SplitGridCorners GetSplitGridCorners(size_t pane_count,
++                                     size_t index,
++                                     split_tabs::SplitTabLayout layout);
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_VIEWS_HELIUM_PLUS_SPLIT_GRID_LAYOUT_H_
+--- a/chrome/browser/ui/views/tabs/common/split_tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/split_tab_view.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
+ 
++#include <algorithm>
+ #include <vector>
+ 
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+@@ -133,7 +134,11 @@ gfx::Size SplitTabView::GetMinimumSize()
+       min_width += child->GetMinimumSize().width();
+     }
+     const int tab_overlap = TabStyle::Get()->GetTabOverlap();
+-    return gfx::Size(std::max(0, min_width - tab_overlap),
++    // Helium+: tabs overlap between each pair of neighbours.
++    return gfx::Size(
++        std::max(0, min_width - tab_overlap * (static_cast<int>(
++                                                   children().size()) -
++                                               1)),
+                      TabStyle::Get()->GetStandardHeight());
+   }
+   return views::View::GetMinimumSize();
+@@ -145,27 +150,25 @@ std::optional<BrowserRootView::DropIndex
+     return std::nullopt;
+   }
+ 
+-  CHECK_EQ(collection_node_->children().size(), 2ul);
+-
+-  const auto& start_node = collection_node_->children()[0];
+-  gfx::Point start_loc = views::View::ConvertPointToTarget(
+-      start_node->view(), this,
+-      start_node->view()->GetLocalBounds().CenterPoint());
+-  const auto& end_node = collection_node_->children()[1];
+-  gfx::Point end_loc = views::View::ConvertPointToTarget(
+-      end_node->view(), this, end_node->view()->GetLocalBounds().CenterPoint());
+-
+-  TabDragHandler& drag_handler =
+-      collection_node_->GetController()->GetDragHandler();
++  CHECK_GE(collection_node_->children().size(), 2ul);
+ 
+   // Links can't be dropped between tabs in a split view so just determine the
+   // closest tab to the drop point.
+-  if ((start_loc - loc_in_view).LengthSquared() <
+-      (end_loc - loc_in_view).LengthSquared()) {
+-    return drag_handler.GetLinkDropIndexForNode(*start_node, std::nullopt);
+-  } else {
+-    return drag_handler.GetLinkDropIndexForNode(*end_node, std::nullopt);
++  const TabCollectionNode* closest_node = nullptr;
++  int closest_distance = 0;
++  for (const auto& node : collection_node_->children()) {
++    const gfx::Point center = views::View::ConvertPointToTarget(
++        node->view(), this, node->view()->GetLocalBounds().CenterPoint());
++    const int distance = (center - loc_in_view).LengthSquared();
++    if (!closest_node || distance < closest_distance) {
++      closest_node = node.get();
++      closest_distance = distance;
++    }
+   }
++
++  return collection_node_->GetController()
++      ->GetDragHandler()
++      .GetLinkDropIndexForNode(*closest_node, std::nullopt);
+ }
+ 
+ double SplitTabView::GetHoverAnimationValue() const {
+@@ -242,30 +245,32 @@ views::ProposedLayout SplitTabView::Calc
+   views::ProposedLayout layouts;
+   const auto children = collection_node_ ? collection_node_->GetDirectChildren()
+                                          : TabCollectionNode::ChildViews();
+-  if (children.size() != 2) {
++  if (children.size() < 2) {
+     layouts.host_size = gfx::Size(0, 0);
+     return layouts;
+   }
+ 
+   const int height = TabStyle::Get()->GetStandardHeight();
+   const int tab_overlap = TabStyle::Get()->GetTabOverlap();
++  const int count = static_cast<int>(children.size());
+ 
+   // Layout children horizontally side-by-side in order.
+   int x = 0;
+-  int first_child_width = 0;
++  int used_width = 0;
+   for (size_t i = 0; i < children.size(); ++i) {
+     views::View* child = children[i];
+     gfx::Rect bounds = gfx::Rect(child->GetPreferredSize());
+     bounds.set_x(x);
+     bounds.set_height(height);
+ 
+-    // Fill available width evenly if bounded.
++    // Fill available width evenly if bounded, the last child takes the rest.
+     if (size_bounds.width().is_bounded()) {
+-      const int available_width = size_bounds.width().value() + tab_overlap;
+-      bounds.set_width(i == 0 ? std::floor(available_width / 2)
+-                              : available_width - first_child_width);
++      const int available_width =
++          size_bounds.width().value() + tab_overlap * (count - 1);
++      bounds.set_width(i < children.size() - 1 ? available_width / count
++                                               : available_width - used_width);
+     }
+-    first_child_width = bounds.width();
++    used_width += bounds.width();
+     if (i < children.size() - 1) {
+       x += bounds.width() - tab_overlap;
+     } else {
+@@ -286,7 +291,7 @@ views::ProposedLayout SplitTabView::Calc
+ 
+   const auto children = collection_node_ ? collection_node_->GetDirectChildren()
+                                          : TabCollectionNode::ChildViews();
+-  if (children.size() != 2) {
++  if (children.size() < 2) {
+     layouts.host_size = gfx::Size(0, 0);
+     return layouts;
+   }
+@@ -297,51 +302,57 @@ views::ProposedLayout SplitTabView::Calc
+           : 0;
+ 
+   // Layout children in order. Children will have their preferred height and
+-  // fill available width. If unbounded or uncollapsed and both children fit on
+-  // one row they will share it, otherwise they will be stacked vertically.
+-  if (!size_bounds.width().is_bounded() ||
+-      (!collapsed_ &&
+-       size_bounds.width().value() >=
+-           static_cast<int>(
+-               GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth) *
+-               children.size()))) {
++  // fill available width. Helium+: rows hold as many children as fit, all of
++  // them when unbounded and one when collapsed, spread evenly over the rows
++  // needed (8 children fitting 6 per row: 4 + 4, not 6 + 2).
++  const size_t count = children.size();
++  size_t per_row = count;
++  if (size_bounds.width().is_bounded()) {
++    const int min_width =
++        GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth);
++    per_row = collapsed_ || min_width <= 0
++                  ? 1
++                  : std::clamp<size_t>(size_bounds.width().value() / min_width,
++                                       1, count);
++    const size_t rows = (count + per_row - 1) / per_row;
++    per_row = (count + rows - 1) / rows;
++  }
++
++  int y = 0;
++  for (size_t row_start = 0; row_start < count; row_start += per_row) {
++    const size_t row_end = std::min(row_start + per_row, count);
++    const int row_count = static_cast<int>(row_end - row_start);
+     int x = 0;
+-    for (auto* child : children) {
+-      bool is_first_child = x == 0;
++    int row_height = 0;
++    for (size_t i = row_start; i < row_end; ++i) {
++      views::View* child = children[i];
++      const bool is_last_in_row = i == row_end - 1;
+       gfx::Rect bounds = gfx::Rect(child->GetPreferredSize());
+-      bounds.set_x(x);
+-      // Fill available width if bounded.
++      bounds.set_origin(gfx::Point(x, y));
++      // Fill available width if bounded: children share it evenly, the last
++      // one of the row fills the remaining space.
+       if (size_bounds.width().is_bounded()) {
+-        // Split available space between the two children. Once this calculation
+-        // is done for the first child, the second fills the remaining space.
++        const int row_width = size_bounds.width().value();
+         bounds.set_width(
+-            is_first_child ? (std::floor(size_bounds.width().value() +
+-                                         2 * border_thickness - kSplitViewGap) /
+-                              2)
+-                           : size_bounds.width().value() - x);
++            is_last_in_row
++                ? row_width - x
++                : (row_width + (row_count - 1) *
++                                   (2 * border_thickness - kSplitViewGap)) /
++                      row_count);
+       }
+       // Advance x position by child width, accounting for any border and gap.
+       x += bounds.width() - 2 * border_thickness +
+-           (is_first_child ? kSplitViewGap : 0);
+-      height = std::max(height, bounds.height());
+-      layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
+-    }
+-    width = x;
+-  } else {
+-    int y = 0;
+-    for (auto* child : children) {
+-      gfx::Rect bounds = gfx::Rect(child->GetPreferredSize());
+-      bounds.set_y(y);
+-      bounds.set_width(size_bounds.width().value());
+-      bounds.set_height(bounds.height());
+-      // Advance y position by child height, accounting for any border and gap.
+-      y +=
+-          bounds.height() - 2 * border_thickness + (y == 0 ? kSplitViewGap : 0);
++           (is_last_in_row ? 0 : kSplitViewGap);
++      row_height = std::max(row_height, bounds.height());
+       layouts.child_layouts.emplace_back(child, child->GetVisible(), bounds);
+     }
+-    width = size_bounds.width().value();
+-    height = y + 2 * border_thickness;
++    // One row is as wide as its children, several fill the available width.
++    width = per_row >= count ? x : size_bounds.width().value();
++    // Advance y position by row height, accounting for any border and gap.
++    y += row_height - 2 * border_thickness +
++         (row_end < count ? kSplitViewGap : 0);
+   }
++  height = y + 2 * border_thickness;
+   layouts.host_size = gfx::Size(width, height);
+   return layouts;
+ }
+@@ -366,7 +377,7 @@ std::unique_ptr<views::View> SplitTabVie
+           // front first so it is necessary to test the number of children
+           // in the collection when computing the animation direction.
+           .animation_direction =
+-              (children.size() == 2 && children[0] == child_view)
++              (children.size() >= 2 && children[0] == child_view)
+                   ? TabCollectionAnimatingLayoutManager::AnimationDirection::
+                         kEndToStart
+                   : TabCollectionAnimatingLayoutManager::AnimationDirection::
+--- a/chrome/browser/ui/views/tabs/tab/tab_accessibility.cc
++++ b/chrome/browser/ui/views/tabs/tab/tab_accessibility.cc
+@@ -4,7 +4,11 @@
+ 
+ #include "chrome/browser/ui/views/tabs/tab/tab_accessibility.h"
+ 
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/helium_plus/strings.h"
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/performance_controls/tab_resource_usage_tab_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+@@ -115,10 +119,21 @@ std::u16string GetAccessibleTabLabel(con
+     int tab_index_in_split = std::distance(
+         tabs_in_split.begin(),
+         std::find(tabs_in_split.begin(), tabs_in_split.end(), tab));
+-    title = l10n_util::GetStringFUTF16(
+-        GetAccessibleTabLabelFormatStringForSplit(
+-            split_data->visual_data()->split_layout(), tab_index_in_split),
+-        title);
++    // Helium+: "pane i of n" in a grid.
++    if (tabs_in_split.size() > 2) {
++      title = base::StrCat(
++          {title, u", ",
++           base::ReplaceStringPlaceholders(
++               helium_plus::GetString(helium_plus::StringId::kSplitPane),
++               {base::NumberToString16(tab_index_in_split + 1),
++                base::NumberToString16(tabs_in_split.size())},
++               nullptr)});
++    } else {
++      title = l10n_util::GetStringFUTF16(
++          GetAccessibleTabLabelFormatStringForSplit(
++              split_data->visual_data()->split_layout(), tab_index_in_split),
++          title);
++    }
+   }
+ 
+   if (const std::optional<tab_groups::TabGroupId> group = tab->GetGroup()) {
+--- a/components/sessions/core/live_tab_context.h
++++ b/components/sessions/core/live_tab_context.h
+@@ -114,6 +114,12 @@ class SESSIONS_EXPORT LiveTabContext {
+       split_tabs::SplitTabId split_id,
+       const split_tabs::SplitTabVisualData& visual_data) = 0;
+ 
++  // Helium+: reconstructs a split of more than two tabs (a grid).
++  virtual void ReconstructGrid(
++      const std::vector<LiveTab*>& tabs,
++      split_tabs::SplitTabId split_id,
++      const split_tabs::SplitTabVisualData& visual_data) {}
++
+   virtual void CloseTab() = 0;
+ 
+  protected:
+--- a/components/sessions/core/session_service_commands.cc
++++ b/components/sessions/core/session_service_commands.cc
+@@ -42,6 +42,30 @@ std::string SplitTabLayoutToString(split
+   NOTREACHED();
+ }
+ 
++// Helium+: the grid ratios of a split, after its layout (older versions stop
++// reading before them).
++void WriteRatiosToPickle(base::Pickle& pickle,
++                         const std::vector<double>& ratios) {
++  pickle.WriteUInt32(static_cast<uint32_t>(ratios.size()));
++  for (double ratio : ratios) {
++    pickle.WriteDouble(ratio);
++  }
++}
++
++std::vector<double> ReadRatiosFromPickle(base::PickleIterator& iter) {
++  uint32_t count = 0;
++  if (!iter.ReadUInt32(&count) || count > split_tabs::kMaxTabsInSplit) {
++    return {};
++  }
++  std::vector<double> ratios(count);
++  for (double& ratio : ratios) {
++    if (!iter.ReadDouble(&ratio)) {
++      return {};
++    }
++  }
++  return ratios;
++}
++
+ split_tabs::SplitTabLayout SplitTabLayoutFromString(
+     std::string split_tab_layout_string) {
+   if (split_tab_layout_string == "Horizontal") {
+@@ -849,6 +873,10 @@ bool CreateTabsAndWindows(
+ 
+         split->split_visual_data_ = split_tabs::SplitTabVisualData(
+             SplitTabLayoutFromString(split_layout_str), split_ratio);
++        std::vector<double> line_ratios = ReadRatiosFromPickle(iter);
++        std::vector<double> pane_ratios = ReadRatiosFromPickle(iter);
++        split->split_visual_data_.set_grid_ratios(std::move(line_ratios),
++                                                  std::move(pane_ratios));
+         break;
+       }
+ 
+@@ -1216,6 +1244,8 @@ std::unique_ptr<SessionCommand> CreateSp
+   pickle.WriteDouble(split_tab_visual_data->split_ratio());
+   pickle.WriteString(
+       SplitTabLayoutToString(split_tab_visual_data->split_layout()));
++  WriteRatiosToPickle(pickle, split_tab_visual_data->line_ratios());
++  WriteRatiosToPickle(pickle, split_tab_visual_data->pane_ratios());
+ 
+   return std::make_unique<SessionCommand>(kCommandSetSplitTabData, pickle);
+ }
+--- a/components/sessions/core/tab_restore_service_helper.cc
++++ b/components/sessions/core/tab_restore_service_helper.cc
+@@ -186,6 +186,22 @@ void ReconstructSplits(
+                    std::vector<raw_ptr<tab_restore::Tab>>>& split_tabs_map,
+     const std::map<SessionID, LiveTab*>& restored_tab_map) {
+   for (const auto& [split_id, tabs] : split_tabs_map) {
++    // Helium+: grids of more than two tabs.
++    if (tabs.size() > 2) {
++      std::vector<LiveTab*> live_tabs;
++      for (const auto& tab : tabs) {
++        if (auto it = restored_tab_map.find(tab->id);
++            it != restored_tab_map.end()) {
++          live_tabs.push_back(it->second);
++        }
++      }
++      if (live_tabs.size() >= 2) {
++        context->ReconstructGrid(live_tabs, split_id,
++                                 tabs[0]->split_visual_data.value_or(
++                                     split_tabs::SplitTabVisualData()));
++      }
++      continue;
++    }
+     CHECK(tabs.size() == 2);
+     auto leading_it = restored_tab_map.find(tabs[0]->id);
+     auto trailing_it = restored_tab_map.find(tabs[1]->id);
+@@ -736,7 +752,12 @@ LiveTabContext* TabRestoreServiceHelper:
+             return t->split_id.has_value() && t->split_id.value() == split_id;
+           });
+ 
+-      if (other_tabs_in_split != window.tabs.end()) {
++      // Helium+: a grid keeps its split while two tabs are left.
++      if (other_tabs_in_split != window.tabs.end() &&
++          std::count_if(window.tabs.begin(), window.tabs.end(),
++                        [&split_id](const auto& t) {
++                          return t->split_id == split_id;
++                        }) == 1) {
+         (*other_tabs_in_split)->split_id = std::nullopt;
+         (*other_tabs_in_split)->split_visual_data = std::nullopt;
+         window.split_tabs.erase(split_id.value());
+--- a/components/split_tabs/split_tab_visual_data.cc
++++ b/components/split_tabs/split_tab_visual_data.cc
+@@ -6,6 +6,17 @@
+ 
+ namespace split_tabs {
+ 
++std::vector<int> GetSplitGridLines(size_t tab_count) {
++  if (tab_count <= 2) {
++    return std::vector<int>(tab_count, 1);
++  }
++  std::vector<int> lines(tab_count / 2, 2);
++  if (tab_count % 2) {
++    lines.insert(lines.begin(), 1);
++  }
++  return lines;
++}
++
+ SplitTabVisualData::SplitTabVisualData()
+     : split_layout_(SplitTabLayout::kSideBySide) {}
+ 
+--- a/components/split_tabs/split_tab_visual_data.h
++++ b/components/split_tabs/split_tab_visual_data.h
+@@ -5,8 +5,21 @@
+ #ifndef COMPONENTS_SPLIT_TABS_SPLIT_TAB_VISUAL_DATA_H_
+ #define COMPONENTS_SPLIT_TABS_SPLIT_TAB_VISUAL_DATA_H_
+ 
++#include <cstddef>
++#include <utility>
++#include <vector>
++
+ namespace split_tabs {
+ 
++// Helium+: a split shows up to this many tabs, in a grid.
++inline constexpr size_t kMaxTabsInSplit = 8;
++
++// Helium+: the number of panes in each line of the grid of a split of
++// `tab_count` tabs: columns side by side, rows when stacked. Two tabs get a
++// line each; with more, lines hold two panes and the first tab of an odd count
++// gets a whole line.
++std::vector<int> GetSplitGridLines(size_t tab_count);
++
+ // Orientation of a split view. Needs to be kept in sync with
+ // tab_search::mojom::SplitTabLayout in
+ // chrome/browser/ui/webui/tab_search/tab_search.mojom.
+@@ -45,6 +58,17 @@ class SplitTabVisualData {
+ 
+   double split_ratio() const { return split_ratio_; }
+ 
++  // Helium+: with more than two tabs, the share of each line of the grid and
++  // of the first pane of each line (see GetSplitGridLines()). Equal shares when
++  // empty or not matching the grid.
++  void set_grid_ratios(std::vector<double> line_ratios,
++                       std::vector<double> pane_ratios) {
++    line_ratios_ = std::move(line_ratios);
++    pane_ratios_ = std::move(pane_ratios);
++  }
++  const std::vector<double>& line_ratios() const { return line_ratios_; }
++  const std::vector<double>& pane_ratios() const { return pane_ratios_; }
++
+   // Checks whether two instances are visually equivalent.
+   friend bool operator==(const SplitTabVisualData&,
+                          const SplitTabVisualData&) = default;
+@@ -53,6 +77,8 @@ class SplitTabVisualData {
+   SplitTabLayout split_layout_;
+   // ratio of the first split tab's width to the available width.
+   double split_ratio_ = 0.5;
++  std::vector<double> line_ratios_;
++  std::vector<double> pane_ratios_;
+ };
+ 
+ }  // namespace split_tabs
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -46,6 +46,7 @@ enum TabContextMenuCommand {
+   CommandRenameTab,
+   CommandReplaceAnchor,
+   CommandCloseUngroupedTabs,
++  CommandAddToActiveSplit,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
+--- a/chrome/browser/extensions/api/tabs/tabs_api.cc
++++ b/chrome/browser/extensions/api/tabs/tabs_api.cc
+@@ -39,6 +39,7 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/incognito_allowed_url.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+@@ -50,6 +51,7 @@
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "components/sessions/core/session_id.h"
+ #include "components/tab_groups/tab_group_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "components/translate/core/browser/language_state.h"
+@@ -2226,7 +2228,19 @@ ExtensionFunction::ResponseAction TabsCr
+       }
+ 
+       // 2. Check that the split-with tab is not already in a split view.
+-      if (::tabs::TabInterface::GetFromContents(target_contents)->IsSplit()) {
++      // Helium+: or in one with room left, which the new tab joins.
++      ::tabs::TabInterface* split_with_tab =
++          ::tabs::TabInterface::GetFromContents(target_contents);
++      BrowserWindowInterface* split_with_window =
++          target_window_controller
++              ? target_window_controller->GetBrowserWindowInterface()
++              : nullptr;
++      if (split_with_tab->IsSplit() &&
++          (!split_with_window ||
++           split_with_window->GetTabStripModel()
++                   ->GetSplitData(*split_with_tab->GetSplit())
++                   ->ListTabs()
++                   .size() >= split_tabs::kMaxTabsInSplit)) {
+         return RespondNow(Error(ErrorUtils::FormatErrorMessage(
+             tabs_constants::kSplitWithTabAlreadyInSplitViewError,
+             base::NumberToString(*split_with_tab_id_))));
+--- a/chrome/browser/extensions/open_tab_helper.cc
++++ b/chrome/browser/extensions/open_tab_helper.cc
+@@ -15,9 +15,11 @@
+ #include "chrome/browser/tab_list/tab_list_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/helium_plus/tab_commands.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_handle.h"
+@@ -216,6 +218,12 @@ base::expected<content::WebContents*, st
+       if (split_contents) {
+         split_tab = tabs::TabInterface::GetFromContents(split_contents);
+         CHECK(split_tab);
++        // Helium+: a tab joining a split goes after its last pane.
++        if (split_tab->IsSplit()) {
++          index = helium_plus::GetSplitInsertionIndex(
++              *browser.GetTabStripModel(), *split_tab->GetSplit(),
++              /*at_start=*/false);
++        }
+       }
+     }
+   }
+@@ -267,8 +275,14 @@ base::expected<content::WebContents*, st
+     tabs::TabInterface* new_tab =
+         tabs::TabInterface::GetFromContents(new_contents);
+     CHECK(new_tab);
+-    if (!tab_list->CreateSplit(
+-            {split_tab->GetHandle(), new_tab->GetHandle()})) {
++    if (split_tab->IsSplit()) {
++      // Helium+: joins the grid of the split-with tab.
++      TabStripModel* model = browser.GetTabStripModel();
++      model->AddToExistingSplit(*split_tab->GetSplit(),
++                                {model->GetIndexOfTab(new_tab)},
++                                /*at_start=*/false);
++    } else if (!tab_list->CreateSplit(
++                   {split_tab->GetHandle(), new_tab->GetHandle()})) {
+       tab_list->CloseTab(new_tab->GetHandle());
+       return base::unexpected(tabs_constants::kSplitViewCreationFailedError);
+     }
+--- a/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
+@@ -19,7 +19,9 @@
+ 
+ namespace {
+ constexpr int kIconDesignWidth = 16;
+-constexpr int kTitleMinWidth = 10;
++// Helium+: room for a few characters, not a clipped first letter (narrow tabs
++// of a split grid sharing a row).
++constexpr int kTitleMinWidth = 24;
+ constexpr int kHorizontalInset = 7;
+ constexpr int kDefaultPadding = 4;
+ }  // namespace
+@@ -70,7 +72,7 @@ views::ProposedLayout TabViewVerticalLay
+         is_centered
+             ? (placed_children == 0)
+             : (child.min_width + child.padding < bounds_remaining.width() ||
+-               placed_children < 2);
++               (placed_children < 2 && !child.expand));
+     const bool is_child_visible = IsChildVisible(child.view, width);
+     if (is_child_visible && can_render_child) {
+       layouts.child_layouts.emplace_back(
