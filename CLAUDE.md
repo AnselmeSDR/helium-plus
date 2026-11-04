@@ -239,6 +239,23 @@ two-line calls.
     end of `kCommandSetSplitTabData`) and in tab restore. Vertical strip: the tabs of a grid share
     rows, as many per row as fit, spread evenly (8 tabs fitting 6 per row: 4 + 4,
     `split_tab_view.cc`).
+24. `replica-windows.patch`: like Arc, the windows of a profile show the same tabs
+    (`helium_plus::ReplicaWindows`, started by `TabState`; design comments in
+    `replica_windows.h`). Opening, closing, moving, pinning, grouping, renaming a group or
+    splitting in one window does the same in the others (posted sync, coalesced per profile); each
+    window keeps its own copy of the pages (loaded when shown) and its own active tab; a navigation
+    reaches the copies at their next display, never while they are on screen (`PrepareToShow`).
+    Copies share a logical id (`TabState::replica_id()`, also the id of their `ClosedTab`
+    entries). The first window of a profile is its main window: the only one saved with the
+    session (`SessionServiceBase::ShouldTrackBrowser`) and whose groups are saved tab groups
+    (`SavedTabGroupModelListener`; group icons of a copy read the main group,
+    `GroupIcons::GetSavedId`). Closing the main window while others remain hides it
+    (`BrowserView::OnWindowCloseRequested`); a window closing while others remain records nothing
+    in tab restore (`browser_tab_strip_model_delegate.cc`, `UnloadController`). Each window has a
+    slot in the profile switcher: switching shows the window of the other profile in the same slot,
+    else a new replica window of that profile (`CreateWindowInSlot`), else
+    `profiles::SwitchToProfile`. Not done: replica windows are not restored after a restart (only
+    the main window of each profile).
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

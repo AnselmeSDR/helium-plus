@@ -1,0 +1,1914 @@
+--- a/chrome/browser/sessions/session_service_base.cc
++++ b/chrome/browser/sessions/session_service_base.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/startup/startup_browser_creator.h"
+ #include "chrome/browser/ui/tabs/features.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+@@ -849,6 +850,11 @@ bool SessionServiceBase::ShouldTrackBrow
+     return false;
+   }
+ 
++  // Helium+: the other windows of a profile are copies of its main window.
++  if (helium_plus::ReplicaWindows::IsReplicaWindow(browser)) {
++    return false;
++  }
++
+   // Never track app popup windows that do not have a trusted source (i.e.
+   // popup windows spawned by an app). If this logic changes, be sure to also
+   // change SessionRestoreImpl::CreateRestoredBrowser().
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3567,6 +3567,8 @@ static_library("ui") {
+       "helium_plus/hibernation_service.h",
+       "helium_plus/profile_switcher.cc",
+       "helium_plus/profile_switcher.h",
++      "helium_plus/replica_windows.cc",
++      "helium_plus/replica_windows.h",
+       "helium_plus/shared_settings.cc",
+       "helium_plus/shared_settings.h",
+       "helium_plus/shared_theme.cc",
+--- a/chrome/browser/ui/browser_tab_strip_model_delegate.cc
++++ b/chrome/browser/ui/browser_tab_strip_model_delegate.cc
+@@ -30,6 +30,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/helium_plus/anchored_tabs.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/tab_helpers.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+@@ -590,7 +591,11 @@ void BrowserTabStripModelDelegate::Close
+ bool BrowserTabStripModelDelegate::BrowserSupportsHistoricalEntries() {
+   // We don't create historical tabs for incognito windows or windows without
+   // profiles.
+-  return browser_->GetProfile() && !browser_->GetProfile()->IsOffTheRecord();
++  // Helium+: nor for the tabs of a closing window that live on in the other
++  // windows of the profile.
++  return browser_->GetProfile() && !browser_->GetProfile()->IsOffTheRecord() &&
++         !(browser_->GetTabStripModel()->closing_all() &&
++           helium_plus::ReplicaWindows::TabsLiveOn(browser_));
+ }
+ 
+ }  // namespace chrome
+--- a/chrome/browser/ui/helium_plus/closed_tabs.cc
++++ b/chrome/browser/ui/helium_plus/closed_tabs.cc
+@@ -126,6 +126,8 @@ ClosedTab MakeClosedTab(tabs::TabInterfa
+           : ClosedTab(contents->GetVisibleURL(), contents->GetTitle(),
+                       state.custom_title());
+   closed_tab.closed_time = state.closed_time();
++  // The same tab closed in another window of the profile gets the same id.
++  closed_tab.id = state.replica_id();
+   return closed_tab;
+ }
+ 
+@@ -187,6 +189,9 @@ TabState* AddTab(TabStripModel& model,
+       select ? chrome::RestoredTabLoadPolicy::kLoadIfVisible
+              : chrome::RestoredTabLoadPolicy::kDeferUntilActivation);
+   TabState* state = contents ? TabState::FromWebContents(contents) : nullptr;
++  if (state) {
++    state->set_replica_id(closed_tab.id);
++  }
+   if (state && !select) {
+     state->set_closed_time(closed_tab.closed_time);
+   }
+--- a/chrome/browser/ui/helium_plus/closed_tabs.h
++++ b/chrome/browser/ui/helium_plus/closed_tabs.h
+@@ -73,6 +73,7 @@ class ClosedTabsService : public Browser
+ 
+  private:
+   friend class base::NoDestructor<ClosedTabsService>;
++  friend class ReplicaWindows;
+ 
+   // The pinned tabs or a group.
+   struct Container {
+--- a/chrome/browser/ui/helium_plus/group_icons.cc
++++ b/chrome/browser/ui/helium_plus/group_icons.cc
+@@ -22,6 +22,7 @@
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/helium_plus/strings.h"
+ #include "chrome/browser/ui/select_file_policy/chrome_select_file_policy.h"
+ #include "components/prefs/pref_registry_simple.h"
+@@ -557,8 +558,9 @@ std::optional<base::Uuid> GroupIcons::Ge
+   if (!service_) {
+     return std::nullopt;
+   }
++  // A group of a replica window shows the icon of the group it copies.
+   const std::optional<tab_groups::SavedTabGroup> saved_group =
+-      service_->GetGroup(group);
++      service_->GetGroup(ReplicaWindows::GetMainGroup(group));
+   return saved_group ? std::make_optional(saved_group->saved_guid())
+                      : std::nullopt;
+ }
+--- a/chrome/browser/ui/helium_plus/profile_switcher.cc
++++ b/chrome/browser/ui/helium_plus/profile_switcher.cc
+@@ -17,7 +17,7 @@
+ #include "chrome/browser/profiles/profile_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+-#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "ui/base/base_window.h"
+ 
+@@ -25,20 +25,6 @@ namespace helium_plus {
+ 
+ namespace {
+ 
+-BrowserWindowInterface* FindLastActiveWindow(Profile* profile) {
+-  BrowserWindowInterface* found = nullptr;
+-  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
+-      [&found](BrowserWindowInterface* browser) {
+-        if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
+-          return true;
+-        }
+-        found = browser;
+-        return false;
+-      },
+-      BrowserCollection::Order::kActivation);
+-  return found;
+-}
+-
+ void ShowInPlaceOf(BrowserWindowInterface* from, BrowserWindowInterface* to) {
+   if (from == to) {
+     return;
+@@ -62,6 +48,8 @@ void ShowInPlaceOf(BrowserWindowInterfac
+   if (to_window->IsMinimized()) {
+     to_window->Restore();
+   }
++  // Pages that navigated in other windows meanwhile, before they show.
++  ReplicaWindows::PrepareToShow(to);
+   to_window->Show();
+   if (swap) {
+     from_window->Hide();
+@@ -87,20 +75,30 @@ void SwitchToProfile(BrowserWindowInterf
+   }
+   Profile* profile =
+       g_browser_process->profile_manager()->GetProfileByPath(path);
+-  if (BrowserWindowInterface* to =
+-          profile ? FindLastActiveWindow(profile) : nullptr) {
+-    ShowInPlaceOf(from, to);
+-    return;
++  // Each window shows its own profile: the window of `profile` in the same
++  // slot, else a new one with the tabs of its other windows.
++  const int slot = ReplicaWindows::GetSlot(from);
++  if (profile) {
++    BrowserWindowInterface* to = ReplicaWindows::FindWindowInSlot(profile, slot);
++    if (!to) {
++      to = ReplicaWindows::CreateWindowInSlot(
++          profile, slot, from->GetWindow()->GetBounds());
++    }
++    if (to) {
++      ShowInPlaceOf(from, to);
++      return;
++    }
+   }
+   profiles::SwitchToProfile(path, /*always_create=*/false,
+                             base::BindOnce(
+                                 [](base::WeakPtr<BrowserWindowInterface> from,
+-                                   BrowserWindowInterface* to) {
++                                   int slot, BrowserWindowInterface* to) {
+                                   if (from && to) {
++                                    ReplicaWindows::SetSlot(to, slot);
+                                     ShowInPlaceOf(from.get(), to);
+                                   }
+                                 },
+-                                from->GetWeakPtr()));
++                                from->GetWeakPtr(), slot));
+ }
+ 
+ void SwitchToAdjacentProfile(BrowserWindowInterface* from, bool forward) {
+@@ -135,6 +133,7 @@ bool ShowHiddenBrowserWindow() {
+   if (!hidden) {
+     return false;
+   }
++  ReplicaWindows::PrepareToShow(hidden);
+   hidden->GetWindow()->Show();
+   return true;
+ }
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/replica_windows.cc
+@@ -0,0 +1,1325 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
++
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/browser/lifetime/browser_shutdown.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/tab_list/tab_removed_reason.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/helium_plus/closed_tabs.h"
++#include "chrome/browser/ui/helium_plus/tab_state.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/common/webui_url_constants.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "components/tabs/public/split_tab_data.h"
++#include "components/tabs/public/tab_group.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/restore_type.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
++#include "ui/base/base_window.h"
++#include "ui/gfx/range/range.h"
++#include "url/gurl.h"
++
++namespace helium_plus {
++
++namespace {
++
++int IdOf(const tabs::TabInterface* tab) {
++  const TabState* state = tab ? TabState::From(tab) : nullptr;
++  return state ? state->replica_id() : 0;
++}
++
++bool IsSharingWindow(BrowserWindowInterface* browser) {
++  return browser &&
++         browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++         browser->GetProfile() && !browser->GetProfile()->IsOffTheRecord() &&
++         browser->GetTabStripModel();
++}
++
++// Index of the tab `id` in `model`, or TabStripModel::kNoTab.
++int FindTab(const TabStripModel& model, int id) {
++  for (int index = 0; index < model.count(); ++index) {
++    if (IdOf(model.GetTabAtIndex(index)) == id) {
++      return index;
++    }
++  }
++  return TabStripModel::kNoTab;
++}
++
++std::vector<int> ListIds(const TabStripModel& model) {
++  std::vector<int> ids;
++  for (int index = 0; index < model.count(); ++index) {
++    ids.push_back(IdOf(model.GetTabAtIndex(index)));
++  }
++  return ids;
++}
++
++// Whether a tab of `model` keeps the closed tab `id` (helium_plus/closed_tabs.h).
++bool HasClosedTab(const TabStripModel& model, int id) {
++  for (int index = 0; index < model.count(); ++index) {
++    const TabState* state = TabState::From(model.GetTabAtIndex(index));
++    if (!state) {
++      continue;
++    }
++    for (const ClosedTabs* closed_tabs :
++         {&state->closed_before(), &state->closed_after()}) {
++      if (std::ranges::contains(*closed_tabs, id, &ClosedTab::id)) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++// A new tab nobody used yet, like the one a new window opens with.
++bool IsUntouchedNewTab(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab->GetContents();
++  if (!contents || contents->GetController().GetEntryCount() > 1) {
++    return false;
++  }
++  const GURL& url = contents->GetVisibleURL();
++  return url.is_empty() || url.IsAboutBlank() ||
++         (url.SchemeIs(content::kChromeUIScheme) &&
++          (url.host() == chrome::kChromeUINewTabHost ||
++           url.host() == chrome::kChromeUINewTabPageHost));
++}
++
++// Whether `tab` is on screen: active, or in the active split, in a visible
++// window.
++bool IsShown(BrowserWindowInterface* browser, tabs::TabInterface* tab) {
++  ui::BaseWindow* window = browser->GetWindow();
++  if (!window || !window->IsVisible() || window->IsMinimized()) {
++    return false;
++  }
++  tabs::TabInterface* active = browser->GetTabStripModel()->GetActiveTab();
++  return active == tab ||
++         (active && tab->GetSplit() && active->GetSplit() == tab->GetSplit());
++}
++
++std::vector<int> ListSplitIds(const TabStripModel& model,
++                              split_tabs::SplitTabId split) {
++  std::vector<int> ids;
++  if (const split_tabs::SplitTabData* data = model.GetSplitData(split)) {
++    for (tabs::TabInterface* tab : data->ListTabs()) {
++      ids.push_back(IdOf(tab));
++    }
++  }
++  return ids;
++}
++
++// The splits of `model` in tab order.
++std::vector<split_tabs::SplitTabId> ListSplits(const TabStripModel& model) {
++  std::vector<split_tabs::SplitTabId> splits;
++  for (int index = 0; index < model.count(); ++index) {
++    const std::optional<split_tabs::SplitTabId> split =
++        model.GetTabAtIndex(index)->GetSplit();
++    if (split && !std::ranges::contains(splits, *split)) {
++      splits.push_back(*split);
++    }
++  }
++  return splits;
++}
++
++}  // namespace
++
++ReplicaWindows::WindowState::WindowState() = default;
++ReplicaWindows::WindowState::WindowState(WindowState&&) = default;
++ReplicaWindows::WindowState& ReplicaWindows::WindowState::operator=(
++    WindowState&&) = default;
++ReplicaWindows::WindowState::~WindowState() = default;
++
++ReplicaWindows::ProfileState::ProfileState() = default;
++ReplicaWindows::ProfileState::ProfileState(ProfileState&&) = default;
++ReplicaWindows::ProfileState& ReplicaWindows::ProfileState::operator=(
++    ProfileState&&) = default;
++ReplicaWindows::ProfileState::~ProfileState() = default;
++
++// static
++void ReplicaWindows::EnsureStarted() {
++  Get();
++}
++
++// static
++ReplicaWindows* ReplicaWindows::Get() {
++  static base::NoDestructor<ReplicaWindows> instance;
++  return instance.get();
++}
++
++ReplicaWindows::ReplicaWindows() {
++  GlobalBrowserCollection* browsers = GlobalBrowserCollection::GetInstance();
++  browser_collection_observation_.Observe(browsers);
++  browsers->ForEach(
++      [this](BrowserWindowInterface* browser) {
++        Register(browser);
++        return true;
++      },
++      BrowserCollection::Order::kCreation);
++}
++
++ReplicaWindows::~ReplicaWindows() = default;
++
++// static
++bool ReplicaWindows::IsReplicaWindow(BrowserWindowInterface* browser) {
++  // Without registering `browser`: this is also asked while it closes.
++  if (!IsSharingWindow(browser)) {
++    return false;
++  }
++  ProfileState* state = Get()->GetProfileState(browser->GetProfile());
++  return state && state->main_window && state->main_window != browser;
++}
++
++// static
++bool ReplicaWindows::IsReplicaGroup(const tab_groups::TabGroupId& group) {
++  for (auto& [profile, state] : Get()->profiles_) {
++    for (const WindowState& window : state.windows) {
++      TabGroupModel* groups = window.browser->GetTabStripModel()->group_model();
++      if (groups && groups->ContainsTabGroup(group)) {
++        return window.browser != state.main_window;
++      }
++    }
++  }
++  return false;
++}
++
++// static
++tab_groups::TabGroupId ReplicaWindows::GetMainGroup(
++    const tab_groups::TabGroupId& group) {
++  ReplicaWindows* self = Get();
++  auto id_it = self->group_ids_.find(group);
++  if (id_it == self->group_ids_.end()) {
++    return group;
++  }
++  for (auto& [profile, state] : self->profiles_) {
++    if (!state.main_window) {
++      continue;
++    }
++    TabGroupModel* groups =
++        state.main_window->GetTabStripModel()->group_model();
++    if (!groups) {
++      continue;
++    }
++    for (const tab_groups::TabGroupId& main_group : groups->ListTabGroups()) {
++      auto main_it = self->group_ids_.find(main_group);
++      if (main_it != self->group_ids_.end() &&
++          main_it->second == id_it->second) {
++        return main_group;
++      }
++    }
++  }
++  return group;
++}
++
++// static
++bool ReplicaWindows::HideInsteadOfClosing(BrowserWindowInterface* browser) {
++  if (browser_shutdown::IsTryingToQuit() || !IsSharingWindow(browser)) {
++    return false;
++  }
++  ReplicaWindows* self = Get();
++  ProfileState* state = self->GetProfileState(browser->GetProfile());
++  if (!state || state->main_window != browser) {
++    return false;
++  }
++  const bool others = std::ranges::any_of(
++      state->windows, [browser](const WindowState& window) {
++        return window.browser != browser && !window.closing;
++      });
++  // An emptied main window closes: the next window takes over.
++  if (!others || !browser->GetWindow() ||
++      browser->GetTabStripModel()->empty()) {
++    return false;
++  }
++  state->main_window_hidden_on_close = true;
++  browser->GetWindow()->Hide();
++  return true;
++}
++
++// static
++bool ReplicaWindows::TabsLiveOn(BrowserWindowInterface* browser) {
++  if (!IsSharingWindow(browser)) {
++    return false;
++  }
++  ProfileState* state = Get()->GetProfileState(browser->GetProfile());
++  return state && std::ranges::any_of(
++                      state->windows, [browser](const WindowState& window) {
++                        return window.browser != browser && !window.closing;
++                      });
++}
++
++// static
++int ReplicaWindows::GetSlot(BrowserWindowInterface* browser) {
++  WindowState* window = Get()->Register(browser);
++  return window ? window->slot : 0;
++}
++
++// static
++void ReplicaWindows::SetSlot(BrowserWindowInterface* browser, int slot) {
++  if (WindowState* window = Get()->Register(browser)) {
++    window->slot = slot;
++  }
++}
++
++// static
++BrowserWindowInterface* ReplicaWindows::FindWindowInSlot(Profile* profile,
++                                                        int slot) {
++  ProfileState* state = Get()->GetProfileState(profile);
++  if (!state) {
++    return nullptr;
++  }
++  for (const WindowState& window : state->windows) {
++    if (window.slot == slot && !window.closing) {
++      return window.browser;
++    }
++  }
++  return nullptr;
++}
++
++// static
++BrowserWindowInterface* ReplicaWindows::CreateWindowInSlot(
++    Profile* profile,
++    int slot,
++    const gfx::Rect& bounds) {
++  ReplicaWindows* self = Get();
++  ProfileState* state = self->GetProfileState(profile);
++  if (!state || std::ranges::none_of(state->windows, [](const WindowState& w) {
++        return !w.closing && w.browser->GetTabStripModel()->count() > 0;
++      })) {
++    return nullptr;
++  }
++  BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
++  params.initial_bounds = bounds;
++  self->pending_slot_ = slot;
++  BrowserWindowInterface* browser = CreateBrowserWindow(std::move(params));
++  self->pending_slot_.reset();
++  if (!browser || !self->Register(browser)) {
++    return nullptr;
++  }
++  SetSlot(browser, slot);
++  // The window gets its tabs right away, before being shown.
++  self->Sync(profile);
++  if (browser->GetTabStripModel()->empty()) {
++    return nullptr;
++  }
++  return browser;
++}
++
++// static
++void ReplicaWindows::PrepareToShow(BrowserWindowInterface* browser) {
++  if (!IsSharingWindow(browser)) {
++    return;
++  }
++  ReplicaWindows* self = Get();
++  ProfileState* state = self->GetProfileState(browser->GetProfile());
++  if (!state) {
++    return;
++  }
++  if (state->main_window == browser) {
++    state->main_window_hidden_on_close = false;
++  }
++  ++self->applying_;
++  self->UpdateStaleCopies(*state);
++  --self->applying_;
++}
++
++// static
++void ReplicaWindows::OnTabStateChanged(tabs::TabInterface* tab) {
++  ReplicaWindows* self = Get();
++  if (self->applying_ || !tab) {
++    return;
++  }
++  BrowserWindowInterface* browser = tab->GetBrowserWindowInterface();
++  if (!IsSharingWindow(browser)) {
++    return;
++  }
++  ProfileState* state = self->GetProfileState(browser->GetProfile());
++  if (!state || state->windows.size() < 2) {
++    return;
++  }
++  state->changed_states[IdOf(tab)] = browser;
++  self->ScheduleSync(browser->GetProfile());
++}
++
++// static
++void ReplicaWindows::OnNavigationFinished(tabs::TabInterface* tab,
++                                          content::NavigationHandle* handle) {
++  ReplicaWindows* self = Get();
++  if (self->applying_ || !tab || !handle->IsInPrimaryMainFrame() ||
++      !handle->HasCommitted() || handle->IsErrorPage() ||
++      handle->GetRestoreType() != content::RestoreType::kNotRestored) {
++    return;
++  }
++  BrowserWindowInterface* browser = tab->GetBrowserWindowInterface();
++  if (!IsSharingWindow(browser)) {
++    return;
++  }
++  ProfileState* state = self->GetProfileState(browser->GetProfile());
++  if (!state || state->windows.size() < 2) {
++    return;
++  }
++  state->navigated[IdOf(tab)] = browser;
++  self->ScheduleSync(browser->GetProfile());
++}
++
++void ReplicaWindows::OnBrowserCreated(BrowserWindowInterface* browser) {
++  Register(browser);
++}
++
++void ReplicaWindows::OnBrowserClosed(BrowserWindowInterface* browser) {
++  auto profile_it = std::ranges::find_if(profiles_, [browser](auto& entry) {
++    return std::ranges::contains(entry.second.windows, browser,
++                                 &WindowState::browser);
++  });
++  if (profile_it == profiles_.end()) {
++    return;
++  }
++  ProfileState& state = profile_it->second;
++  std::erase_if(state.windows, [browser](const WindowState& window) {
++    return window.browser == browser;
++  });
++  std::erase_if(state.stale, [browser](const auto& entry) {
++    return entry.second == browser;
++  });
++  for (auto* changes : {&state.changed_states, &state.navigated}) {
++    std::erase_if(*changes,
++                  [browser](const auto& entry) { return entry.second == browser; });
++  }
++  if (state.windows.empty()) {
++    profiles_.erase(profile_it);
++    return;
++  }
++  if (state.main_window == browser) {
++    // The next window takes over, saved with the session from now on (its
++    // groups become saved tab groups only after a restart).
++    state.main_window = state.windows.front().browser;
++    state.main_window_hidden_on_close = false;
++    if (!browser_shutdown::IsTryingToQuit() &&
++        !state.windows.front().closing) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(
++              [](base::WeakPtr<BrowserWindowInterface> main_window) {
++                SessionService* service =
++                    main_window ? SessionServiceFactory::GetForProfile(
++                                      main_window->GetProfile())
++                                : nullptr;
++                if (service) {
++                  service->ResetFromCurrentBrowsers();
++                }
++              },
++              state.main_window->GetWeakPtr()));
++    }
++    return;
++  }
++  // The main window, hidden when the user closed it, closes with the last
++  // other window.
++  if (state.main_window_hidden_on_close && state.windows.size() == 1 &&
++      state.windows.front().browser == state.main_window) {
++    state.main_window_hidden_on_close = false;
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(
++                       [](base::WeakPtr<BrowserWindowInterface> main_window) {
++                         if (main_window && main_window->GetWindow()) {
++                           main_window->GetWindow()->Close();
++                         }
++                       },
++                       state.main_window->GetWeakPtr()));
++  }
++}
++
++void ReplicaWindows::OnTabStripModelChanged(
++    TabStripModel* model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  WindowState* window = GetWindowState(model);
++  if (!window) {
++    return;
++  }
++  if (selection.active_tab_changed()) {
++    ProfileState* state = GetProfileState(model);
++    if (state && !state->stale.empty()) {
++      ScheduleSync(model->profile());
++    }
++  }
++  if (applying_ || window->closing) {
++    return;
++  }
++  switch (change.type()) {
++    case TabStripModelChange::kInserted:
++    case TabStripModelChange::kMoved:
++      OnListChanged(model, /*structural=*/true);
++      break;
++    case TabStripModelChange::kRemoved: {
++      bool structural = false;
++      for (const TabStripModelChange::RemovedTab& removed :
++           change.GetRemove()->contents) {
++        if (removed.remove_reason ==
++            TabRemovedReason::kInsertedIntoOtherTabStrip) {
++          window->moved_out.insert(IdOf(removed.tab));
++        }
++        // A closed tab turned into a ClosedTab doesn't change the list.
++        const TabState* state = TabState::From(removed.tab);
++        structural |= !state || !state->IsClosed();
++      }
++      OnListChanged(model, structural);
++      break;
++    }
++    case TabStripModelChange::kReplaced:
++    case TabStripModelChange::kSelectionOnly:
++      break;
++  }
++}
++
++void ReplicaWindows::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                             int index) {
++  if (applying_ || !tab || !tab->GetBrowserWindowInterface()) {
++    return;
++  }
++  OnListChanged(tab->GetBrowserWindowInterface()->GetTabStripModel(),
++                /*structural=*/true);
++}
++
++void ReplicaWindows::TabGroupedStateChanged(
++    TabStripModel* model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  if (!applying_) {
++    OnListChanged(model, /*structural=*/true);
++  }
++}
++
++void ReplicaWindows::OnTabGroupChanged(const TabGroupChange& change) {
++  if (change.type == TabGroupChange::kClosed) {
++    group_ids_.erase(change.group);
++  }
++  if (applying_ || change.type == TabGroupChange::kEditorOpened) {
++    return;
++  }
++  OnListChanged(change.model, /*structural=*/true);
++}
++
++void ReplicaWindows::OnSplitTabChanged(const SplitTabChange& change) {
++  if (!applying_) {
++    OnListChanged(change.model, /*structural=*/true);
++  }
++}
++
++void ReplicaWindows::WillCloseAllTabs(TabStripModel* model) {
++  if (WindowState* window = GetWindowState(model)) {
++    window->closing = true;
++  }
++}
++
++void ReplicaWindows::CloseAllTabsStopped(TabStripModel* model,
++                                         CloseAllStoppedReason reason) {
++  if (WindowState* window = GetWindowState(model);
++      window && reason == kCloseAllCanceled) {
++    window->closing = false;
++  }
++}
++
++ReplicaWindows::WindowState* ReplicaWindows::Register(
++    BrowserWindowInterface* browser) {
++  if (!IsSharingWindow(browser)) {
++    return nullptr;
++  }
++  if (WindowState* window = GetWindowState(browser)) {
++    return window;
++  }
++  Profile* profile = browser->GetProfile();
++  ProfileState& state = profiles_[profile];
++  WindowState window;
++  window.browser = browser;
++  window.slot = pending_slot_.value_or(++next_slot_);
++  pending_slot_.reset();
++  if (!state.main_window) {
++    state.main_window = browser;
++    window.seeded = true;
++  }
++  state.windows.push_back(std::move(window));
++  browser->GetTabStripModel()->AddObserver(this);
++  if (state.windows.size() > 1) {
++    ScheduleSync(profile);
++  }
++  return &state.windows.back();
++}
++
++ReplicaWindows::ProfileState* ReplicaWindows::GetProfileState(
++    Profile* profile) {
++  auto it = profiles_.find(profile);
++  return it == profiles_.end() ? nullptr : &it->second;
++}
++
++ReplicaWindows::ProfileState* ReplicaWindows::GetProfileState(
++    TabStripModel* model) {
++  return model ? GetProfileState(model->profile()) : nullptr;
++}
++
++ReplicaWindows::WindowState* ReplicaWindows::GetWindowState(
++    BrowserWindowInterface* browser) {
++  if (!browser) {
++    return nullptr;
++  }
++  ProfileState* state = GetProfileState(browser->GetProfile());
++  if (!state) {
++    return nullptr;
++  }
++  auto it = std::ranges::find(state->windows, browser, &WindowState::browser);
++  return it == state->windows.end() ? nullptr : &*it;
++}
++
++ReplicaWindows::WindowState* ReplicaWindows::GetWindowState(
++    TabStripModel* model) {
++  ProfileState* state = GetProfileState(model);
++  if (!state) {
++    return nullptr;
++  }
++  auto it = std::ranges::find_if(state->windows, [model](WindowState& window) {
++    return window.browser->GetTabStripModel() == model;
++  });
++  return it == state->windows.end() ? nullptr : &*it;
++}
++
++void ReplicaWindows::OnListChanged(TabStripModel* model, bool structural) {
++  WindowState* window = GetWindowState(model);
++  if (!window) {
++    return;
++  }
++  if (structural) {
++    window->structure_version = ++next_structure_version_;
++  }
++  ProfileState* state = GetProfileState(model);
++  if (state && state->windows.size() > 1) {
++    ScheduleSync(model->profile());
++  }
++}
++
++void ReplicaWindows::ScheduleSync(Profile* profile) {
++  ProfileState* state = GetProfileState(profile);
++  if (!state || state->sync_pending) {
++    return;
++  }
++  state->sync_pending = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<ReplicaWindows> self, Profile* profile) {
++            if (self) {
++              self->Sync(profile);
++            }
++          },
++          weak_factory_.GetWeakPtr(), profile));
++}
++
++std::vector<ReplicaWindows::WindowState*> ReplicaWindows::GetSyncedWindows(
++    ProfileState& state) {
++  std::vector<WindowState*> windows;
++  for (WindowState& window : state.windows) {
++    TabStripModel* model = window.browser->GetTabStripModel();
++    if (window.closing || model->closing_all() ||
++        (window.seeded && model->empty())) {
++      continue;
++    }
++    windows.push_back(&window);
++  }
++  return windows;
++}
++
++void ReplicaWindows::Sync(Profile* profile) {
++  ProfileState* state = GetProfileState(profile);
++  if (!state) {
++    return;
++  }
++  state->sync_pending = false;
++  std::vector<WindowState*> windows = GetSyncedWindows(*state);
++  // A tab strip being dragged in can't change now.
++  for (WindowState* window : windows) {
++    TabStripModel* model = window->browser->GetTabStripModel();
++    if (model->delegate() && !model->delegate()->IsTabStripEditable()) {
++      state->sync_pending = true;
++      base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++          FROM_HERE,
++          base::BindOnce(
++              [](base::WeakPtr<ReplicaWindows> self, Profile* profile) {
++                if (self) {
++                  self->Sync(profile);
++                }
++              },
++              weak_factory_.GetWeakPtr(), profile),
++          base::Milliseconds(300));
++      return;
++    }
++  }
++
++  ++applying_;
++  // The window the user changed last gives the order of the tabs.
++  auto latest = [&](bool seeded_only) {
++    WindowState* result = nullptr;
++    for (WindowState* window : windows) {
++      if (seeded_only && !window->seeded) {
++        continue;
++      }
++      if (!result || window->structure_version > result->structure_version ||
++          (window->structure_version == result->structure_version &&
++           window->browser == state->main_window)) {
++        result = window;
++      }
++    }
++    return result;
++  };
++  if (WindowState* source = latest(/*seeded_only=*/true)) {
++    for (WindowState* window : windows) {
++      if (!window->seeded) {
++        Seed(*state, *source, *window);
++      }
++    }
++  }
++  for (WindowState* window : windows) {
++    window->seeded = true;
++  }
++  windows = GetSyncedWindows(*state);
++
++  if (windows.size() > 1) {
++    SyncTabSet(*state, windows);
++    if (WindowState* source = latest(/*seeded_only=*/false)) {
++      for (WindowState* window : windows) {
++        if (window != source) {
++          SyncStructure(*source->browser->GetTabStripModel(),
++                        *window->browser->GetTabStripModel());
++        }
++      }
++    }
++    SyncStates(*state, windows);
++    SyncNavigations(*state, windows);
++  }
++  UpdateStaleCopies(*state);
++
++  state->synced_ids.clear();
++  for (WindowState* window : windows) {
++    for (int id : ListIds(*window->browser->GetTabStripModel())) {
++      state->synced_ids.insert(id);
++    }
++    window->moved_out.clear();
++  }
++  state->changed_states.clear();
++  state->navigated.clear();
++  --applying_;
++}
++
++void ReplicaWindows::Seed(ProfileState& state,
++                          WindowState& source,
++                          WindowState& target) {
++  TabStripModel& from = *source.browser->GetTabStripModel();
++  TabStripModel& to = *target.browser->GetTabStripModel();
++  if (from.empty()) {
++    return;
++  }
++
++  // Tabs the window opened with: a new tab nobody used gives way to the
++  // copies. Other ones (a link opened in a new window, a tab dragged out, the
++  // tabs of a window saved before replicas existed) join the shared list.
++  std::vector<tabs::TabHandle> dropped;
++  bool keeps_own_tab = false;
++  for (int index = 0; index < to.count(); ++index) {
++    tabs::TabInterface* tab = to.GetTabAtIndex(index);
++    if (FindTab(from, IdOf(tab)) != TabStripModel::kNoTab) {
++      continue;
++    }
++    if (IsUntouchedNewTab(tab)) {
++      dropped.push_back(tab->GetHandle());
++    } else {
++      keeps_own_tab = true;
++    }
++  }
++
++  for (int index = 0; index < from.count(); ++index) {
++    tabs::TabInterface* tab = from.GetTabAtIndex(index);
++    if (FindTab(to, IdOf(tab)) != TabStripModel::kNoTab) {
++      continue;
++    }
++    // With the closed tabs it keeps, which only the seeded window lacks.
++    tabs::TabInterface* copy = AddCopy(to, *tab, index);
++    TabState* copy_state = copy ? TabState::From(copy) : nullptr;
++    const TabState* source_state = TabState::From(tab);
++    if (copy_state && source_state) {
++      copy_state->SetClosedTabs(source_state->closed_before(),
++                                source_state->closed_after());
++    }
++  }
++
++  for (const tabs::TabHandle& handle : dropped) {
++    if (tabs::TabInterface* tab = handle.Get()) {
++      const int index = to.GetIndexOfTab(tab);
++      if (index != TabStripModel::kNoTab && to.count() > 1) {
++        to.CloseWebContentsAt(index, TabCloseTypes::CLOSE_NONE);
++      }
++    }
++  }
++
++  SyncStructure(from, to);
++  if (!keeps_own_tab && from.GetActiveTab()) {
++    const int index = FindTab(to, IdOf(from.GetActiveTab()));
++    if (index != TabStripModel::kNoTab) {
++      to.ActivateTabAt(index);
++    }
++  }
++}
++
++void ReplicaWindows::SyncTabSet(ProfileState& state,
++                                const std::vector<WindowState*>& windows) {
++  // A tab dragged into a window holding its copy replaces the copy.
++  for (WindowState* window : windows) {
++    TabStripModel& model = *window->browser->GetTabStripModel();
++    std::map<int, std::vector<tabs::TabHandle>> by_id;
++    for (int index = 0; index < model.count(); ++index) {
++      tabs::TabInterface* tab = model.GetTabAtIndex(index);
++      by_id[IdOf(tab)].push_back(tab->GetHandle());
++    }
++    for (auto& [id, handles] : by_id) {
++      if (handles.size() < 2) {
++        continue;
++      }
++      // Keep a loaded one.
++      auto kept = std::ranges::find_if(handles, [](tabs::TabHandle handle) {
++        content::WebContents* contents = handle.Get()->GetContents();
++        return contents && !contents->GetController().NeedsReload();
++      });
++      if (kept == handles.end()) {
++        kept = handles.begin();
++      }
++      for (auto it = handles.begin(); it != handles.end(); ++it) {
++        tabs::TabInterface* tab = it->Get();
++        const int index = tab ? model.GetIndexOfTab(tab) : TabStripModel::kNoTab;
++        if (it != kept && index != TabStripModel::kNoTab && model.count() > 1) {
++          model.CloseWebContentsAt(index, TabCloseTypes::CLOSE_NONE);
++        }
++      }
++    }
++  }
++
++  // Where each tab is now.
++  std::map<int, std::vector<std::pair<WindowState*, tabs::TabHandle>>> holders;
++  for (WindowState* window : windows) {
++    TabStripModel& model = *window->browser->GetTabStripModel();
++    for (int index = 0; index < model.count(); ++index) {
++      tabs::TabInterface* tab = model.GetTabAtIndex(index);
++      holders[IdOf(tab)].emplace_back(window, tab->GetHandle());
++    }
++  }
++
++  // Tabs of the list that left a window.
++  const std::set<int> known_ids = state.synced_ids;
++  for (int id : known_ids) {
++    auto holders_it = holders.find(id);
++    const size_t held = holders_it == holders.end() ? 0 : holders_it->second.size();
++    if (held == windows.size()) {
++      continue;
++    }
++    bool moved = false;
++    bool compacted = false;
++    for (WindowState* window : windows) {
++      TabStripModel& model = *window->browser->GetTabStripModel();
++      if (FindTab(model, id) != TabStripModel::kNoTab) {
++        continue;
++      }
++      moved |= window->moved_out.contains(id);
++      compacted |= HasClosedTab(model, id);
++    }
++    if (held == 0 || moved) {
++      // Dragged to another window, or gone everywhere: copies come back in
++      // the windows missing it below, or there is nothing left to do.
++      if (held > 0) {
++        state.synced_ids.erase(id);
++      }
++      continue;
++    }
++    std::vector<tabs::TabHandle> tabs;
++    for (auto& [window, handle] : holders_it->second) {
++      tabs.push_back(handle);
++    }
++    for (const tabs::TabHandle& handle : tabs) {
++      tabs::TabInterface* tab = handle.Get();
++      if (!tab) {
++        continue;
++      }
++      if (compacted) {
++        // Closed by the user: its copies close too, then become ClosedTabs.
++        if (TabState* tab_state = TabState::From(tab)) {
++          tab_state->SetClosed(true);
++        }
++        continue;
++      }
++      TabStripModel* model =
++          tab->GetBrowserWindowInterface()->GetTabStripModel();
++      const int index = model->GetIndexOfTab(tab);
++      if (index != TabStripModel::kNoTab && model->count() > 1) {
++        model->CloseWebContentsAt(index, TabCloseTypes::CLOSE_NONE);
++      }
++    }
++  }
++
++  // Tabs new to the list.
++  for (auto& [id, tab_holders] : holders) {
++    if (state.synced_ids.contains(id) || tab_holders.empty()) {
++      continue;
++    }
++    WindowState* source_window = tab_holders.front().first;
++    tabs::TabInterface* source_tab = tab_holders.front().second.Get();
++    if (!source_tab) {
++      continue;
++    }
++    TabStripModel& source = *source_window->browser->GetTabStripModel();
++    const int source_index = source.GetIndexOfTab(source_tab);
++    const int previous_id =
++        source_index > 0 ? IdOf(source.GetTabAtIndex(source_index - 1)) : 0;
++    for (WindowState* window : windows) {
++      TabStripModel& model = *window->browser->GetTabStripModel();
++      if (FindTab(model, id) != TabStripModel::kNoTab) {
++        continue;
++      }
++      if (HasClosedTab(model, id)) {
++        // Opened again from its ClosedTab in the source window.
++        std::optional<int> index =
++            ClosedTabsService::Restore(model, id, /*select=*/false);
++        if (index) {
++          if (TabState* tab_state = TabState::From(model.GetTabAtIndex(*index))) {
++            if (const TabState* source_state = TabState::From(source_tab)) {
++              tab_state->CopyFrom(*source_state, /*with_closed_tabs=*/false);
++            }
++          }
++        }
++        continue;
++      }
++      const int previous = previous_id ? FindTab(model, previous_id)
++                                       : TabStripModel::kNoTab;
++      AddCopy(model, *source_tab,
++              previous == TabStripModel::kNoTab ? 0 : previous + 1);
++    }
++  }
++}
++
++void ReplicaWindows::SyncStructure(TabStripModel& source,
++                                   TabStripModel& target) {
++  // Splits whose tabs differ are undone, then made again at the end.
++  for (const split_tabs::SplitTabId& split : ListSplits(target)) {
++    const std::vector<int> ids = ListSplitIds(target, split);
++    const int source_index = ids.empty() ? TabStripModel::kNoTab
++                                         : FindTab(source, ids.front());
++    const std::optional<split_tabs::SplitTabId> source_split =
++        source_index == TabStripModel::kNoTab
++            ? std::nullopt
++            : source.GetTabAtIndex(source_index)->GetSplit();
++    if (!source_split || ListSplitIds(source, *source_split) != ids) {
++      target.RemoveSplit(split);
++    }
++  }
++
++  // Pinned state.
++  for (int id : ListIds(target)) {
++    const int source_index = FindTab(source, id);
++    const int index = FindTab(target, id);
++    if (source_index == TabStripModel::kNoTab ||
++        index == TabStripModel::kNoTab) {
++      continue;
++    }
++    const bool pinned = source.IsTabPinned(source_index);
++    if (target.IsTabPinned(index) != pinned) {
++      target.SetTabPinned(index, pinned);
++    }
++  }
++
++  SyncGroups(source, target);
++  SyncOrder(source, target);
++  SyncSplits(source, target);
++}
++
++void ReplicaWindows::SyncGroups(TabStripModel& source, TabStripModel& target) {
++  if (!source.group_model() || !target.group_model()) {
++    return;
++  }
++  // Tabs leaving their group, and the tabs each source group needs.
++  std::map<tab_groups::TabGroupId, std::vector<int>> joining;
++  std::vector<tab_groups::TabGroupId> source_groups;
++  for (int id : ListIds(target)) {
++    const int source_index = FindTab(source, id);
++    if (source_index == TabStripModel::kNoTab) {
++      continue;
++    }
++    const std::optional<tab_groups::TabGroupId> source_group =
++        source.GetTabAtIndex(source_index)->GetGroup();
++    const int index = FindTab(target, id);
++    const std::optional<tab_groups::TabGroupId> group =
++        target.GetTabAtIndex(index)->GetGroup();
++    const std::optional<tab_groups::TabGroupId> wanted =
++        source_group ? FindCopyOfGroup(*source_group, target) : std::nullopt;
++    if (group && (!source_group || group != wanted)) {
++      target.RemoveFromGroup({index});
++    }
++    if (source_group && (!wanted || group != wanted)) {
++      joining[*source_group].push_back(id);
++    }
++  }
++  for (int index = 0; index < source.count(); ++index) {
++    const std::optional<tab_groups::TabGroupId> group =
++        source.GetTabAtIndex(index)->GetGroup();
++    if (group && !std::ranges::contains(source_groups, *group)) {
++      source_groups.push_back(*group);
++    }
++  }
++
++  for (const tab_groups::TabGroupId& source_group : source_groups) {
++    auto joining_it = joining.find(source_group);
++    if (joining_it != joining.end()) {
++      std::vector<int> indices;
++      for (int id : joining_it->second) {
++        const int index = FindTab(target, id);
++        if (index != TabStripModel::kNoTab) {
++          indices.push_back(index);
++        }
++      }
++      std::ranges::sort(indices);
++      if (!indices.empty()) {
++        if (std::optional<tab_groups::TabGroupId> group =
++                FindCopyOfGroup(source_group, target)) {
++          target.AddToExistingGroup(indices, *group);
++        } else {
++          LinkGroups(source_group, target.AddToNewGroup(indices));
++        }
++      }
++    }
++
++    // Title and color; each window keeps its group collapsed or not.
++    const std::optional<tab_groups::TabGroupId> group =
++        FindCopyOfGroup(source_group, target);
++    if (!group || !source.group_model()->ContainsTabGroup(source_group) ||
++        !target.group_model()->ContainsTabGroup(*group)) {
++      continue;
++    }
++    const tab_groups::TabGroupVisualData* source_visuals =
++        source.group_model()->GetTabGroup(source_group)->visual_data();
++    const tab_groups::TabGroupVisualData* visuals =
++        target.group_model()->GetTabGroup(*group)->visual_data();
++    if (source_visuals->title() != visuals->title() ||
++        source_visuals->color() != visuals->color()) {
++      target.ChangeTabGroupVisuals(
++          *group,
++          tab_groups::TabGroupVisualData(source_visuals->title(),
++                                         source_visuals->color(),
++                                         visuals->is_collapsed()));
++    }
++  }
++}
++
++void ReplicaWindows::SyncOrder(TabStripModel& source, TabStripModel& target) {
++  // The tabs both windows have, in the source order.
++  std::vector<int> order;
++  for (int id : ListIds(source)) {
++    if (FindTab(target, id) != TabStripModel::kNoTab) {
++      order.push_back(id);
++    }
++  }
++  std::vector<int> current;
++  for (int id : ListIds(target)) {
++    if (std::ranges::contains(order, id)) {
++      current.push_back(id);
++    }
++  }
++  if (current == order) {
++    return;
++  }
++
++  // Tabs placed one after the other from the start; a group moves at once,
++  // then its tabs are ordered inside it; a split moves at once.
++  std::set<tab_groups::TabGroupId> placed_groups;
++  int next = 0;
++  size_t k = 0;
++  // Bounded, in case a move doesn't do what is expected.
++  for (int steps = 0; k < order.size() && steps < 4 * target.count() + 16;
++       ++steps) {
++    const int index = FindTab(target, order[k]);
++    if (index == TabStripModel::kNoTab) {
++      ++k;
++      continue;
++    }
++    tabs::TabInterface* tab = target.GetTabAtIndex(index);
++    const std::optional<tab_groups::TabGroupId> group = tab->GetGroup();
++    if (group && !placed_groups.contains(*group) && target.group_model() &&
++        target.group_model()->ContainsTabGroup(*group)) {
++      placed_groups.insert(*group);
++      const gfx::Range range =
++          target.group_model()->GetTabGroup(*group)->ListTabs();
++      if (static_cast<int>(range.start()) > next) {
++        target.MoveGroupTo(*group, next);
++      }
++      continue;
++    }
++    const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
++    int size = 1;
++    if (split) {
++      size = static_cast<int>(ListSplitIds(target, *split).size());
++      const int first =
++          target.GetIndexOfTab(target.GetSplitData(*split)->ListTabs().front());
++      if (first > next) {
++        target.MoveSplitTo(*split, next, tab->IsPinned(), group);
++      }
++    } else if (index > next) {
++      target.MoveWebContentsAt(index, next, /*select_after_move=*/false);
++    }
++    next += size;
++    k += size;
++  }
++}
++
++void ReplicaWindows::SyncSplits(TabStripModel& source, TabStripModel& target) {
++  for (const split_tabs::SplitTabId& source_split : ListSplits(source)) {
++    const std::vector<int> ids = ListSplitIds(source, source_split);
++    std::vector<int> indices;
++    for (int id : ids) {
++      const int index = FindTab(target, id);
++      if (index == TabStripModel::kNoTab) {
++        break;
++      }
++      indices.push_back(index);
++    }
++    if (indices.size() != ids.size() || indices.size() < 2) {
++      continue;
++    }
++    const split_tabs::SplitTabVisualData& visual_data =
++        *source.GetSplitData(source_split)->visual_data();
++    const std::optional<split_tabs::SplitTabId> split =
++        target.GetTabAtIndex(indices.front())->GetSplit();
++    if (split && ListSplitIds(target, *split) == ids) {
++      const split_tabs::SplitTabVisualData& current =
++          *target.GetSplitData(*split)->visual_data();
++      if (current == visual_data) {
++        continue;
++      }
++      if (current.split_layout() != visual_data.split_layout()) {
++        target.UpdateSplitLayout(*split, visual_data.split_layout());
++      }
++      if (current.split_ratio() != visual_data.split_ratio()) {
++        target.UpdateSplitRatio(*split, visual_data.split_ratio());
++      }
++      if (current.line_ratios() != visual_data.line_ratios() ||
++          current.pane_ratios() != visual_data.pane_ratios()) {
++        target.UpdateSplitGridRatios(*split, visual_data.line_ratios(),
++                                     visual_data.pane_ratios());
++      }
++      continue;
++    }
++    if (std::ranges::any_of(indices, [&target](int index) {
++          return target.GetTabAtIndex(index)->IsSplit();
++        })) {
++      continue;
++    }
++    // Contiguous after SyncOrder; otherwise next time.
++    std::vector<int> sorted = indices;
++    std::ranges::sort(sorted);
++    if (sorted.back() - sorted.front() + 1 != static_cast<int>(sorted.size())) {
++      continue;
++    }
++    target.RestoreSplit(split_tabs::SplitTabId::GenerateNew(), sorted,
++                        visual_data);
++  }
++}
++
++void ReplicaWindows::SyncStates(ProfileState& state,
++                                const std::vector<WindowState*>& windows) {
++  for (auto& [id, source_browser] : state.changed_states) {
++    if (!std::ranges::contains(windows, source_browser.get(),
++                               [](WindowState* w) { return w->browser.get(); })) {
++      continue;
++    }
++    TabStripModel& source = *source_browser->GetTabStripModel();
++    const int source_index = FindTab(source, id);
++    if (source_index == TabStripModel::kNoTab) {
++      continue;
++    }
++    const TabState* source_state =
++        TabState::From(source.GetTabAtIndex(source_index));
++    if (!source_state) {
++      continue;
++    }
++    for (WindowState* window : windows) {
++      if (window->browser == source_browser) {
++        continue;
++      }
++      TabStripModel& model = *window->browser->GetTabStripModel();
++      int index = FindTab(model, id);
++      if (index == TabStripModel::kNoTab && !source_state->IsClosed() &&
++          HasClosedTab(model, id)) {
++        // Opened again in the source window while a ClosedTab here.
++        index = ClosedTabsService::Restore(model, id, /*select=*/false)
++                    .value_or(TabStripModel::kNoTab);
++      }
++      if (index == TabStripModel::kNoTab) {
++        continue;
++      }
++      if (TabState* tab_state = TabState::From(model.GetTabAtIndex(index))) {
++        tab_state->CopyFrom(*source_state, /*with_closed_tabs=*/false);
++      }
++    }
++  }
++}
++
++void ReplicaWindows::SyncNavigations(ProfileState& state,
++                                     const std::vector<WindowState*>& windows) {
++  for (auto& [id, source_browser] : state.navigated) {
++    if (!std::ranges::contains(windows, source_browser.get(),
++                               [](WindowState* w) { return w->browser.get(); })) {
++      continue;
++    }
++    TabStripModel& source = *source_browser->GetTabStripModel();
++    const int source_index = FindTab(source, id);
++    if (source_index == TabStripModel::kNoTab) {
++      continue;
++    }
++    tabs::TabInterface* source_tab = source.GetTabAtIndex(source_index);
++    for (WindowState* window : windows) {
++      if (window->browser == source_browser) {
++        continue;
++      }
++      TabStripModel& model = *window->browser->GetTabStripModel();
++      const int index = FindTab(model, id);
++      if (index == TabStripModel::kNoTab) {
++        continue;
++      }
++      tabs::TabInterface* copy = model.GetTabAtIndex(index);
++      // Never under the user's eyes: once no longer shown.
++      state.stale[copy->GetHandle()] = source_browser;
++      if (!IsShown(window->browser, copy)) {
++        ReplacePage(model, *copy, *source_tab);
++        state.stale.erase(copy->GetHandle());
++      }
++    }
++  }
++}
++
++void ReplicaWindows::UpdateStaleCopies(ProfileState& state) {
++  for (auto it = state.stale.begin(); it != state.stale.end();) {
++    tabs::TabInterface* copy = it->first.Get();
++    BrowserWindowInterface* source_browser = it->second;
++    BrowserWindowInterface* browser =
++        copy ? copy->GetBrowserWindowInterface() : nullptr;
++    const bool source_alive = std::ranges::contains(
++        state.windows, source_browser, &WindowState::browser);
++    if (!copy || !browser || !source_alive) {
++      it = state.stale.erase(it);
++      continue;
++    }
++    if (IsShown(browser, copy)) {
++      ++it;
++      continue;
++    }
++    TabStripModel& source = *source_browser->GetTabStripModel();
++    const int source_index = FindTab(source, IdOf(copy));
++    if (source_index != TabStripModel::kNoTab) {
++      ReplacePage(*browser->GetTabStripModel(), *copy,
++                  *source.GetTabAtIndex(source_index));
++    }
++    it = state.stale.erase(it);
++  }
++}
++
++tabs::TabInterface* ReplicaWindows::AddCopy(TabStripModel& target,
++                                            tabs::TabInterface& tab,
++                                            int index) {
++  content::WebContents* contents = tab.GetContents();
++  if (!contents) {
++    return nullptr;
++  }
++  // A page of its own, loaded when shown, with the same history.
++  content::WebContents::CreateParams params(contents->GetBrowserContext());
++  params.initially_hidden = true;
++  std::unique_ptr<content::WebContents> copy =
++      content::WebContents::Create(params);
++  copy->GetController().CopyStateFrom(&contents->GetController(),
++                                      /*needs_reload=*/true);
++
++  const int inserted = target.InsertWebContentsAt(
++      std::clamp(index, 0, target.count()), std::move(copy),
++      tab.IsPinned() ? AddTabTypes::ADD_PINNED : AddTabTypes::ADD_NONE);
++  tabs::TabInterface* copy_tab = target.GetTabAtIndex(inserted);
++  TabState* state = TabState::From(copy_tab);
++  const TabState* source_state = TabState::From(&tab);
++  if (state && source_state) {
++    state->set_replica_id(source_state->replica_id());
++    state->CopyFrom(*source_state, /*with_closed_tabs=*/false);
++  }
++  return copy_tab;
++}
++
++void ReplicaWindows::ReplacePage(TabStripModel& model,
++                                 tabs::TabInterface& copy,
++                                 tabs::TabInterface& source) {
++  content::WebContents* old_contents = copy.GetContents();
++  content::WebContents* contents = source.GetContents();
++  if (!old_contents || !contents || old_contents == contents) {
++    return;
++  }
++  content::NavigationEntry* old_entry =
++      old_contents->GetController().GetLastCommittedEntry();
++  content::NavigationEntry* entry =
++      contents->GetController().GetLastCommittedEntry();
++  if (old_entry && entry && old_entry->GetURL() == entry->GetURL() &&
++      old_contents->GetController().GetEntryCount() ==
++          contents->GetController().GetEntryCount()) {
++    return;
++  }
++  content::WebContents::CreateParams params(contents->GetBrowserContext());
++  params.initially_hidden = true;
++  std::unique_ptr<content::WebContents> page =
++      content::WebContents::Create(params);
++  page->GetController().CopyStateFrom(&contents->GetController(),
++                                      /*needs_reload=*/true);
++  // The old page is deleted here.
++  model.DiscardWebContents(old_contents, std::move(page));
++}
++
++std::optional<tab_groups::TabGroupId> ReplicaWindows::FindCopyOfGroup(
++    const tab_groups::TabGroupId& source_group,
++    TabStripModel& target) {
++  auto id_it = group_ids_.find(source_group);
++  if (id_it == group_ids_.end() || !target.group_model()) {
++    return std::nullopt;
++  }
++  for (const tab_groups::TabGroupId& group :
++       target.group_model()->ListTabGroups()) {
++    auto it = group_ids_.find(group);
++    if (it != group_ids_.end() && it->second == id_it->second) {
++      return group;
++    }
++  }
++  return std::nullopt;
++}
++
++void ReplicaWindows::LinkGroups(const tab_groups::TabGroupId& first,
++                                const tab_groups::TabGroupId& second) {
++  auto it = group_ids_.find(first);
++  const int id = it != group_ids_.end() ? it->second : ++next_group_id_;
++  group_ids_[first] = id;
++  group_ids_[second] = id;
++}
++
++}  // namespace helium_plus
+--- /dev/null
++++ b/chrome/browser/ui/helium_plus/replica_windows.h
+@@ -0,0 +1,221 @@
++// Copyright 2026 The Helium+ Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_HELIUM_PLUS_REPLICA_WINDOWS_H_
++#define CHROME_BROWSER_UI_HELIUM_PLUS_REPLICA_WINDOWS_H_
++
++#include <map>
++#include <optional>
++#include <set>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tab_groups/tab_group_id.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/gfx/geometry/rect.h"
++
++class BrowserWindowInterface;
++class Profile;
++class TabStripModel;
++
++namespace content {
++class NavigationHandle;
++}
++
++namespace helium_plus {
++
++// Like Arc, the windows of a profile show the same tabs: opening, closing,
++// moving, pinning, grouping or splitting a tab in one window does the same in
++// the others, each window keeping its own copy of the pages (loaded when
++// shown) and its own active tab. A navigation reaches the copies in the other
++// windows the next time they are shown, never while they are on screen.
++//
++// The first window of a profile is its main window: the only one saved with
++// the session and whose groups are saved tab groups. The other windows are
++// replicas, built again from the main window when they open. Each window also
++// has a slot of the profile switcher: switching profiles shows the window of
++// the other profile in the same slot (see helium_plus/profile_switcher.h).
++class ReplicaWindows : public BrowserCollectionObserver,
++                       public TabStripModelObserver {
++ public:
++  static void EnsureStarted();
++
++  // Whether `browser` is a replica window: not saved with the session.
++  static bool IsReplicaWindow(BrowserWindowInterface* browser);
++  // Whether `group` is a group of a replica window: not a saved tab group.
++  static bool IsReplicaGroup(const tab_groups::TabGroupId& group);
++  // The group of the main window `group` is a copy of, or `group` itself.
++  static tab_groups::TabGroupId GetMainGroup(
++      const tab_groups::TabGroupId& group);
++
++  // When the user closes the main window of a profile having other windows,
++  // hides it instead, as its tabs live on in the other windows. Returns
++  // whether the window was hidden.
++  static bool HideInsteadOfClosing(BrowserWindowInterface* browser);
++  // Whether the tabs of `browser`, closing, live on in other windows: the tab
++  // restore service doesn't record them then.
++  static bool TabsLiveOn(BrowserWindowInterface* browser);
++
++  // The slot of `browser` in the profile switcher.
++  static int GetSlot(BrowserWindowInterface* browser);
++  static void SetSlot(BrowserWindowInterface* browser, int slot);
++  // The normal window of `profile` in `slot`, visible or not.
++  static BrowserWindowInterface* FindWindowInSlot(Profile* profile, int slot);
++  // Opens, not shown yet, a window of `profile` in `slot` with the tabs of
++  // the other windows of `profile`. Returns null if `profile` has no window.
++  static BrowserWindowInterface* CreateWindowInSlot(Profile* profile,
++                                                    int slot,
++                                                    const gfx::Rect& bounds);
++
++  // Before `browser`, hidden, is shown: its copies of pages that navigated in
++  // other windows get the new pages.
++  static void PrepareToShow(BrowserWindowInterface* browser);
++
++  // From TabState.
++  static void OnTabStateChanged(tabs::TabInterface* tab);
++  static void OnNavigationFinished(tabs::TabInterface* tab,
++                                   content::NavigationHandle* handle);
++
++  ReplicaWindows(const ReplicaWindows&) = delete;
++  ReplicaWindows& operator=(const ReplicaWindows&) = delete;
++
++ private:
++  friend class base::NoDestructor<ReplicaWindows>;
++
++  struct WindowState {
++    WindowState();
++    WindowState(WindowState&&);
++    WindowState& operator=(WindowState&&);
++    ~WindowState();
++
++    raw_ptr<BrowserWindowInterface> browser;
++    int slot = 0;
++    // Whether the window got the tabs of the other windows.
++    bool seeded = false;
++    // Its tab strip is closing all its tabs.
++    bool closing = false;
++    // Increased on each structural change made by the user in this window.
++    int structure_version = 0;
++    // Tabs moved out to another window since the last sync.
++    std::set<int> moved_out;
++  };
++
++  struct ProfileState {
++    ProfileState();
++    ProfileState(ProfileState&&);
++    ProfileState& operator=(ProfileState&&);
++    ~ProfileState();
++
++    // In opening order.
++    std::vector<WindowState> windows;
++    raw_ptr<BrowserWindowInterface> main_window;
++    // The main window, closed by the user while other windows remained.
++    bool main_window_hidden_on_close = false;
++    // The tabs of the shared list as of the last sync.
++    std::set<int> synced_ids;
++    // Tabs whose Helium+ state changed, with the window where it did.
++    std::map<int, raw_ptr<BrowserWindowInterface>> changed_states;
++    // Tabs that navigated, with the window where they did.
++    std::map<int, raw_ptr<BrowserWindowInterface>> navigated;
++    // Copies to update once no longer shown, with the window of the tab
++    // that navigated.
++    std::map<tabs::TabHandle, raw_ptr<BrowserWindowInterface>> stale;
++    bool sync_pending = false;
++  };
++
++  static ReplicaWindows* Get();
++
++  ReplicaWindows();
++  ~ReplicaWindows() override;
++
++  // BrowserCollectionObserver:
++  void OnBrowserCreated(BrowserWindowInterface* browser) override;
++  void OnBrowserClosed(BrowserWindowInterface* browser) override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void TabGroupedStateChanged(TabStripModel* model,
++                              std::optional<tab_groups::TabGroupId> old_group,
++                              std::optional<tab_groups::TabGroupId> new_group,
++                              tabs::TabInterface* tab,
++                              int index) override;
++  void OnTabGroupChanged(const TabGroupChange& change) override;
++  void OnSplitTabChanged(const SplitTabChange& change) override;
++  void WillCloseAllTabs(TabStripModel* model) override;
++  void CloseAllTabsStopped(TabStripModel* model,
++                           CloseAllStoppedReason reason) override;
++
++  // Adds `browser` if it is a normal window. Returns its state.
++  WindowState* Register(BrowserWindowInterface* browser);
++  ProfileState* GetProfileState(Profile* profile);
++  WindowState* GetWindowState(BrowserWindowInterface* browser);
++  WindowState* GetWindowState(TabStripModel* model);
++  ProfileState* GetProfileState(TabStripModel* model);
++
++  // A change of the tab list made in `model`, not by this class.
++  void OnListChanged(TabStripModel* model, bool structural);
++  void ScheduleSync(Profile* profile);
++  void Sync(Profile* profile);
++
++  // The windows of `state` taking part in the sync.
++  std::vector<WindowState*> GetSyncedWindows(ProfileState& state);
++  // Gives `target` copies of all the tabs of `source`.
++  void Seed(ProfileState& state, WindowState& source, WindowState& target);
++  // Applies the tabs closed, compacted or added since the last sync.
++  void SyncTabSet(ProfileState& state,
++                  const std::vector<WindowState*>& windows);
++  // Gives `target` the order, pinned state, groups and splits of `source`.
++  void SyncStructure(TabStripModel& source, TabStripModel& target);
++  void SyncGroups(TabStripModel& source, TabStripModel& target);
++  void SyncOrder(TabStripModel& source, TabStripModel& target);
++  void SyncSplits(TabStripModel& source, TabStripModel& target);
++  void SyncStates(ProfileState& state,
++                  const std::vector<WindowState*>& windows);
++  void SyncNavigations(ProfileState& state,
++                       const std::vector<WindowState*>& windows);
++  void UpdateStaleCopies(ProfileState& state);
++
++  // Inserts in `target` at `index` a copy of `tab`, not loaded. Returns it.
++  tabs::TabInterface* AddCopy(TabStripModel& target,
++                              tabs::TabInterface& tab,
++                              int index);
++  // Replaces the page of `copy` by a copy of the page of `source`.
++  void ReplacePage(TabStripModel& model,
++                   tabs::TabInterface& copy,
++                   tabs::TabInterface& source);
++  // The group of `target` that is the copy of `source_group`, if any.
++  std::optional<tab_groups::TabGroupId> FindCopyOfGroup(
++      const tab_groups::TabGroupId& source_group,
++      TabStripModel& target);
++  void LinkGroups(const tab_groups::TabGroupId& first,
++                  const tab_groups::TabGroupId& second);
++
++  base::ScopedObservation<GlobalBrowserCollection, BrowserCollectionObserver>
++      browser_collection_observation_{this};
++  std::map<raw_ptr<Profile>, ProfileState> profiles_;
++  // Groups that are copies of one another share a logical id.
++  std::map<tab_groups::TabGroupId, int> group_ids_;
++  int next_group_id_ = 0;
++  int next_slot_ = 0;
++  int next_structure_version_ = 0;
++  // The slot of the next window opened by CreateWindowInSlot().
++  std::optional<int> pending_slot_;
++  // Changes made by this class are not synced back.
++  int applying_ = 0;
++  base::WeakPtrFactory<ReplicaWindows> weak_factory_{this};
++};
++
++}  // namespace helium_plus
++
++#endif  // CHROME_BROWSER_UI_HELIUM_PLUS_REPLICA_WINDOWS_H_
+--- a/chrome/browser/ui/helium_plus/tab_state.cc
++++ b/chrome/browser/ui/helium_plus/tab_state.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/helium_plus/closed_tabs.h"
+ #include "chrome/browser/ui/helium_plus/hibernation_service.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/helium_plus/shared_settings.h"
+ #include "chrome/browser/ui/helium_plus/tab_import.h"
+ #include "chrome/browser/sessions/session_service.h"
+@@ -176,9 +177,11 @@ DEFINE_USER_DATA(TabState);
+ 
+ TabState::TabState(tabs::TabInterface& tab)
+     : ContentsObservingTabFeature(tab),
++      replica_id_(NextClosedTabId()),
+       scoped_unowned_user_data_(tab.GetUnownedUserDataHost(), *this) {
+   HibernationService::EnsureStarted();
+   ClosedTabsService::EnsureStarted();
++  ReplicaWindows::EnsureStarted();
+   SharedSettings::EnsureStarted();
+   TabImport::EnsureStarted();
+ 
+@@ -276,6 +279,18 @@ void TabState::SetCustomTitle(std::u16st
+   custom_title_ = std::move(title);
+   Persist(kCustomTitleKey, base::UTF16ToUTF8(custom_title_));
+   NotifyTitleChanged();
++  ReplicaWindows::OnTabStateChanged(&tab());
++}
++
++void TabState::CopyFrom(const TabState& other, bool with_closed_tabs) {
++  SetCustomTitle(other.custom_title_);
++  SetAnchor(other.anchor_url_, other.anchor_title_);
++  SetDiverged(other.diverged_);
++  SetClosed(other.closed_);
++  closed_time_ = other.closed_time_;
++  if (with_closed_tabs) {
++    SetClosedTabs(other.closed_before_, other.closed_after_);
++  }
+ }
+ 
+ bool TabState::IsAnchored() const {
+@@ -295,6 +310,7 @@ void TabState::SetAnchorToCurrentPage()
+ }
+ 
+ void TabState::DidFinishNavigation(content::NavigationHandle* handle) {
++  ReplicaWindows::OnNavigationFinished(&tab(), handle);
+   if (!handle->IsInPrimaryMainFrame() || !handle->HasCommitted() ||
+       !IsAnchored()) {
+     return;
+@@ -325,6 +341,7 @@ void TabState::SetClosed(bool closed) {
+   if (content::WebContents* contents = tab().GetContents()) {
+     contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
+   }
++  ReplicaWindows::OnTabStateChanged(&tab());
+ }
+ 
+ void TabState::SetClosedTabs(ClosedTabs before, ClosedTabs after) {
+@@ -363,6 +380,7 @@ void TabState::SetAnchor(GURL url, std::
+   Persist(kAnchorUrlKey,
+           anchor_url_.is_valid() ? anchor_url_.spec() : std::string());
+   Persist(kAnchorTitleKey, base::UTF16ToUTF8(anchor_title_));
++  ReplicaWindows::OnTabStateChanged(&tab());
+ }
+ 
+ void TabState::UpdateDiverged(content::NavigationHandle* handle) {
+@@ -393,6 +411,7 @@ void TabState::SetDiverged(bool diverged
+   if (content::WebContents* contents = tab().GetContents()) {
+     contents->NotifyNavigationStateChanged(content::INVALIDATE_TYPE_TAB);
+   }
++  ReplicaWindows::OnTabStateChanged(&tab());
+ }
+ 
+ void TabState::RestoreFrom(
+--- a/chrome/browser/ui/helium_plus/tab_state.h
++++ b/chrome/browser/ui/helium_plus/tab_state.h
+@@ -66,6 +66,17 @@ class TabState : public tabs::ContentsOb
+   static const TabState* From(const tabs::TabInterface* tab);
+   static TabState* FromWebContents(content::WebContents* contents);
+ 
++  // Id of the tab in the tab list shared by the windows of a profile (see
++  // helium_plus/replica_windows.h): its copies in the other windows have the
++  // same one. Unique in the browser process, from the same counter as
++  // ClosedTab::id, not saved.
++  int replica_id() const { return replica_id_; }
++  void set_replica_id(int replica_id) { replica_id_ = replica_id; }
++
++  // Takes the state of `other`, a copy of this tab in another window: custom
++  // title, anchor, closed state and, if `with_closed_tabs`, its closed tabs.
++  void CopyFrom(const TabState& other, bool with_closed_tabs);
++
+   // Keeps restored extra data on `contents` until its tab is created.
+   static void StashRestoredData(
+       content::WebContents* contents,
+@@ -120,6 +131,7 @@ class TabState : public tabs::ContentsOb
+                          size_t& saved_chunks);
+   void NotifyTitleChanged();
+ 
++  int replica_id_;
+   std::u16string custom_title_;
+   GURL anchor_url_;
+   std::u16string anchor_title_;
+--- a/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_model_listener.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_model_listener.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/local_tab_group_listener.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+@@ -69,6 +70,12 @@ void SavedTabGroupModelListener::OnTabGr
+     return;
+   }
+ 
++  // Helium+: a group of a replica window copies a saved group of the main
++  // window.
++  if (helium_plus::ReplicaWindows::IsReplicaGroup(group_id)) {
++    return;
++  }
++
+   auto group_and_tab_guid_mapping = CreateSavedTabGroupAndTabMapping(group_id);
+ 
+   SavedTabGroup copy_group = group_and_tab_guid_mapping.first;
+--- a/chrome/browser/ui/unload_controller.cc
++++ b/chrome/browser/ui/unload_controller.cc
+@@ -30,6 +30,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+@@ -223,6 +224,10 @@ void UnloadController::OnWindowClosing()
+       WillRestoreSession(*browser_->GetProfile())) {
+     notify_restore_service = false;
+   }
++  // Helium+: nor a window whose tabs live on in other windows.
++  if (helium_plus::ReplicaWindows::TabsLiveOn(browser_)) {
++    notify_restore_service = false;
++  }
+ 
+   if (tab_restore_service && notify_restore_service) {
+     tab_restore_service->BrowserClosing(BrowserLiveTabContext::From(browser_));
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -108,6 +108,7 @@
+ #include "chrome/browser/ui/global_error/global_error.h"
+ #include "chrome/browser/ui/global_error/global_error_service.h"
+ #include "chrome/browser/ui/global_error/global_error_service_factory.h"
++#include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/helium_plus/tab_commands.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+@@ -5353,6 +5354,12 @@ views::CloseRequestResult BrowserView::O
+     return views::CloseRequestResult::kCannotClose;
+   }
+ 
++  // Helium+: the main window of a profile hides while its tabs live on in
++  // other windows.
++  if (helium_plus::ReplicaWindows::HideInsteadOfClosing(browser_.get())) {
++    return views::CloseRequestResult::kCannotClose;
++  }
++
+   // Give beforeunload handlers, the user, or policy the chance to cancel the
+   // close before we hide the window below.
+   if (!UnloadController::From(browser_)->HandleBeforeClose()) {
