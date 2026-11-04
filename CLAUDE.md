@@ -319,6 +319,32 @@ Chromium 156 (`missing 'export module' declaration`). `tools/build-local.sh full
 with the remaining time in the Ghostty title; to compile a single file:
 `autoninja -C out/Default ../../path/file.cc^`.
 
+Xcode SDK updates: `out/Default/args.gn` pins `mac_sdk_path` to
+`//out/Default/sdk/xcode_links/MacOSX27.0.sdk` (link kept by the build), so a new Xcode SDK
+(27.2) doesn't change the SDK path and force a full rebuild. A full build takes ~2 h 10 on all
+cores (`tools/build-local.sh full`); run detached (`nohup`), `script` needs a terminal: call
+`helium_build` from `dev.sh` instead.
+
+Running the dev build: the user's instance runs from `out/Run`, an APFS clone of `out/Default`
+(`cp -c -R`, without `obj`, `gen`, `clang_*`, `local_rustc_sysroot`, `sdk`, `jsproto`, `pyproto`,
+`vk_intermediates`, `vulkan_intermediates`), so a build never replaces libraries under it; data in
+`~/Library/Application Support/net.imput.helium.dev`, arguments `--enable-ui-devtools
+--use-mock-keychain --disable-features=DialMediaRouteProvider --restore-last-session`. Default
+browser: launcher `~/Applications/Helium+.app` (source in `~/.config/helium/helium-plus-opener/`),
+which opens links with that copy or starts it with those arguments. Updating it: quit the instance
+like Cmd+Q (`quitpid`, in `build/helium-plus-notes/tools/`), clone again, relaunch (first start
+~80 s); always ask the user first. Test notes and tools of the last session:
+`build/helium-plus-notes/` (`RESUME.md`).
+
+Testing without the mouse: separate instance from `out/Default` with its own `--user-data-dir`,
+`--remote-debugging-port` and `--enable-unsafe-extension-debugging`, a test extension loaded
+through CDP `Extensions.loadUnpacked` (into the last used profile) and driven in its service
+worker (`chrome.tabs`, `chrome.windows`, `chrome.tabs.createSplit`); vertical tabs in a fresh
+data directory: Local State `helium_plus.shared_settings["helium.browser.layout"] = 2` (shared
+settings override the profile's `Preferences`); no profile picker on startup: Local State
+`browser.show_profile_picker_on_startup = false`. UI through accessibility (`AXPress`,
+`AXShowMenu` on a tab for its menu, `AXFullScreen` on the window like the green button).
+
 Official updates: Sparkle is only enabled when `PROD_MACOS_SPARKLE_ED_PUB_KEY` is defined
 (`devutils/shared.sh`); never define it in our CI: Helium+ must not update itself to the official
 Helium.
