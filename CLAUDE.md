@@ -256,6 +256,17 @@ two-line calls.
     else a new replica window of that profile (`CreateWindowInSlot`), else
     `profiles::SwitchToProfile`. Not done: replica windows are not restored after a restart (only
     the main window of each profile).
+25. `fullscreen-profile-switch.patch`: switching profiles from a fullscreen window
+    (`ShowInPlaceOf`, `profile_switcher.cc`): macOS gives each fullscreen window its own space, so
+    the target window is first shown in the current one
+    (`Widget::SetCanAppearInExistingFullscreenSpaces` + `MoveToActiveFullscreenSpace`), then goes
+    fullscreen (`chrome::ToggleFullscreenMode`); the source is hidden 1.2 s later (a later switch
+    cancels it, `g_switch`) and keeps its fullscreen space: shown again, it comes back fullscreen.
+    A regular source and a target still fullscreen from an earlier switch: the target leaves
+    fullscreen, then takes the source's frame once the transition is over
+    (`FullscreenController::RunOrDeferUntilTransitionIsComplete`; macOS gives it back its own
+    frame from before fullscreen). Chromium's "hold Esc to exit" bubble shows when the target goes
+    fullscreen, as with the green button.
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.

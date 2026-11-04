@@ -1,0 +1,147 @@
+--- a/chrome/browser/ui/helium_plus/profile_switcher.cc
++++ b/chrome/browser/ui/helium_plus/profile_switcher.cc
+@@ -9,33 +9,49 @@
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_attributes_entry.h"
+ #include "chrome/browser/profiles/profile_attributes_storage.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profile_window.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
++#include "chrome/browser/ui/exclusive_access/fullscreen_controller.h"
+ #include "chrome/browser/ui/helium_plus/replica_windows.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "ui/base/base_window.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/widget/widget.h"
+ 
+ namespace helium_plus {
+ 
+ namespace {
+ 
++// How long macOS takes to move to the space of a window going fullscreen.
++constexpr base::TimeDelta kFullscreenTransition = base::Milliseconds(1200);
++
++views::Widget* GetWidget(BrowserWindowInterface* browser) {
++  return views::Widget::GetWidgetForNativeWindow(
++      browser->GetWindow()->GetNativeWindow());
++}
++
++// Each switch cancels the pending steps of the previous one.
++int g_switch = 0;
++
+ void ShowInPlaceOf(BrowserWindowInterface* from, BrowserWindowInterface* to) {
+   if (from == to) {
+     return;
+   }
++  const int current_switch = ++g_switch;
+   ui::BaseWindow* from_window = from->GetWindow();
+   ui::BaseWindow* to_window = to->GetWindow();
+-  // Fullscreen windows live in their own space: only swap regular windows.
+-  const bool swap = !from_window->IsFullscreen() && !to_window->IsFullscreen();
+-  if (swap) {
+-    to_window->SetBounds(from_window->GetBounds());
+-  }
++  const bool from_fullscreen = from_window->IsFullscreen();
++  const bool to_fullscreen = to_window->IsFullscreen();
+   // Same tab strip width and collapse state, as if it were the same window.
+   auto* from_strip = tabs::VerticalTabStripStateController::From(from);
+   auto* to_strip = tabs::VerticalTabStripStateController::From(to);
+@@ -50,10 +66,74 @@ void ShowInPlaceOf(BrowserWindowInterfac
+   }
+   // Pages that navigated in other windows meanwhile, before they show.
+   ReplicaWindows::PrepareToShow(to);
+-  to_window->Show();
+-  if (swap) {
++
++  if (!from_fullscreen) {
++    if (to_fullscreen) {
++      // Still fullscreen from an earlier switch: a regular window again, in
++      // place of the other one once out of fullscreen (macOS gives it back
++      // the frame it had before).
++      to_window->Show();
++      chrome::ToggleFullscreenMode(to);
++      ExclusiveAccessManager::From(to)
++          ->fullscreen_controller()
++          ->RunOrDeferUntilTransitionIsComplete(base::BindOnce(
++              [](base::WeakPtr<BrowserWindowInterface> to,
++                 const gfx::Rect& bounds) {
++                if (to && to->GetWindow() && !to->GetWindow()->IsFullscreen()) {
++                  to->GetWindow()->SetBounds(bounds);
++                }
++              },
++              to->GetWeakPtr(), from_window->GetBounds()));
++    } else {
++      to_window->SetBounds(from_window->GetBounds());
++      to_window->Show();
++    }
+     from_window->Hide();
++    return;
+   }
++
++  // Fullscreen windows live in their own space (macOS): the window replacing
++  // a fullscreen one goes fullscreen too, and the replaced one hides once
++  // macOS is in the new space, keeping its own space for when it shows again.
++  if (to_fullscreen) {
++    to_window->Show();
++  } else {
++    // Shown first in the current space, so that macOS only slides from there
++    // to the new one.
++    to_window->SetBounds(from_window->GetRestoredBounds());
++    if (views::Widget* widget = GetWidget(to)) {
++      widget->SetCanAppearInExistingFullscreenSpaces(true);
++      to_window->Show();
++      widget->MoveToActiveFullscreenSpace();
++    } else {
++      to_window->Show();
++    }
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(
++                       [](base::WeakPtr<BrowserWindowInterface> to) {
++                         if (!to || !to->GetWindow()) {
++                           return;
++                         }
++                         if (views::Widget* widget = GetWidget(to.get())) {
++                           widget->SetCanAppearInExistingFullscreenSpaces(
++                               false);
++                         }
++                         if (!to->GetWindow()->IsFullscreen()) {
++                           chrome::ToggleFullscreenMode(to.get());
++                         }
++                       },
++                       to->GetWeakPtr()));
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<BrowserWindowInterface> from, int current_switch) {
++            if (from && from->GetWindow() && current_switch == g_switch) {
++              from->GetWindow()->Hide();
++            }
++          },
++          from->GetWeakPtr(), current_switch),
++      kFullscreenTransition);
+ }
+ 
+ }  // namespace
+@@ -81,8 +161,11 @@ void SwitchToProfile(BrowserWindowInterf
+   if (profile) {
+     BrowserWindowInterface* to = ReplicaWindows::FindWindowInSlot(profile, slot);
+     if (!to) {
++      ui::BaseWindow* window = from->GetWindow();
+       to = ReplicaWindows::CreateWindowInSlot(
+-          profile, slot, from->GetWindow()->GetBounds());
++          profile, slot,
++          window->IsFullscreen() ? window->GetRestoredBounds()
++                                 : window->GetBounds());
+     }
+     if (to) {
+       ShowInPlaceOf(from, to);
