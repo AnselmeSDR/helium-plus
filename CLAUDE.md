@@ -277,6 +277,9 @@ two-line calls.
     as visible to its own scripts (`Document::IsPageVisible`), so adaptive-bitrate players (Twitch,
     YouTube…) don't drop the stream quality when the page is backgrounded while the video keeps
     playing in the PiP window.
+28. `folder-popover-sort.patch`: the hover popover of a collapsed folder lists its tabs sorted
+    alphabetically (ascending, case-insensitive, `base::i18n::FoldCase`) for quick scanning
+    (`group_tabs_popover.cc`); the real tab order in the folder is unchanged.
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.
