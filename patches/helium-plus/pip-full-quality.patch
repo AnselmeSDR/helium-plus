@@ -1,0 +1,18 @@
+--- a/third_party/blink/renderer/core/dom/document.cc
++++ b/third_party/blink/renderer/core/dom/document.cc
+@@ -2353,6 +2353,15 @@ bool Document::IsPageVisible() const {
+   // visibility.
+   if (load_event_progress_ >= kUnloadVisibilityChangeInProgress)
+     return false;
++  // helium_plus: a page whose video plays in Picture-in-Picture keeps reporting
++  // itself as visible to its own scripts, so adaptive-bitrate players (Twitch,
++  // YouTube...) don't drop the stream quality when the page is backgrounded
++  // while its video keeps playing in the PiP window.
++  if (PictureInPictureController* pip_controller =
++          Supplement<Document>::From<PictureInPictureController>(*this)) {
++    if (pip_controller->PictureInPictureElement())
++      return true;
++  }
+   return GetFrame()->GetPage()->IsPageVisible();
+ }
+ 

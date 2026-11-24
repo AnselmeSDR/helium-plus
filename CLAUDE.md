@@ -273,6 +273,10 @@ two-line calls.
     reopen (URL and custom title; not pinned, group or history) at the end of the target profile's
     window in the same slot, which shows in place of this one (`SwitchToProfile(from, path,
     shown)`), then close here without a tab restore entry.
+27. `pip-full-quality.patch`: a page whose video plays in Picture-in-Picture keeps reporting itself
+    as visible to its own scripts (`Document::IsPageVisible`), so adaptive-bitrate players (Twitch,
+    YouTube…) don't drop the stream quality when the page is backgrounded while the video keeps
+    playing in the PiP window.
 
 UI strings: `helium_plus/strings.cc` (French if the browser is in French, English otherwise), no
 `.grd` to avoid large patches and full rebuilds.
@@ -329,7 +333,11 @@ Running the dev build: the user's instance runs from `out/Run`, an APFS clone of
 (`cp -c -R`, without `obj`, `gen`, `clang_*`, `local_rustc_sysroot`, `sdk`, `jsproto`, `pyproto`,
 `vk_intermediates`, `vulkan_intermediates`), so a build never replaces libraries under it; data in
 `~/Library/Application Support/net.imput.helium.dev`, arguments `--enable-ui-devtools
---use-mock-keychain --disable-features=DialMediaRouteProvider --restore-last-session`. Default
+--use-mock-keychain --disable-features=DialMediaRouteProvider
+--enable-features=BrowserInitiatedAutomaticPictureInPicture,AutoPictureInPictureOnWindowOccluded
+--restore-last-session` (the `--enable-features` turn on Chromium's browser-initiated auto
+Picture-in-Picture: an audible playing video goes to PiP when its tab, window or profile is left,
+on sites with media engagement; set in the opener's `main.swift`). Default
 browser: launcher `~/Applications/Helium+.app` (source in `~/.config/helium/helium-plus-opener/`),
 which opens links with that copy or starts it with those arguments. Updating it: quit the instance
 like Cmd+Q (`quitpid`, in `build/helium-plus-notes/tools/`), clone again, relaunch (first start
